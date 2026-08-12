@@ -392,3 +392,86 @@ def test_parse_link_lines_rejects_empty_text(batch_module):
     mode, _ = module.parse_link_lines('   \n  \n')
 
     assert mode == 'invalid'
+
+
+def _stub_progress_app(module):
+    class FakeX:
+        async def send_message(self, did, text):
+            return types.SimpleNamespace(id=1)
+
+        async def edit_message_text(self, *args, **kwargs):
+            pass
+
+        async def delete_messages(self, *args, **kwargs):
+            pass
+
+    async def get_key(user_id, key, default=None):
+        return default
+
+    async def process_text(user_id, text):
+        return text
+
+    module.get_user_data_key = get_key
+    module.process_text_with_rules = process_text
+    module.X = FakeX()
+    module.LOG_GROUP = 0
+
+
+def test_process_msg_cleans_downloaded_file_on_processing_error(batch_module, tmp_path):
+    module, _ = batch_module
+    module.emp[(42, "public_channel")] = True
+    _stub_progress_app(module)
+    # fixture's plugins.settings.rename_file is None -> the rename step raises,
+    # exercising the mid-processing cleanup path.
+
+    downloaded = tmp_path / "42_doc.bin"
+
+    class UserClient:
+        async def download_media(self, m, file_name=None, progress=None, progress_args=None):
+            downloaded.write_bytes(b"data")
+            return str(downloaded)
+
+    message = types.SimpleNamespace(
+        media=True, caption=None, video=None, video_note=None, voice=None,
+        sticker=None, audio=None, photo=None,
+        document=types.SimpleNamespace(file_name="doc.bin"),
+    )
+
+    result = asyncio.run(
+        module.process_msg(UserClient(), UserClient(), message, "42", "public", 42, "public_channel")
+    )
+
+    assert result.startswith("Error:")
+    assert not downloaded.exists()
+
+
+def test_process_msg_sends_sticker_from_downloaded_file(batch_module, tmp_path):
+    module, _ = batch_module
+    module.emp[(42, "public_channel")] = True
+    _stub_progress_app(module)
+    module.thumbnail = lambda d: None
+
+    downloaded = tmp_path / "42_sticker"
+    sent = {}
+
+    class UserClient:
+        async def download_media(self, m, file_name=None, progress=None, progress_args=None):
+            downloaded.write_bytes(b"webp")
+            return str(downloaded)
+
+        async def send_sticker(self, tcid, sticker, reply_to_message_id=None):
+            sent["sticker"] = sticker
+
+    message = types.SimpleNamespace(
+        media=True, caption=None, video=None, video_note=None, voice=None,
+        sticker=types.SimpleNamespace(file_id="sticker-file-id"),
+        audio=None, photo=None, document=None,
+    )
+
+    result = asyncio.run(
+        module.process_msg(UserClient(), UserClient(), message, "42", "public", 42, "public_channel")
+    )
+
+    assert result == "Done."
+    assert sent["sticker"] == str(downloaded)
+    assert not downloaded.exists()
