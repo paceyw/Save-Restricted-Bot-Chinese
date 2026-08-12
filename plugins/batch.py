@@ -108,6 +108,8 @@ async def get_msg(c, u, i, d, lt, uid):
             for label, client, fetched_by_bot in clients:
                 try:
                     xm = await client.get_messages(i, d)
+                except FloodWait:
+                    raise  # let process_one_link's retry wrapper see it
                 except Exception as e:
                     print(f'Error fetching public message with {label} client: {e}')
                     continue
@@ -125,6 +127,8 @@ async def get_msg(c, u, i, d, lt, uid):
                     if xm and not getattr(xm, 'empty', False):
                         emp[(uid, i)] = True
                         return xm
+                except FloodWait:
+                    raise
                 except Exception as e:
                     print(f'Error joining public chat {i}: {e}')
 
@@ -153,6 +157,8 @@ async def get_msg(c, u, i, d, lt, uid):
                 result = await u.get_messages(chat_id_100, d)
                 if result and not getattr(result, "empty", False):
                     return result
+            except FloodWait:
+                raise
             except Exception:
                 pass
 
@@ -160,6 +166,8 @@ async def get_msg(c, u, i, d, lt, uid):
                 result = await u.get_messages(chat_id_dash, d)
                 if result and not getattr(result, "empty", False):
                     return result
+            except FloodWait:
+                raise
             except Exception:
                 pass
 
@@ -169,13 +177,19 @@ async def get_msg(c, u, i, d, lt, uid):
                 result = await u.get_messages(i, d)
                 if result and not getattr(result, "empty", False):
                     return result
+            except FloodWait:
+                raise
             except Exception:
                 pass
 
             return None
+        except FloodWait:
+            raise
         except Exception as e:
             print(f'Private channel error: {e}')
             return None
+    except FloodWait:
+        raise
     except Exception as e:
         print(f'Error fetching message: {e}')
         return None
@@ -387,6 +401,16 @@ def _flood_secs(e):
     return getattr(e, 'value', getattr(e, 'x', 10))
 
 
+async def _safe_cleanup(coro):
+    """Post-delivery cleanup must never propagate (esp. FloodWait): a raised
+    error here would make the caller retry an already-delivered send and
+    duplicate the content."""
+    try:
+        await coro
+    except Exception as e:
+        print(f'cleanup failed (delivery already done): {e}')
+
+
 async def process_album(c, u, msgs, d, lt, uid, i):
     """Forward an album 1:1 — grouping, order, caption and tags preserved.
 
@@ -405,10 +429,12 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     user_cap = await get_user_data_key(d, 'caption', '')
     ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
-    if deliver_via_bot:
+    # Fast server-side copy preserves the ORIGINAL caption — skip it whenever
+    # text rules or a user caption apply, so both paths produce the same text.
+    if deliver_via_bot and not ft:
         try:
             await sender.copy_media_group(tcid, msgs[0].chat.id, msgs[0].id)
-            await X.delete_messages(did, p.id)
+            await _safe_cleanup(X.delete_messages(did, p.id))
             return f'✅ 相册已一比一转发（{len(msgs)} 项）'
         except Exception as e:
             print(f'copy_media_group failed, falling back to re-upload: {e}')
@@ -416,57 +442,65 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     st = time.time()
     media = []
     files = []
-    for idx, one in enumerate(msgs):
-        if not (one.photo or one.video or one.document or one.audio):
-            continue
-        await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
-        # Telegram's SendMultiMedia validates uploads by file extension
-        # (PHOTO_EXT_INVALID otherwise), so the temp name must carry one.
-        if one.photo:
-            ext = '.jpg'
-        elif one.video:
-            ext = os.path.splitext(one.video.file_name or '')[1] or '.mp4'
-        elif one.audio:
-            ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
-        else:
-            ext = os.path.splitext(one.document.file_name or '')[1]
-        f = await u.download_media(
-            one,
-            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{uid}_{int(time.time())}_{idx}{ext}'),
-            progress=prog, progress_args=(X, did, p.id, st),
-        )
-        if not f:
-            print(f'Album item {idx + 1} download failed, skipping')
-            continue
-        files.append(f)
-        if one.photo:
-            media.append(InputMediaPhoto(f))
-        elif one.video:
-            # Keep the source channel's thumbnail; without one Telegram shows
-            # the first frame, which is often black.
-            thumb_path = None
-            if one.video.thumbs:
-                try:
-                    thumb_path = await u.download_media(
-                        one.video.thumbs[-1].file_id,
-                        file_name=os.path.join(
-                            _WORKDIR, 'downloads',
-                            f'album_thumb_{uid}_{int(time.time())}_{idx}.jpg',
-                        ),
-                    )
-                except Exception as e:
-                    print(f'Thumb download failed for album item {idx + 1}: {e}')
-            if thumb_path:
-                files.append(thumb_path)
-            media.append(InputMediaVideo(
-                f, duration=one.video.duration,
-                width=one.video.width, height=one.video.height,
-                thumb=thumb_path,
-            ))
-        elif one.audio:
-            media.append(InputMediaAudio(f, duration=one.audio.duration))
-        else:
-            media.append(InputMediaDocument(f))
+    try:
+        for idx, one in enumerate(msgs):
+            if not (one.photo or one.video or one.document or one.audio):
+                continue
+            await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
+            # Telegram's SendMultiMedia validates uploads by file extension
+            # (PHOTO_EXT_INVALID otherwise), so the temp name must carry one.
+            if one.photo:
+                ext = '.jpg'
+            elif one.video:
+                ext = os.path.splitext(one.video.file_name or '')[1] or '.mp4'
+            elif one.audio:
+                ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
+            else:
+                ext = os.path.splitext(one.document.file_name or '')[1]
+            f = await u.download_media(
+                one,
+                file_name=os.path.join(_WORKDIR, 'downloads', f'album_{uid}_{int(time.time())}_{idx}{ext}'),
+                progress=prog, progress_args=(X, did, p.id, st),
+            )
+            if not f:
+                print(f'Album item {idx + 1} download failed, skipping')
+                continue
+            files.append(f)
+            if one.photo:
+                media.append(InputMediaPhoto(f))
+            elif one.video:
+                # Keep the source channel's thumbnail; without one Telegram shows
+                # the first frame, which is often black.
+                thumb_path = None
+                if one.video.thumbs:
+                    try:
+                        thumb_path = await u.download_media(
+                            one.video.thumbs[-1].file_id,
+                            file_name=os.path.join(
+                                _WORKDIR, 'downloads',
+                                f'album_thumb_{uid}_{int(time.time())}_{idx}.jpg',
+                            ),
+                        )
+                    except Exception as e:
+                        print(f'Thumb download failed for album item {idx + 1}: {e}')
+                if thumb_path:
+                    files.append(thumb_path)
+                media.append(InputMediaVideo(
+                    f, duration=one.video.duration,
+                    width=one.video.width, height=one.video.height,
+                    thumb=thumb_path,
+                ))
+            elif one.audio:
+                media.append(InputMediaAudio(f, duration=one.audio.duration))
+            else:
+                media.append(InputMediaDocument(f))
+    except Exception:
+        # A failed download/progress step must not leak already-downloaded
+        # files. FloodWait propagates too — the retry re-downloads cleanly.
+        for ff in files:
+            if os.path.exists(ff):
+                os.remove(ff)
+        raise
 
     if not media:
         await X.edit_message_text(did, p.id, '相册下载失败')
@@ -516,7 +550,7 @@ async def process_album(c, u, msgs, d, lt, uid, i):
             if os.path.exists(f):
                 os.remove(f)
         if sent:
-            await X.delete_messages(did, p.id)
+            await _safe_cleanup(X.delete_messages(did, p.id))
             return f'⚠️ 整组发送被拒，已逐条发送 {sent}/{len(media)} 项（{err[:40]}）'
         if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
             hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
@@ -528,11 +562,12 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     for f in files:
         if os.path.exists(f):
             os.remove(f)
-    await X.delete_messages(did, p.id)
+    await _safe_cleanup(X.delete_messages(did, p.id))
     return f'✅ 相册已发送（{len(media)} 项）'
 
 
 async def process_msg(c, u, m, d, lt, uid, i):
+    f = None  # downloaded temp file; the finally below guarantees cleanup
     try:
         tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
         did = int(d)
@@ -640,7 +675,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 
                 await sender.copy_message(tcid, LOG_GROUP, sent.id)
                 os.remove(f)
-                await X.delete_messages(did, p.id)
+                await _safe_cleanup(X.delete_messages(did, p.id))
                 
                 return 'Done (Large file).'
             
@@ -666,7 +701,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     await sender.send_voice(tcid, f, progress=prog, progress_args=(X, did, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.sticker:
-                    await sender.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+                    await sender.send_sticker(tcid, f, reply_to_message_id=rtmid)
                 elif m.audio or (m.document and file_ext in audio_extensions):
                     await sender.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
                                     thumb=th, progress=prog, progress_args=(X, did, p.id, st), 
@@ -697,7 +732,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 return f'上传失败：{err[:60]} {hint}'.strip()
             
             os.remove(f)
-            await X.delete_messages(did, p.id)
+            await _safe_cleanup(X.delete_messages(did, p.id))
             
             return 'Done.'
             
@@ -707,6 +742,14 @@ async def process_msg(c, u, m, d, lt, uid, i):
             return 'Sent.'
     except Exception as e:
         return f'Error: {str(e)[:50]}'
+    finally:
+        # Any mid-processing exception (rename, metadata, upload setup) would
+        # otherwise strand the downloaded file in downloads/ forever.
+        if f and isinstance(f, str) and os.path.exists(f):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
         
 def parse_link_lines(text):
     """Parse /batch input.
@@ -761,6 +804,8 @@ async def _process_one_link(ubot, uc, i, s, lt, d, uid):
             group = await fetch_client.get_media_group(i, s)
             if group:
                 msgs = group
+        except FloodWait:
+            raise
         except Exception as e:
             print(f'Media group fetch failed, falling back to single: {e}')
     if len(msgs) > 1:
