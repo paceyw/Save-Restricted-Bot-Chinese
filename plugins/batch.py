@@ -811,7 +811,10 @@ async def cancel_cmd(c, m):
         else:
             await m.reply_text('请求取消失败，请重试。')
     else:
-        await m.reply_text('未找到正在进行的批量提取。')
+        # Also drop any pending input state (start/count prompts) — otherwise
+        # the next plain text message would resurrect the abandoned flow.
+        had_state = Z.pop(uid, None) is not None
+        await m.reply_text('已取消。' if had_state else '未找到正在进行的批量提取。')
 
 @X.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
@@ -842,7 +845,11 @@ async def text_handler(c, m):
         if mode == 'range':
             i, d, lt = payload
             Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
-            await m.reply_text('要处理多少条消息？')
+            try:
+                await m.reply_text('要处理多少条消息？')
+            except Exception:
+                Z.pop(uid, None)
+                raise
             return
 
         links = payload
@@ -853,7 +860,11 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
 
-        pt = await m.reply_text(f'开始批量提取 {n} 条链接...')
+        try:
+            pt = await m.reply_text(f'开始批量提取 {n} 条链接...')
+        except Exception:
+            Z.pop(uid, None)
+            raise
         uc = await get_uclient(uid)
         ubot = UB.get(uid)
         if not ubot:
@@ -877,9 +888,11 @@ async def text_handler(c, m):
             return
 
         success = 0
+        cancelled = False
         try:
             for j, (ci, di, lti) in enumerate(links):
                 if should_cancel(uid):
+                    cancelled = True
                     await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
                     break
                 await update_batch_progress(uid, j, success)
@@ -891,7 +904,7 @@ async def text_handler(c, m):
                     try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
                     except: pass
                 await asyncio.sleep(10)
-            if j + 1 == n:
+            if not cancelled and j + 1 == n:
                 await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
         finally:
             await remove_active_batch(uid)
@@ -933,8 +946,11 @@ async def text_handler(c, m):
         if not m.text.isdigit():
             await m.reply_text('请输入有效数字。')
             return
-        
+
         count = int(m.text)
+        if count < 1:
+            await m.reply_text('数量至少为 1。')
+            return
         maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
 
         if count > maxlimit:
@@ -945,12 +961,18 @@ async def text_handler(c, m):
         i, s, n, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['num'], Z[uid]['lt']
         success = 0
 
-        pt = await m.reply_text('正在进行批量提取...')
+        try:
+            pt = await m.reply_text('正在进行批量提取...')
+        except Exception:
+            Z.pop(uid, None)
+            raise
         uc = await get_uclient(uid)
         ubot = UB.get(uid)
-        
-        if not uc or not ubot:
-            await pt.edit('客户端配置缺失')
+
+        # UC is only needed for private links; public links work with the
+        # custom bot alone (same rule as the multi-link flow).
+        if not ubot or (lt != 'public' and not uc):
+            await pt.edit('客户端配置缺失' if not ubot else '用户会话无效或未登录，请先使用 /login。')
             Z.pop(uid, None)
             return
             
@@ -970,32 +992,34 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
         
+        cancelled = False
         try:
             for j in range(n):
-                
+
                 if should_cancel(uid):
+                    cancelled = True
                     await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
                     break
-                
+
                 await update_batch_progress(uid, j, success)
-                
+
                 mid = int(s) + j
-                
+
                 try:
                     msg = await get_msg(ubot, uc, i, mid, lt, uid)
                     if msg:
                         res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                        if 'Done' in res or 'Copied' in res or 'Sent' in res:
+                        if _ok(res):
                             success += 1
                     else:
                         pass
                 except Exception as e:
                     try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
                     except: pass
-                
+
                 await asyncio.sleep(10)
-            
-            if j+1 == n:
+
+            if not cancelled and j + 1 == n:
                 await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
         
         finally:
