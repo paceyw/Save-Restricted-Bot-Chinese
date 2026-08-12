@@ -10,6 +10,11 @@ import string
 import random
 from shared_client import app, _WORKDIR
 from utils.func import get_user_data_key, save_user_data
+try:
+    from utils.encrypt import ecs, dcs
+except ImportError:
+    ecs = None
+    dcs = None
 
 VIDEO_EXTENSIONS = {
     'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm',
@@ -106,12 +111,31 @@ __👉 **注意：** 如果您使用自定义机器人，您的机器人必须�
     await query.answer()
 
 
+async def _stop_cached_user_client(user_id):
+    try:
+        from plugins.batch import UC, Y
+    except ImportError:
+        try:
+            from plugins.batch import UC
+        except ImportError:
+            return
+        Y = None
+
+    old_client = UC.pop(user_id, None)
+    if old_client is not None and old_client is not Y:
+        try:
+            await old_client.stop()
+        except Exception:
+            pass
+
+
 async def _do_logout(user_id, query):
     from utils.func import users_collection
     result = await users_collection.update_one(
         {'user_id': user_id},
         {'$unset': {'session_string': ''}}
     )
+    await _stop_cached_user_client(user_id)
     if result.modified_count > 0:
         await query.message.reply_text('已成功退出登录并删除会话。')
     else:
@@ -227,10 +251,25 @@ async def handle_setreplacement(message, user_id):
             await save_user_data(user_id, 'replacement_words', replacements)
             await message.reply_text(f"✅ 已保存替换规则：'{word}' 将替换为 '{replace_word}'")
 
+def _prepare_session_string(session_string):
+    encrypt_session = ecs
+    decrypt_session = dcs
+    if encrypt_session is None or decrypt_session is None:
+        from utils.encrypt import ecs as encrypt_session, dcs as decrypt_session
+    try:
+        if ':' in decrypt_session(session_string):
+            return session_string
+    except Exception:
+        pass
+    return encrypt_session(session_string)
+
+
 async def handle_addsession(message, user_id):
     session_string = message.text.strip()
-    await save_user_data(user_id, 'session_string', session_string)
+    encrypted_session = _prepare_session_string(session_string)
+    await save_user_data(user_id, 'session_string', encrypted_session)
     await message.reply_text('✅ 会话字符串添加成功！')
+
 
 async def handle_deleteword(message, user_id):
     words_to_delete = message.text.split()
