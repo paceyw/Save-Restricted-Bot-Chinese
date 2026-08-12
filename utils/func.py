@@ -16,8 +16,8 @@ from config import MONGO_DB as MONGO_URI, DB_NAME
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PUBLIC_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/([^/]+)(/(\d+))?')
-PRIVATE_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/c/(\d+)(/(\d+))?')
+PUBLIC_LINK_PATTERN = re.compile(r'^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([^/]+)/(?:\d+/)?(\d+)')
+PRIVATE_LINK_PATTERN = re.compile(r'^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/c/(\d+)/(?:\d+/)?(\d+)')
 VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"}
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
@@ -44,9 +44,11 @@ def hhmmss(seconds):
     return time.strftime('%H:%M:%S', time.gmtime(seconds))
 
 
-def E(L):   
-    private_match = re.match(r'https://t\.me/c/(\d+)/(?:\d+/)?(\d+)', L)
-    public_match = re.match(r'https://t\.me/([^/]+)/(?:\d+/)?(\d+)', L)
+def E(L):
+    if not isinstance(L, str):
+        return None, None, None
+    private_match = re.match(r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/c/(\d+)/(?:\d+/)?(\d+)', L)
+    public_match = re.match(r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([^/]+)/(?:\d+/)?(\d+)', L)
     
     if private_match:
         return f'-100{private_match.group(1)}', int(private_match.group(2)), 'private'
