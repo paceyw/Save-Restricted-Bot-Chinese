@@ -7,7 +7,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant, FloodWait
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
-from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata
+from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
 from shared_client import app as X, _WORKDIR
 from plugins.settings import rename_file
@@ -465,6 +465,11 @@ async def process_album(c, u, msgs, d, lt, uid, i):
             if not f:
                 print(f'Album item {idx + 1} download failed, skipping')
                 continue
+            if one.video:
+                # Videos without an audio track are treated as animations by
+                # Telegram; mixed into SendMultiMedia they fail the whole album
+                # with MEDIA_EMPTY. Remux a silent track before uploading.
+                f = await ensure_audio_track(f)
             files.append(f)
             if one.photo:
                 media.append(InputMediaPhoto(f))

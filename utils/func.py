@@ -230,6 +230,39 @@ async def screenshot(video: str, duration: int, sender: str) -> str | None:
         return None
 
 
+async def ensure_audio_track(file_path):
+    """Telegram treats a video without an audio track as an animation; mixed
+    into SendMultiMedia that makes the whole album fail with MEDIA_EMPTY.
+    Remux with a silent AAC track (stream copy, no re-encode). Returns the
+    path to use (original on probe/remux failure)."""
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0", file_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await probe.communicate()
+        if out.strip():
+            return file_path
+        stem, _ = os.path.splitext(file_path)
+        fixed = f"{stem}_mux.mp4"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", file_path,
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-c:v", "copy", "-c:a", "aac", "-shortest", fixed,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode == 0 and os.path.isfile(fixed) and os.path.getsize(fixed) > 0:
+            os.remove(file_path)
+            return fixed
+        logger.error(f"ffmpeg remux failed for {file_path}: {err.decode()[-200:]}")
+        if os.path.isfile(fixed):
+            os.remove(fixed)
+        return file_path
+    except Exception as e:
+        logger.error(f"ensure_audio_track failed for {file_path}: {e}")
+        return file_path
+
+
 async def get_video_metadata(file_path):
     default_values = {'width': 1, 'height': 1, 'duration': 1}
     loop = asyncio.get_event_loop()
