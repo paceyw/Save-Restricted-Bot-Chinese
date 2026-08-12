@@ -22,7 +22,7 @@ import string
 import requests
 import logging
 import math
-from shared_client import app
+from shared_client import app, _WORKDIR
 from pyrogram import filters
 from utils.func import get_video_metadata, screenshot
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
  
 thread_pool = ThreadPoolExecutor()
 ongoing_downloads = {}
+screenshot_lock = asyncio.Lock()
 
 UPLOAD_HEADER = "╭─────────────────────╮\n│      **__上传中__**\n├─────────────────────"
  
@@ -82,8 +83,11 @@ async def process_audio(message, url, cookies_env_var=None):
             temp_cookie_file.write(cookies)
             temp_cookie_path = temp_cookie_file.name
 
-    random_filename = f"@team_spy_pro_{message.from_user.id}"
+    download_dir = os.path.join(_WORKDIR, 'downloads')
+    os.makedirs(download_dir, exist_ok=True)
+    random_filename = os.path.join(download_dir, f"@team_spy_pro_{message.from_user.id}")
     download_path = f"{random_filename}.mp3"
+    thumbnail_path = None
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -105,6 +109,7 @@ async def process_audio(message, url, cookies_env_var=None):
 
         if os.path.exists(download_path):
             def edit_metadata():
+                nonlocal thumbnail_path
                 audio_file = MP3(download_path, ID3=ID3)
                 try:
                     audio_file.add_tags()
@@ -113,16 +118,16 @@ async def process_audio(message, url, cookies_env_var=None):
                 audio_file.tags["TIT2"] = TIT2(encoding=3, text=title)
                 audio_file.tags["TPE1"] = TPE1(encoding=3, text="Team SPY")
                 audio_file.tags["COMM"] = COMM(encoding=3, lang="eng", desc="Comment", text="Processed by Team SPY")
-
                 thumbnail_url = info_dict.get('thumbnail')
                 if thumbnail_url:
-                    thumbnail_path = os.path.join(tempfile.gettempdir(), "thumb.jpg")
+                    thumbnail_path = os.path.join(
+                        download_dir, f"thumb_{get_random_string()}.jpg"
+                    )
                     asyncio.run(download_thumbnail_async(thumbnail_url, thumbnail_path))
                     with open(thumbnail_path, 'rb') as img:
                         audio_file.tags["APIC"] = APIC(
                             encoding=3, mime='image/jpeg', type=3, desc='Cover', data=img.read()
                         )
-                    os.remove(thumbnail_path)
                 audio_file.save()
 
             await asyncio.to_thread(edit_metadata)
@@ -150,6 +155,8 @@ async def process_audio(message, url, cookies_env_var=None):
     finally:
         if os.path.exists(download_path):
             os.remove(download_path)
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            os.remove(thumbnail_path)
         if temp_cookie_path and os.path.exists(temp_cookie_path):
             os.remove(temp_cookie_path)
 
@@ -216,6 +223,7 @@ async def dl_handler(client, message):
         return    
 
     url = message.text.split()[1]
+    ongoing_downloads[user_id] = True
 
     try:
         if "instagram.com" in url:
@@ -234,8 +242,9 @@ async def dl_handler(client, message):
 async def process_video(message, url, cookies, check_duration_and_size=False):
     logger.info(f"Received link: {url}")
 
-    random_filename = get_random_string() + ".mp4"
-    download_path = os.path.abspath(random_filename)
+    download_dir = os.path.join(_WORKDIR, 'downloads')
+    os.makedirs(download_dir, exist_ok=True)
+    download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
     logger.info(f"Generated random download path: {download_path}")
 
     temp_cookie_path = None
@@ -246,6 +255,8 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
         logger.info(f"Created temporary cookie file at: {temp_cookie_path}")
 
     thumbnail_file = None
+    thumbnail_path = None
+    screenshot_file = None
     metadata = {'width': None, 'height': None, 'duration': None, 'thumbnail': None}
 
     ydl_opts = {
@@ -277,15 +288,27 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
         THUMB = None
 
         if thumbnail_url:
-            thumbnail_file = os.path.join(tempfile.gettempdir(), get_random_string() + ".jpg")
-            downloaded_thumb = d_thumbnail(thumbnail_url, thumbnail_file)
+            thumbnail_path = os.path.join(download_dir, get_random_string() + ".jpg")
+            downloaded_thumb = d_thumbnail(thumbnail_url, thumbnail_path)
             if downloaded_thumb:
+                thumbnail_file = downloaded_thumb
                 logger.info(f"Thumbnail saved at: {downloaded_thumb}")
+            else:
+                thumbnail_file = None
 
         if thumbnail_file:
             THUMB = thumbnail_file
         else:
-            THUMB = await screenshot(download_path, metadata['duration'], message.from_user.id)
+            async with screenshot_lock:
+                previous_cwd = os.getcwd()
+                try:
+                    os.chdir(download_dir)
+                    THUMB = await screenshot(download_path, metadata['duration'], message.from_user.id)
+                    if THUMB and not os.path.isabs(THUMB):
+                        THUMB = os.path.join(download_dir, THUMB)
+                finally:
+                    os.chdir(previous_cwd)
+            screenshot_file = THUMB
 
         caption = f"{title}"
         # Telegram bot API single-file limit is 2 GB; larger files are split.
@@ -319,12 +342,19 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
         logger.exception("An error occurred during download or upload.")
         await message.reply_text(f"**__发生错误：{e}__**")
     finally:
-        if os.path.exists(download_path):
-            os.remove(download_path)
+        cleanup_paths = {
+            download_path,
+            thumbnail_file,
+            thumbnail_path,
+            screenshot_file,
+            os.path.splitext(download_path)[0] + ".jpg",
+            os.path.splitext(download_path)[0] + ".webp",
+        }
+        for output_path in cleanup_paths:
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
         if temp_cookie_path and os.path.exists(temp_cookie_path):
             os.remove(temp_cookie_path)
-        if thumbnail_file and os.path.exists(thumbnail_file):
-            os.remove(thumbnail_file)
 
 
 async def split_and_upload_file(app, sender, file_path, caption):
@@ -334,32 +364,44 @@ async def split_and_upload_file(app, sender, file_path, caption):
 
     file_size = os.path.getsize(file_path)
     start = await app.send_message(sender, f"ℹ️ 文件大小：{file_size / (1024 * 1024):.2f} MB")
-    PART_SIZE =  int(1.9 * 1024 * 1024 * 1024)
+    PART_SIZE = int(1.9 * 1024 * 1024 * 1024)
+    CHUNK_SIZE = 8 * 1024 * 1024
 
     part_number = 0
+    base_name, file_ext = os.path.splitext(file_path)
     async with aiofiles.open(file_path, mode="rb") as f:
         while True:
-            chunk = await f.read(PART_SIZE)
-            if not chunk:
-                break
-
-            # Create part filename
-            base_name, file_ext = os.path.splitext(file_path)
             part_file = f"{base_name}.part{str(part_number).zfill(3)}{file_ext}"
+            bytes_written = 0
+            try:
+                async with aiofiles.open(part_file, mode="wb") as part_f:
+                    while bytes_written < PART_SIZE:
+                        chunk = await f.read(min(CHUNK_SIZE, PART_SIZE - bytes_written))
+                        if not chunk:
+                            break
+                        await part_f.write(chunk)
+                        bytes_written += len(chunk)
 
-            # Write part to file
-            async with aiofiles.open(part_file, mode="wb") as part_f:
-                await part_f.write(chunk)
+                if bytes_written == 0:
+                    break
 
-            # Uploading part
-            edit = await app.send_message(sender, f"⬆️ 正在上传第 {part_number + 1} 部分...")
-            part_caption = f"{caption} \n\n**第 {part_number + 1} 部分：**"
-            await app.send_document(sender, document=part_file, caption=part_caption,
-                progress=progress_bar,
-                progress_args=(UPLOAD_HEADER, edit, time.time())
-            )
-            await edit.delete()
-            os.remove(part_file)
+                edit = None
+                try:
+                    edit = await app.send_message(sender, f"⬆️ 正在上传第 {part_number + 1} 部分...")
+                    part_caption = f"{caption} \n\n**第 {part_number + 1} 部分：**"
+                    await app.send_document(sender, document=part_file, caption=part_caption,
+                        progress=progress_bar,
+                        progress_args=(UPLOAD_HEADER, edit, time.time())
+                    )
+                finally:
+                    if edit:
+                        try:
+                            await edit.delete()
+                        except Exception:
+                            logger.warning("Failed to delete part upload progress message", exc_info=True)
+            finally:
+                if os.path.exists(part_file):
+                    os.remove(part_file)
 
             part_number += 1
 
