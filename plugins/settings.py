@@ -155,7 +155,7 @@ async def _do_reset(user_id, query):
                 'chat_id': ''
             }}
         )
-        thumbnail_path = f'{user_id}.jpg'
+        thumbnail_path = os.path.join(_WORKDIR, f'{user_id}.jpg')
         if os.path.exists(thumbnail_path):
             os.remove(thumbnail_path)
         await query.message.reply_text('✅ 所有设置已成功重置。如需退出登录，请点击 /logout')
@@ -221,6 +221,14 @@ async def handle_conversation_input(client, message):
 async def handle_setchat(message, user_id):
     try:
         chat_id = message.text.strip()
+        try:
+            chat_id_int = int(chat_id)
+        except ValueError:
+            await message.reply_text('❌ 无效的聊天 ID，请输入数字 ID（频道/群组通常为 -100 开头的负数）。')
+            return
+        if chat_id_int >= 0:
+            await message.reply_text('❌ 聊天 ID 必须为负数（频道/群组 ID），例如 -1001234567890。')
+            return
         await save_user_data(user_id, 'chat_id', chat_id)
         await message.reply_text('✅ 聊天 ID 设置成功！')
     except Exception as e:
@@ -237,7 +245,7 @@ async def handle_setcaption(message, user_id):
     await message.reply_text('✅ 标题设置成功！')
 
 async def handle_setreplacement(message, user_id):
-    match = re.match("'(.+)' '(.+)'", message.text)
+    match = re.match(r"^'([^']+)'\s+'([^']+)'$", message.text)
     if not match:
         await message.reply_text("❌ 格式无效。用法：'WORD(s)' 'REPLACEWORD'")
     else:
@@ -284,8 +292,13 @@ async def handle_setthumb(message, user_id):
         # resolve "downloads/" against PARENT_DIR (/app, read-only).
         download_path = os.path.join(_WORKDIR, 'downloads', f'thumb_{user_id}.jpg')
         temp_path = await app.download_media(message, file_name=download_path)
+        if not temp_path:
+            await message.reply_text('❌ 下载缩略图失败，请重试。')
+            return
         try:
-            thumb_path = f'{user_id}.jpg'
+            # Must match utils.func.thumbnail(): absolute path under the
+            # writable volume - cwd is /app (read-only) in the container.
+            thumb_path = os.path.join(_WORKDIR, f'{user_id}.jpg')
             if os.path.exists(thumb_path):
                 os.remove(thumb_path)
             os.rename(temp_path, thumb_path)

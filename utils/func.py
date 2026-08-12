@@ -33,7 +33,11 @@ def is_private_link(link):
 
 
 def thumbnail(sender):
-    return f'{sender}.jpg' if os.path.exists(f'{sender}.jpg') else None
+    # plugins.settings.handle_setthumb stores the file under _WORKDIR (the
+    # writable volume); resolve the same absolute path here.
+    from shared_client import _WORKDIR
+    path = os.path.join(_WORKDIR, f'{sender}.jpg')
+    return path if os.path.exists(path) else None
 
 
 def hhmmss(seconds):
