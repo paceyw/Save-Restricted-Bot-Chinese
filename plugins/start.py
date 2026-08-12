@@ -6,104 +6,86 @@ from shared_client import app
 from pyrogram import filters
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from config import LOG_GROUP, OWNER_ID, FORCE_SUB
+from config import LOG_GROUP, OWNER_ID, FORCE_SUB, PAY_NOTICE, ADMIN_CONTACT
 
 async def subscribe(app, message):
     if FORCE_SUB:
         try:
           user = await app.get_chat_member(FORCE_SUB, message.from_user.id)
           if str(user.status) == "ChatMemberStatus.BANNED":
-              await message.reply_text("You are Banned. Contact -- Team SPY")
+              await message.reply_text("您已被封禁。请联系 -- Team SPY")
               return 1
         except UserNotParticipant:
             link = await app.export_chat_invite_link(FORCE_SUB)
-            caption = f"Join our channel to use the bot"
-            await message.reply_photo(photo="https://graph.org/file/d44f024a08ded19452152.jpg",caption=caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Now...", url=f"{link}")]]))
+            caption = f"加入我们的频道后即可使用机器人"
+            await message.reply_photo(photo="https://graph.org/file/d44f024a08ded19452152.jpg",caption=caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("立即加入...", url=f"{link}")]]))
             return 1
         except Exception as ggn:
-            await message.reply_text(f"Something Went Wrong. Contact admins... with following message {ggn}")
+            await message.reply_text(f"出现错误。请联系管理员……以下是错误信息：{ggn}")
             return 1 
      
 @app.on_message(filters.command("set"))
 async def set(_, message):
     if message.from_user.id not in OWNER_ID:
-        await message.reply("You are not authorized to use this command.")
+        await message.reply("您没有权限使用此命令。")
         return
      
     await app.set_bot_commands([
-        BotCommand("start", "🚀 Start the bot"),
-        BotCommand("batch", "🫠 Extract in bulk"),
-        BotCommand("login", "🔑 Get into the bot"),
-        BotCommand("setbot", "🧸 Add your bot for handling files"),
-        BotCommand("logout", "🚪 Get out of the bot"),
-        BotCommand("adl", "👻 Download audio from 30+ sites"),
-        BotCommand("dl", "💀 Download videos from 30+ sites"),
-        BotCommand("status", "⟳ Refresh Payment status"),
-        BotCommand("transfer", "💘 Gift premium to others"),
-        BotCommand("add", "➕ Add user to premium"),
-        BotCommand("rem", "➖ Remove from premium"),
-        BotCommand("rembot", "🤨 Remove your custom bot"),
-        BotCommand("settings", "⚙️ Personalize things"),
-        BotCommand("plan", "🗓️ Check our premium plans"),
-        BotCommand("terms", "🥺 Terms and conditions"),
-        BotCommand("help", "❓ If you're a noob, still!"),
-        BotCommand("cancel", "🚫 Cancel login/batch/settings process"),
-        BotCommand("stop", "🚫 Cancel batch process")
+        BotCommand("start", "🚀 启动机器人"),
+        BotCommand("batch", "🫠 批量提取"),
+        BotCommand("single", "🔖 单条提取"),
+        BotCommand("login", "🔑 登录机器人"),
+        BotCommand("setbot", "🧸 添加处理文件的机器人"),
+        BotCommand("rembot", "🤨 移除您的自定义机器人"),
+        BotCommand("logout", "🚪 退出机器人"),
+        BotCommand("status", "📊 查看您的状态"),
+        BotCommand("myplan", "📋 查看您的会员套餐"),
+        BotCommand("transfer", "💘 将会员转赠他人"),
+        BotCommand("add", "➕ 添加用户为会员"),
+        BotCommand("rem", "➖ 移除会员"),
+        BotCommand("settings", "⚙️ 个性化设置"),
+        BotCommand("plan", "🗓️ 查看会员方案"),
+        BotCommand("pay", "💎 开通/续费会员"),
+        BotCommand("terms", "🥺 条款和条件"),
+        BotCommand("help", "❓ 新手也能看懂！"),
+        BotCommand("cancel", "🚫 取消登录/批量/设置流程"),
+        BotCommand("stop", "🚫 取消批量提取流程")
     ])
  
-    await message.reply("✅ Commands configured successfully!")
+    await message.reply("✅ 命令配置成功！")
  
  
  
  
 help_pages = [
     (
-        "📝 **Bot Commands Overview (1/2)**:\n\n"
-        "1. **/add userID**\n"
-        "> Add user to premium (Owner only)\n\n"
-        "2. **/rem userID**\n"
-        "> Remove user from premium (Owner only)\n\n"
-        "3. **/transfer userID**\n"
-        "> Transfer premium to your beloved major purpose for resellers (Premium members only)\n\n"
-        "4. **/get**\n"
-        "> Get all user IDs (Owner only)\n\n"
-        "5. **/lock**\n"
-        "> Lock channel from extraction (Owner only)\n\n"
-        "6. **/dl link**\n"
-        "> Download videos (Not available in v3 if you are using)\n\n"
-        "7. **/adl link**\n"
-        "> Download audio (Not available in v3 if you are using)\n\n"
-        "8. **/login**\n"
-        "> Log into the bot for private channel access\n\n"
-        "9. **/batch**\n"
-        "> Bulk extraction for posts (After login)\n\n"
+        "📝 **机器人命令概览（1/2）**：\n\n"
+        "🔑 **账号与登录**\n"
+        "• **/login** — 登录以访问受限内容\n"
+        "• **/logout** — 退出登录\n"
+        "• **/setbot** — 添加自定义处理机器人\n"
+        "• **/rembot** — 移除自定义机器人\n\n"
+        "📥 **内容提取**\n"
+        "• **/batch** — 批量提取帖子（登录后使用）\n"
+        "• **/single** — 单条提取\n"
+        "• **/cancel** / **/stop** — 取消进行中的任务\n\n"
+        "⚙️ **个性化**\n"
+        "• **/settings** — 重命名标签 / 标题 / 缩略图 / 会话等设置\n"
     ),
     (
-        "📝 **Bot Commands Overview (2/2)**:\n\n"
-        "10. **/logout**\n"
-        "> Logout from the bot\n\n"
-        "11. **/stats**\n"
-        "> Get bot stats\n\n"
-        "12. **/plan**\n"
-        "> Check premium plans\n\n"
-        "13. **/speedtest**\n"
-        "> Test the server speed (not available in v3)\n\n"
-        "14. **/terms**\n"
-        "> Terms and conditions\n\n"
-        "15. **/cancel**\n"
-        "> Cancel ongoing batch process\n\n"
-        "16. **/myplan**\n"
-        "> Get details about your plans\n\n"
-        "17. **/session**\n"
-        "> Generate Pyrogram V2 session\n\n"
-        "18. **/settings**\n"
-        "> 1. SETCHATID : To directly upload in channel or group or user's dm use it with -100[chatID]\n"
-        "> 2. SETRENAME : To add custom rename tag or username of your channels\n"
-        "> 3. CAPTION : To add custom caption\n"
-        "> 4. REPLACEWORDS : Can be used for words in deleted set via REMOVE WORDS\n"
-        "> 5. RESET : To set the things back to default\n\n"
-        "> You can set CUSTOM THUMBNAIL, PDF WATERMARK, VIDEO WATERMARK, SESSION-based login, etc. from settings\n\n"
-        "**__Powered by Team SPY__**"
+        "📝 **机器人命令概览（2/2）**：\n\n"
+        "💎 **会员**\n"
+        "• **/status** — 查看登录与会员状态\n"
+        "• **/myplan** — 查看您的会员套餐\n"
+        "• **/plan** — 查看会员方案\n"
+        "• **/pay** — 开通 / 续费会员\n"
+        "• **/transfer** — 将会员转赠他人（仅高级会员）\n\n"
+        "ℹ️ **其他**\n"
+        "• **/help** — 查看本帮助\n"
+        "• **/terms** — 条款和条件\n"
+        "• **/add** — 添加会员（仅管理员）\n"
+        "• **/rem** — 移除会员（仅管理员）\n\n"
+        "**__由 Team SPY 提供支持__**"
     )
 ]
  
@@ -113,8 +95,8 @@ async def send_or_edit_help_page(_, message, page_number):
         return
  
      
-    prev_button = InlineKeyboardButton("◀️ Previous", callback_data=f"help_prev_{page_number}")
-    next_button = InlineKeyboardButton("Next ▶️", callback_data=f"help_next_{page_number}")
+    prev_button = InlineKeyboardButton("◀️ 上一页", callback_data=f"help_prev_{page_number}")
+    next_button = InlineKeyboardButton("下一页 ▶️", callback_data=f"help_next_{page_number}")
  
      
     buttons = []
@@ -162,74 +144,20 @@ async def on_help_navigation(client, callback_query):
 @app.on_message(filters.command("terms") & filters.private)
 async def terms(client, message):
     terms_text = (
-        "> 📜 **Terms and Conditions** 📜\n\n"
-        "✨ We are not responsible for user deeds, and we do not promote copyrighted content. If any user engages in such activities, it is solely their responsibility.\n"
-        "✨ Upon purchase, we do not guarantee the uptime, downtime, or the validity of the plan. __Authorization and banning of users are at our discretion; we reserve the right to ban or authorize users at any time.__\n"
-        "✨ Payment to us **__does not guarantee__** authorization for the /batch command. All decisions regarding authorization are made at our discretion and mood.\n"
+        "> 📜 **条款和条件** 📜\n\n"
+        "✨ 我们不对用户的行为负责，也不推广受版权保护的内容。如有用户从事此类活动，责任由其自行承担。\n"
+        "✨ 购买后，我们不保证方案的在线时间、停机时间或有效性。__用户的授权和封禁由我们自行决定；我们保留随时封禁或授权用户的权利。__\n"
     )
-     
     buttons = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📋 See Plans", callback_data="see_plan")],
-            [InlineKeyboardButton("💬 Contact Now", url="https://t.me/kingofpatal")],
+            [InlineKeyboardButton("💬 联系开通", url=ADMIN_CONTACT)],
         ]
     )
     await message.reply_text(terms_text, reply_markup=buttons)
- 
- 
+
+
 @app.on_message(filters.command("plan") & filters.private)
 async def plan(client, message):
-    plan_text = (
-        "> 💰 **Premium Price**:\n\n Starting from $2 or 200 INR accepted via **__Amazon Gift Card__** (terms and conditions apply).\n"
-        "📥 **Download Limit**: Users can download up to 100,000 files in a single batch command.\n"
-        "🛑 **Batch**: You will get two modes /bulk and /batch.\n"
-        "   - Users are advised to wait for the process to automatically cancel before proceeding with any downloads or uploads.\n\n"
-        "📜 **Terms and Conditions**: For further details and complete terms and conditions, please send /terms.\n"
-    )
-     
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📜 See Terms", callback_data="see_terms")],
-            [InlineKeyboardButton("💬 Contact Now", url="https://t.me/kingofpatal")],
-        ]
-    )
-    await message.reply_text(plan_text, reply_markup=buttons)
- 
- 
-@app.on_callback_query(filters.regex("see_plan"))
-async def see_plan(client, callback_query):
-    plan_text = (
-        "> 💰**Premium Price**\n\n Starting from $2 or 200 INR accepted via **__Amazon Gift Card__** (terms and conditions apply).\n"
-        "📥 **Download Limit**: Users can download up to 100,000 files in a single batch command.\n"
-        "🛑 **Batch**: You will get two modes /bulk and /batch.\n"
-        "   - Users are advised to wait for the process to automatically cancel before proceeding with any downloads or uploads.\n\n"
-        "📜 **Terms and Conditions**: For further details and complete terms and conditions, please send /terms or click See Terms👇\n"
-    )
-     
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📜 See Terms", callback_data="see_terms")],
-            [InlineKeyboardButton("💬 Contact Now", url="https://t.me/kingofpatal")],
-        ]
-    )
-    await callback_query.message.edit_text(plan_text, reply_markup=buttons)
- 
- 
-@app.on_callback_query(filters.regex("see_terms"))
-async def see_terms(client, callback_query):
-    terms_text = (
-        "> 📜 **Terms and Conditions** 📜\n\n"
-        "✨ We are not responsible for user deeds, and we do not promote copyrighted content. If any user engages in such activities, it is solely their responsibility.\n"
-        "✨ Upon purchase, we do not guarantee the uptime, downtime, or the validity of the plan. __Authorization and banning of users are at our discretion; we reserve the right to ban or authorize users at any time.__\n"
-        "✨ Payment to us **__does not guarantee__** authorization for the /batch command. All decisions regarding authorization are made at our discretion and mood.\n"
-    )
-     
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 See Plans", callback_data="see_plan")],
-            [InlineKeyboardButton("💬 Contact Now", url="https://t.me/kingofpatal")],
-        ]
-    )
-    await callback_query.message.edit_text(terms_text, reply_markup=buttons)
+    await message.reply_text(PAY_NOTICE)
  
  

@@ -48,6 +48,14 @@ PREMIUM_LIMIT  = int(os.getenv("PREMIUM_LIMIT", "500"))
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
 
+# ─── PAY NOTICE (统一付费提示文案) ─────────────────────────────────────────────
+# 所有支付/会员入口均展示此文案，引导用户联系人工开通。
+# 通过环境变量 PAY_NOTICE 配置；默认值不含真实联系方式，部署时在 .env 中填写。
+PAY_NOTICE = os.getenv(
+    "PAY_NOTICE",
+    "私密消息转发BOT（限私域使用），如需使用请联系管理员付费。"
+)
+
 # ════════════════════════════════════════════════════════════════════════════════
 # ░ PREMIUM PLANS CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════════

@@ -1,204 +1,189 @@
-<h1 align="center">
-  Save Restricted Content Bot v3
-</h1>
+<div align="center">
 
-The Save Restricted Content Bot is a stable Telegram bot developed by devgagan and TEAM SPY. It enables users to forward (no forward tag) messages from Telegram channels and groups, offering features such as custom thumbnail support and the ability to upload files up to 4GB. Additionally, the bot supports downloading videos from platforms like YouTube, Instagram, and Facebook, along with over 100 other sites(which ytdlp supports)
+# Save Restricted Content Bot v3 · 中文优化版
 
-[Telegram](https://t.me/save_restricted_content_bots) | [See Recent Updates](https://github.com/devgaganin/Save-Restricted-Content-Bot-V2/tree/v3#updates)
+Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 
-### Star the repo it motivate us to update new features
-Please do start and max fork thanks 
+</div>
 
-## 📚 About This Branch
-- This branch is based on `Pyrogram V2` offering enhanced stability and a forced login feature. User are not forced to login in bot for public channels but for public groups and private channel they have to do login.
-- for detailed features scroll down to features section
+> 本仓库 Fork 自 [devgaganin/Save-Restricted-Content-Bot-v3](https://github.com/devgaganin/Save-Restricted-Content-Bot-v3)，并在其基础上做了关键 Bug 修复与中文本地化。
+> 所有 **合规使用** 仅限转发自己有权访问的内容；不得用于绕过他人设置的访问限制、抓取受版权保护内容等用途。
 
 ---
 
-## 🔧 Features
-- Extract content from both public and private channels/groups.
-- Custom bot functionality added use `/setbot`
-- 128 bit encryption for data saving use @v3saverbot on telegram to generate `MASTER_KEY`, `IV_KEY`
-- Rename and forward content to other channels or users.
-- extract restricted content from other bots how to use format link like `https://botusername(without @)/message_id(get it from plus messenger)`
-- `/login` method along with `session` based login
-- Custom captions and thumbnails.
-- Auto-remove default video thumbnails.
-- Delete or replace words in filenames and captions.
-- Auto-pin messages if enabled.
-- download yt/insta/Twitter/fb ect normal ytdlp supported sites that supports best format
-- Login via phone number.
-- **Supports 4GB file uploads**: The bot can handle large file uploads, up to 4GB in size.
-- file splitter if not premium string
-- **Enhanced Timer**: Distinct timers for free and paid users to limit usage and improve service.
-- **Improved Looping**: Optimized looping for processing multiple files or links, reducing delays and enhancing performance.
-- **Premium Access**: Premium users enjoy faster processing speeds and priority queue management.
-- ~~ads setup shorlink ads token system~~
-- ~~fast uploader via `SpyLib` using Telethon modules and `mautrix bridge repo`~~ 
-- Directly upload to `topic` in any topic enabled group
-- real time download and uplaod progress, support chats, text , audio, video , video note sticker everything
+## 🔧 本 Fork 相对原版做了什么
 
-  
-## ⚡ Commands
+原版 v3 存在一个**架构性缺陷**：机器人的命令处理器一部分注册在 Telethon 客户端上，但 `shared_client.py` 为了让 Pyrogram 独占接收消息，主动关闭了 Telethon 的 update loop。结果所有写在 Telethon 上的命令**永远收不到消息**，处于完全失效状态。
 
-- **`start`**: 🚀 Start the bot.
-- **`batch`**: 🫠 Extract in bulk.
-- **`login`**: 🔑 Get into the bot.
-- **`single`**: Process single link.
-- **`setbot`**: add your custome bot.
-- **`logout`**: 🚪 Get out of the bot.
-- **`adl`**: 👻 Download audio from 30+ sites.
-- **`dl`**: 💀 Download videos from 30+ sites.
-- **`transfer`**: 💘 Gift premium to others.
-- **`status`**: ⌛ Get your plan details.
-- **`add`**: ➕ Add user to premium.
-- **`rem`**: ➖ Remove user from premium.
-- **`rembot`**: remove your custome bot.
-- **`session`**: 🧵 Generate Pyrogramv2 session.
-- **`settings`**: ⚙️ Personalize settings.
-- **`stats`**: 📊 Get stats of the bot.
-- **`plan`**: 🗓️ Check our premium plans.
-- **`terms`**: 🥺 Terms and conditions.
-- **`help`**: ❓ Help if you're new.
-- **`cancel`**: 🚫 Cancel batch process.
+本 Fork 的核心修复如下：
 
+| 修复项 | 原版问题 | 本 Fork 处理 |
+|---|---|---|
+| **命令失效（核心）** | `/status`、`/transfer`、`/rem`、`/add`、`/settings`（含全部设置按钮）、`/adl`、`/dl` 共 9 个处理器注册在被关闭 loop 的 Telethon 上，全部无反应 | 全部迁移到正在收消息的 Pyrogram 客户端，命令恢复正常响应 |
+| **`/myplan` 幽灵命令** | help 文本宣传 `/myplan`，但代码库无任何实现 | 新增 `/myplan`，显示当前会员套餐与到期时间 |
+| **`pay.py` 崩溃** | 支付成功回调引用了未导入的 `OWNER_ID`，且 `send_message` 缺 chat_id 参数，必然抛异常 | 整个支付流程重写为统一提示文案 |
+| **菜单与实际不符** | `set_bot_commands` 注册了多个实际瘫痪的命令；help 列出 `/get` `/lock` `/session` 等不存在的命令 | 菜单与 help 全部对齐真实可用命令 |
+| **缺少 `.gitignore`** | 原仓库无 `.gitignore`，`telethonbot.session`（含登录态）等敏感文件易误提交 | 新增 `.gitignore`，排除 session/缓存/媒体/数据库文件 |
+| **`ytdl` cookie 传参错误** | 调用处传入字面量字符串 `"YT_COOKIES"`，而非已导入的 cookie 内容 | 已修正，传入实际 cookie 值 |
+| **`ytdl` 大文件阈值错误** | 大文件判断写成 `2*1024*1024`（2 MiB），与宣称的 2 GB 不符 | 已修正为 2 GB |
 
-## ⚙️ Required Variables
+### 支付/会员入口调整
 
-<details>
-<summary><b>Click to view required variables</b></summary>
+本 Fork 将所有支付与会员开通入口（`/start`、`/pay`、`/plan`、`/myplan` 非会员分支）统一改为提示：
 
-To run the bot, you'll need to configure a few sensitive variables. Here's how to set them up securely:
+> 私密消息转发BOT（限私域使用），如需使用请联系管理员付费。
 
-- **`API_ID`**: Your API ID from [telegram.org](https://my.telegram.org/auth).
-- **`API_HASH`**: Your API Hash from [telegram.org](https://my.telegram.org/auth).
-- **`BOT_TOKEN`**: Get your bot token from [@BotFather](https://t.me/botfather).
-- **`OWNER_ID`**: Use [@missrose_bot](https://t.me/missrose_bot) to get your user ID by sending `/info`.
-- **`CHANNEL_ID`**: The ID of the channel for forced subscription.
-- **`LOG_GROUP`**: A group or channel where the bot logs messages. Forward a message to [@userinfobot](https://t.me/userinfobot) to get your channel/group ID.
-- **`MONGO_DB`**: A MongoDB URL for storing session data (recommended for security).
-  
-### Additional Configuration Options:
-- **`STRING`**: (Optional) Add your **premium account session string** here to allow 4GB file uploads. This is **optional** and can be left empty if not used.
-- **`FREEMIUM_LIMIT`**: Default is `0`. Set this to any value you want to allow free users to extract content. If set to `0`, free users will not have access to any extraction features.
-- **`PREMIUM_LIMIT`**: Default is `500`. This is the batch limit for premium users. You can customize this to allow premium users to process more links/files in one batch.
-- **`YT_COOKIES`**: Yt cookies for downloading yt videos 
-- **`INSTA_COOKIES`**: If you want to enable instagram downloading fill cookiesn
-
-**How to get cookies ??** : use mozila firfox if on android or use chrome on desktop and download extension get this cookie or any Netscape Cookies (HTTP Cookies) extractor and use that 
-
-### Monetization (Optional):
-- **`WEBSITE_URL`**: (Optional) This is the domain for your monetization short link service. Provide the shortener's domain name, for example: `upshrink.com`. Do **not** include `www` or `https://`. The default link shortener is already set.
-- **`AD_API`**: (Optional) The API key from your link shortener service (e.g., **Upshrink**, **AdFly**, etc.) to monetize links. Enter the API provided by your shortener.
-
-> **Important:** Always keep your credentials secure! Never hard-code them in the repository. Use environment variables or a `.env` file.
-
-</details>
+`/terms`（条款）页面的联系按钮和付费文案通过环境变量 `PAY_NOTICE`、`ADMIN_CONTACT` 配置（见 `config.py`），部署时在 `.env` 中填写自己的联系方式。
 
 ---
 
-## 🚀 Deployment Guide
+## ⚡ 可用命令
 
-<details>
-<summary><b>Deploy on VPS</b></summary>
+本 Fork 中**实际可用**的命令（全部已验证注册到 Pyrogram 客户端）：
 
-1. Fork the repo.
-2. Update `config.py` with your values.
-3. Run the following:
-   ```bash
-   sudo apt update
-   sudo apt install ffmpeg git python3-pip
-   git clone your_repo_link
-   cd your_repo_name
-   pip3 install -r requirements.txt
-   python3 main.py
-   ```
+### 🔑 账号与登录
+| 命令 | 说明 |
+|---|---|
+| `/login` | 登录以访问受限内容 |
+| `/logout` | 退出登录 |
+| `/setbot` | 添加自定义处理机器人（用户自己的 Bot Token） |
+| `/rembot` | 移除自定义机器人 |
 
-- To run the bot in the background:
-  ```bash
-  screen -S gagan
-  python3 main.py
-  ```
-  - Detach: `Ctrl + A`, then `Ctrl + D`
-  - To stop: `screen -r gagan` and `screen -S gagan -X quit`
+### 📥 内容提取
+| 命令 | 说明 |
+|---|---|
+| `/batch` | 批量提取帖子（登录后使用） |
+| `/single` | 单条提取 |
+| `/cancel` | 取消进行中的登录/批量/设置流程 |
+| `/stop` | 取消批量提取流程 |
 
-</details>
+### ⚙️ 个性化设置
+| 命令 | 说明 |
+|---|---|
+| `/settings` | 设置重命名标签 / 标题 / 缩略图 / 会话 / 删除词语 / 替换词语等 |
 
-<details>
-<summary><b>Deploy on Heroku</b></summary>
+### 💎 会员
+| 命令 | 说明 |
+|---|---|
+| `/status` | 查看登录与会员状态 |
+| `/myplan` | 查看您的会员套餐 |
+| `/plan` | 查看会员方案（本 Fork 显示联系提示） |
+| `/pay` | 开通 / 续费会员（本 Fork 显示联系提示） |
+| `/transfer` | 将会员转赠他人（仅高级会员） |
 
-1. Fork and Star the repo.
-2. Click [![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://www.heroku.com/deploy).
-3. Enter required variables and click deploy ✅.
+### 🎬 媒体下载
+| 命令 | 说明 |
+|---|---|
+| `/dl <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点） |
+| `/adl <链接>` | 提取音频 |
 
-</details>
-
-<details>
-<summary><b>Deploy on Render</b></summary>
-
-1. Fork and star the repo.
-2. Edit `config.py` or set environment variables on Render.
-3. Go to [render.com](https://render.com), sign up/log in.
-4. Create a new web service, select the free plan.
-5. Connect your GitHub repo and deploy ✅.
-
-</details>
-
-<details>
-<summary><b>Deploy on Koyeb</b></summary>
-
-1. Fork and star the repo.
-2. Edit `config.py` or set environment variables on Koyeb.
-3. Create a new service, select `Dockerfile` as build type.
-4. Connect your GitHub repo and deploy ✅.
-
-</details>
-
----
-### ⚠️ Must Do: Secure Your Sensitive Variables
-
-**Do not expose sensitive variables (e.g., `API_ID`, `API_HASH`, `BOT_TOKEN`) on GitHub. Use environment variables to keep them secure.**
-
-### Configuring Variables Securely:
-
-- **On VPS or Local Machine:**
-  - Use a text editor to edit `config.py`:
-    ```bash
-    nano config.py
-    ```
-  - Alternatively, export as environment variables:
-    ```bash
-    export API_ID=your_api_id
-    export API_HASH=your_api_hash
-    export BOT_TOKEN=your_bot_token
-    ```
-
-- **For Cloud Platforms (Heroku, Railway, etc.):**
-  - Set environment variables directly in your platform’s dashboard.
-
-- **Using `.env` File:**
-  - Create a `.env` file and add your credentials:
-    ```
-    API_ID=your_api_id
-    API_HASH=your_api_hash
-    BOT_TOKEN=your_bot_token
-    ```
-  - Make sure to add `.env` to `.gitignore` to prevent it from being pushed to GitHub.
-
-**Why This is Important?**
-Your credentials can be stolen if pushed to a public repository. Always keep them secure by using environment variables or local configuration files.
+### ℹ️ 其他
+| 命令 | 说明 |
+|---|---|
+| `/start` | 启动机器人（本 Fork 显示联系提示） |
+| `/help` | 查看帮助（分页） |
+| `/terms` | 条款和条件 |
+| `/add <ID> <时长> <单位>` | 添加会员（仅管理员） |
+| `/rem <ID>` | 移除会员（仅管理员） |
+| `/set` | 设置机器人命令菜单（仅管理员） |
 
 ---
 
-## 🛠️ Terms of Use
+## 🔑 必需的环境变量
 
-Visit the [Terms of Use](https://github.com/devgaganin/Save-Restricted-Content-Bot-Repo/blob/master/TERMS_OF_USE.md) page to review and accept the guidelines.
-## Important Note
+| 变量 | 说明 | 获取方式 |
+|---|---|---|
+| `API_ID` | Telegram API ID | [my.telegram.org](https://my.telegram.org/apps) |
+| `API_HASH` | Telegram API Hash | 同上 |
+| `BOT_TOKEN` | 机器人 Token | [@BotFather](https://t.me/botfather) |
+| `OWNER_ID` | 管理员用户 ID（可多个，空格分隔） | [@userinfobot](https://t.me/userinfobot) |
+| `MONGO_DB` | MongoDB 连接 URI | 自建 MongoDB，格式见部署指南 |
+| `DB_NAME` | 数据库名，默认 `telegram_downloader` | — |
+| `MASTER_KEY` | 会话加密密钥（32 字节十六进制） | 自行生成随机值，**勿用源码默认值** |
+| `IV_KEY` | 解密密钥（16 字节十六进制） | 自行生成随机值，**勿用源码默认值** |
 
-**Note**: Changing the terms and commands doesn't magically make you a developer. Real development involves understanding the code, writing new functionalities, and debugging issues, not just renaming things. If only it were that easy!
+### 可选变量
 
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `STRING` | 空 | 高级账号 Pyrogram V2 会话字符串，启用后支持 4GB 上传 |
+| `LOG_GROUP` | `-1001234456` | 日志群组/频道 Chat ID |
+| `FORCE_SUB` | `-10012345567` | 强制订阅频道 ID；填 `0` 不启用 |
+| `FREEMIUM_LIMIT` | `0` | 免费用户提取上限，`0` 表示不允许 |
+| `PREMIUM_LIMIT` | `500` | 高级用户批量上限 |
+| `YT_COOKIES` | 空 | YouTube 下载用 Netscape cookie |
+| `INSTA_COOKIES` | 空 | Instagram 下载用 cookie |
+| `JOIN_LINK` | `t.me/team_spy_pro` | 加入链接 |
+| `ADMIN_CONTACT` | — | 管理员联系方式 |
+| `PLAN_*` | 见 `config.py` | 会员方案价格/时长配置 |
 
-<h3 align="center">
-  Developed with ❤️ by <a href="https://t.me/team_spy_pro"> Gagan </a>
-</h3>
+> ⚠️ **安全**：`config.py` 中 `MASTER_KEY`/`IV_KEY` 的默认值仅用于演示。生产部署务必通过环境变量覆盖为随机值，否则任何人都能解密你的用户会话。
 
+---
+
+## 🚀 快速部署
+
+详见 [**部署指南**](DEPLOYMENT.md)。最简流程（Docker Compose）：
+
+```bash
+git clone https://github.com/paceyw/Save-Restricted-Bot-Chinese.git
+cd Save-Restricted-Bot-Chinese
+cp .env.example .env
+# 编辑 .env 填入真实凭证
+docker compose up -d --build
+```
+
+---
+
+## 📁 项目结构
+
+```
+├── main.py              # 启动入口：加载共享客户端 + 动态加载 plugins/
+├── shared_client.py     # Telethon（API-only）+ Pyrogram（收消息）客户端
+├── config.py            # 从环境变量读取配置；PAY_NOTICE 统一提示文案
+├── app.py               # Flask 健康检查页（端口 5000）
+├── plugins/
+│   ├── start.py         # /start /help /plan /terms /set 菜单
+│   ├── login.py         # 用户登录、会话保存、自定义 Bot 管理
+│   ├── batch.py         # 批量/单条消息提取与上传
+│   ├── ytdl.py          # yt-dlp 音视频下载（Pyrogram 上传）
+│   ├── settings.py      # 用户个性化设置（重命名/标题/缩略图/会话）
+│   ├── premium.py       # /add 会员管理、/start 处理
+│   ├── pay.py           # 付费入口（统一提示文案）
+│   └── stats.py         # /status /myplan /transfer /rem
+├── utils/
+│   ├── func.py          # MongoDB 集合、文件处理、视频元数据
+│   ├── encrypt.py       # 会话加密（AES-GCM）
+│   └── custom_filters.py# 登录流程过滤器
+└── templates/welcome.html
+```
+
+### 架构说明
+
+机器人同时使用两个 Telegram 库：
+- **Pyrogram**（`app`）：**唯一接收消息的客户端**，所有命令处理器都注册在此。
+- **Telethon**（`client`）：降级为 **API-only** 客户端（不接收消息），仅供少数 API 调用使用。
+
+由于同一个 `BOT_TOKEN` 只能由一个 session 接收推送，`shared_client.py` 选择让 Pyrogram 独占 update loop。**这是为什么所有命令必须注册在 Pyrogram 上**——原版的部分命令错误注册在 Telethon 上，正是它们失效的根因。
+
+---
+
+## ⚖️ 免责声明
+
+- 本机器人仅用于转发 **您自己有权访问** 的 Telegram 内容。
+- 不对用户行为负责，不推广受版权保护的内容。
+- 使用非官方客户端登录的账号可能受到 Telegram 的额外审查，请只使用合法授权的账号。
+- 遵守 [Telegram API Terms of Service](https://core.telegram.org/api/terms)。
+
+---
+
+## 🙏 致谢
+
+- 原作者：[devgagan / Team SPY](https://github.com/devgaganin)
+- 本 Fork 仅做 Bug 修复与中文本地化，核心功能源自原项目。
+
+<div align="center">
+
+本 Fork 由 [paceyw](https://github.com/paceyw) 维护 · 基于 devgaganin 的原项目
+
+</div>

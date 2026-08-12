@@ -212,7 +212,7 @@ async def prog(c, t, C, h, m, st):
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
         speed = c / (time.time() - st) / (1024 * 1024) if time.time() > st else 0
         eta = time.strftime('%M:%S', time.gmtime((t - c) / (speed * 1024 * 1024))) if speed > 0 else '00:00'
-        await C.edit_message_text(h, m, f"__**Pyro Handler...**__\n\n{bar}\n\n⚡**__Completed__**: {c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__Done__**: {p:.2f}%\n🚀 **__Speed__**: {speed:.2f} MB/s\n⏳ **__ETA__**: {eta}\n\n**__Powered by Team SPY__**")
+        await C.edit_message_text(h, m, f"__**Pyro 处理器...**__\n\n{bar}\n\n⚡**__已完成__**：{c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__完成度__**：{p:.2f}%\n🚀 **__速度__**：{speed:.2f} MB/s\n⏳ **__预计剩余时间__**：{eta}\n\n**__由 Team SPY 提供支持__**")
         if p >= 100: P.pop(m, None)
 
 async def send_direct(c, m, tcid, ft=None, rtmid=None):
@@ -263,7 +263,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 return 'Sent directly.'
             
             st = time.time()
-            p = await c.send_message(d, 'Downloading...')
+            p = await c.send_message(d, '正在下载...')
 
             c_name = f"{time.time()}"
             if m.video:
@@ -289,10 +289,10 @@ async def process_msg(c, u, m, d, lt, uid, i):
             f = await u.download_media(m, file_name=c_name, progress=prog, progress_args=(c, d, p.id, st))
             
             if not f:
-                await c.edit_message_text(d, p.id, 'Failed.')
+                await c.edit_message_text(d, p.id, '失败。')
                 return 'Failed.'
             
-            await c.edit_message_text(d, p.id, 'Renaming...')
+            await c.edit_message_text(d, p.id, '正在重命名...')
             if (
                 (m.video and m.video.file_name) or
                 (m.audio and m.audio.file_name) or
@@ -305,7 +305,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
             
             if fsize > 2 and Y:
                 st = time.time()
-                await c.edit_message_text(d, p.id, 'File is larger than 2GB. Using alternative method...')
+                await c.edit_message_text(d, p.id, '文件大于 2GB，正在使用备用方法...')
                 await upd_dlg(Y)
                 mtd = await get_video_metadata(f)
                 dur, h, w = mtd['duration'], mtd['width'], mtd['height']
@@ -335,7 +335,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 
                 return 'Done (Large file).'
             
-            await c.edit_message_text(d, p.id, 'Uploading...')
+            await c.edit_message_text(d, p.id, '正在上传...')
             st = time.time()
 
             try:
@@ -375,7 +375,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
                                         progress=prog, progress_args=(c, d, p.id, st), 
                                         reply_to_message_id=rtmid)
             except Exception as e:
-                await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:30]}')
+                await c.edit_message_text(d, p.id, f'上传失败：{str(e)[:30]}')
                 if os.path.exists(f): os.remove(f)
                 return 'Failed.'
             
@@ -396,34 +396,34 @@ async def process_cmd(c, m):
     cmd = m.command[0]
     
     if FREEMIUM_LIMIT == 0 and not await is_premium_user(uid):
-        await m.reply_text("This bot does not provide free servies, get subscription from OWNER")
+        await m.reply_text("此机器人不提供免费服务，请向管理员订阅")
         return
     
     if await sub(c, m) == 1: return
-    pro = await m.reply_text('Doing some checks hold on...')
+    pro = await m.reply_text('正在进行检查，请稍候...')
     
     if is_user_active(uid):
-        await pro.edit('You have an active task. Use /stop to cancel it.')
+        await pro.edit('您有一个正在进行的任务。使用 /stop 取消。')
         return
     
     ubot = await get_ubot(uid)
     if not ubot:
-        await pro.edit('Add your bot with /setbot first')
+        await pro.edit('请先使用 /setbot 添加您的机器人')
         return
     
     Z[uid] = {'step': 'start' if cmd == 'batch' else 'start_single'}
-    await pro.edit(f'Send {"start link..." if cmd == "batch" else "link you to process"}.')
+    await pro.edit(f'发送 {"起始链接..." if cmd == "batch" else "要处理的链接"}。')
 
 @X.on_message(filters.command(['cancel', 'stop']))
 async def cancel_cmd(c, m):
     uid = m.from_user.id
     if is_user_active(uid):
         if await request_batch_cancel(uid):
-            await m.reply_text('Cancellation requested. The current batch will stop after the current download completes.')
+            await m.reply_text('已请求取消。当前批量提取将在本次下载完成后停止。')
         else:
-            await m.reply_text('Failed to request cancellation. Please try again.')
+            await m.reply_text('请求取消失败，请重试。')
     else:
-        await m.reply_text('No active batch process found.')
+        await m.reply_text('未找到正在进行的批量提取。')
 
 @X.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
@@ -434,45 +434,45 @@ async def text_handler(c, m):
     s = Z[uid].get('step')
     x = await get_ubot(uid)
     if not x:
-        await message.reply("Add your bot /setbot `token`")
+        await message.reply("请添加您的机器人 /setbot `token`")
         return
 
     if s == 'start':
         L = m.text
         i, d, lt = E(L)
         if not i or not d:
-            await m.reply_text('Invalid link format.')
+            await m.reply_text('链接格式无效。')
             Z.pop(uid, None)
             return
         Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
-        await m.reply_text('How many messages?')
+        await m.reply_text('要处理多少条消息？')
 
     elif s == 'start_single':
         L = m.text
         i, d, lt = E(L)
         if not i or not d:
-            await m.reply_text('Invalid link format.')
+            await m.reply_text('链接格式无效。')
             Z.pop(uid, None)
             return
 
         Z[uid].update({'step': 'process_single', 'cid': i, 'sid': d, 'lt': lt})
         i, s, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['lt']
-        pt = await m.reply_text('Processing...')
+        pt = await m.reply_text('处理中...')
         
         ubot = UB.get(uid)
         if not ubot:
-            await pt.edit('Add bot with /setbot first')
+            await pt.edit('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
         
         uc = await get_uclient(uid)
         if not uc:
-            await pt.edit('Cannot proceed without user client.')
+            await pt.edit('没有用户客户端，无法继续。')
             Z.pop(uid, None)
             return
             
         if is_user_active(uid):
-            await pt.edit('Active task exists. Use /stop first.')
+            await pt.edit('存在正在进行的任务。请先使用 /stop。')
             Z.pop(uid, None)
             return
 
@@ -482,39 +482,39 @@ async def text_handler(c, m):
                 res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
                 await pt.edit(f'1/1: {res}')
             else:
-                await pt.edit('Message not found')
+                await pt.edit('未找到消息')
         except Exception as e:
-            await pt.edit(f'Error: {str(e)[:50]}')
+            await pt.edit(f'错误：{str(e)[:50]}')
         finally:
             Z.pop(uid, None)
 
     elif s == 'count':
         if not m.text.isdigit():
-            await m.reply_text('Enter valid number.')
+            await m.reply_text('请输入有效数字。')
             return
         
         count = int(m.text)
         maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
 
         if count > maxlimit:
-            await m.reply_text(f'Maximum limit is {maxlimit}.')
+            await m.reply_text(f'最大限制为 {maxlimit}。')
             return
 
         Z[uid].update({'step': 'process', 'did': str(m.chat.id), 'num': count})
         i, s, n, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['num'], Z[uid]['lt']
         success = 0
 
-        pt = await m.reply_text('Processing batch...')
+        pt = await m.reply_text('正在进行批量提取...')
         uc = await get_uclient(uid)
         ubot = UB.get(uid)
         
         if not uc or not ubot:
-            await pt.edit('Missing client setup')
+            await pt.edit('客户端配置缺失')
             Z.pop(uid, None)
             return
             
         if is_user_active(uid):
-            await pt.edit('Active task exists')
+            await pt.edit('存在正在进行的任务')
             Z.pop(uid, None)
             return
         
@@ -530,7 +530,7 @@ async def text_handler(c, m):
             for j in range(n):
                 
                 if should_cancel(uid):
-                    await pt.edit(f'Cancelled at {j}/{n}. Success: {success}')
+                    await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
                     break
                 
                 await update_batch_progress(uid, j, success)
@@ -546,13 +546,13 @@ async def text_handler(c, m):
                     else:
                         pass
                 except Exception as e:
-                    try: await pt.edit(f'{j+1}/{n}: Error - {str(e)[:30]}')
+                    try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
                     except: pass
                 
                 await asyncio.sleep(10)
             
             if j+1 == n:
-                await m.reply_text(f'Batch Completed ✅ Success: {success}/{n}')
+                await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
         
         finally:
             await remove_active_batch(uid)

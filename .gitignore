@@ -1,0 +1,47 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Telegram session files (contain auth credentials)
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+*session*
+
+# Cookies
+*cookie*
+*cookies*
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Downloaded media and temp files
+*.mp4
+*.mp3
+*.m4a
+*.mkv
+*.avi
+*.mov
+*.webm
+*.part*
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Logs
+*.log

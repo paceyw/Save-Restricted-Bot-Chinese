@@ -2,154 +2,173 @@
 # Licensed under the GNU General Public License v3.0.  
 # See LICENSE file in the repository root for full license text.
 
-from telethon import events, Button
+from pyrogram import filters
+from pyrogram.types import InlineKeyboardButton as IK, InlineKeyboardMarkup as IKM
 import re
 import os
-import asyncio
 import string
 import random
-from shared_client import client as gf
-from config import OWNER_ID
-from utils.func import get_user_data_key, save_user_data, users_collection
+from shared_client import app
+from utils.func import get_user_data_key, save_user_data
 
 VIDEO_EXTENSIONS = {
     'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm',
     'mpeg', 'mpg', '3gp'
 }
 SET_PIC = 'settings.jpg'
-MESS = 'Customize settings for your files...'
+MESS = '自定义文件设置...'
 
 active_conversations = {}
 
-@gf.on(events.NewMessage(incoming=True, pattern='/settings'))
-async def settings_command(event):
-    user_id = event.sender_id
-    await send_settings_message(event.chat_id, user_id)
+
+def settings_menu():
+    return IKM([
+        [IK('📝 设置聊天 ID', callback_data='setchat'),
+         IK('🏷️ 设置重命名标签', callback_data='setrename')],
+        [IK('📋 设置标题', callback_data='setcaption'),
+         IK('🔄 替换词语', callback_data='setreplacement')],
+        [IK('🗑️ 删除词语', callback_data='delete'),
+         IK('🔄 重置设置', callback_data='reset')],
+        [IK('🔑 会话登录', callback_data='addsession'),
+         IK('🚪 退出登录', callback_data='logout')],
+        [IK('🖼️ 设置缩略图', callback_data='setthumb'),
+         IK('❌ 移除缩略图', callback_data='remthumb')],
+        [IK('🆘 报告错误', url='https://t.me/team_spy_pro')]
+    ])
+
+
+@app.on_message(filters.command("settings"))
+async def settings_command(client, message):
+    user_id = message.from_user.id
+    await app.send_message(message.chat.id, MESS, reply_markup=settings_menu())
+
 
 async def send_settings_message(chat_id, user_id):
-    buttons = [
-        [
-            Button.inline('📝 Set Chat ID', b'setchat'),
-            Button.inline('🏷️ Set Rename Tag', b'setrename')
-        ],
-        [
-            Button.inline('📋 Set Caption', b'setcaption'),
-            Button.inline('🔄 Replace Words', b'setreplacement')
-        ],
-        [
-            Button.inline('🗑️ Remove Words', b'delete'),
-            Button.inline('🔄 Reset Settings', b'reset')
-        ],
-        [
-            Button.inline('🔑 Session Login', b'addsession'),
-            Button.inline('🚪 Logout', b'logout')
-        ],
-        [
-            Button.inline('🖼️ Set Thumbnail', b'setthumb'),
-            Button.inline('❌ Remove Thumbnail', b'remthumb')
-        ],
-        [
-            Button.url('🆘 Report Errors', 'https://t.me/team_spy_pro')
-        ]
-    ]
-    await gf.send_message(chat_id, MESS, buttons=buttons)
+    await app.send_message(chat_id, MESS, reply_markup=settings_menu())
 
-@gf.on(events.CallbackQuery)
-async def callback_query_handler(event):
-    user_id = event.sender_id
-    
+
+@app.on_callback_query()
+async def callback_query_handler(client, query):
+    user_id = query.from_user.id
+    data = query.data
+
     callback_actions = {
-        b'setchat': {
+        'setchat': {
             'type': 'setchat',
-            'message': """Send me the ID of that chat(with -100 prefix): 
-__👉 **Note:** if you are using custom bot then your bot should be admin that chat if not then this bot should be admin.__
-👉 __If you want to upload in topic group and in specific topic then pass chat id as **-100CHANNELID/TOPIC_ID** for example: **-1004783898/12**__"""
+            'message': """请向我发送该聊天的 ID（带 -100 前缀）： 
+__👉 **注意：** 如果您使用自定义机器人，您的机器人必须是该聊天的管理员，否则本机器人必须是管理员。__
+👉 __如果您想上传到群组中的话题以及特定话题，请按 **-100CHANNELID/TOPIC_ID** 这种格式传入聊天 ID，例如：**-1004783898/12**__"""
         },
-        b'setrename': {
+        'setrename': {
             'type': 'setrename',
-            'message': 'Send me the rename tag:'
+            'message': '请向我发送重命名标签：'
         },
-        b'setcaption': {
+        'setcaption': {
             'type': 'setcaption',
-            'message': 'Send me the caption:'
+            'message': '请向我发送标题：'
         },
-        b'setreplacement': {
+        'setreplacement': {
             'type': 'setreplacement',
-            'message': "Send me the replacement words in the format: 'WORD(s)' 'REPLACEWORD'"
+            'message': "请按以下格式发送替换词：'WORD(s)' 'REPLACEWORD'"
         },
-        b'addsession': {
+        'addsession': {
             'type': 'addsession',
-            'message': 'Send Pyrogram V2 session string:'
+            'message': '请发送 Pyrogram V2 会话字符串：'
         },
-        b'delete': {
+        'delete': {
             'type': 'deleteword',
-            'message': 'Send words separated by space to delete them from caption/filename...'
+            'message': '请用空格分隔发送要从标题/文件名中删除的词语...'
         },
-        b'setthumb': {
+        'setthumb': {
             'type': 'setthumb',
-            'message': 'Please send the photo you want to set as the thumbnail.'
+            'message': '请发送要设置为缩略图的照片。'
         }
     }
-    
-    if event.data in callback_actions:
-        action = callback_actions[event.data]
-        await start_conversation(event, user_id, action['type'], action['message'])
-    elif event.data == b'logout':
-        result = await users_collection.update_one(
-            {'user_id': user_id},
-            {'$unset': {'session_string': ''}}
-        )
-        if result.modified_count > 0:
-            await event.respond('Logged out and deleted session successfully.')
-        else:
-            await event.respond('You are not logged in.')
-    elif event.data == b'reset':
-        try:
-            await users_collection.update_one(
-                {'user_id': user_id},
-                {'$unset': {
-                    'delete_words': '',
-                    'replacement_words': '',
-                    'rename_tag': '',
-                    'caption': '',
-                    'chat_id': ''
-                }}
-            )
-            thumbnail_path = f'{user_id}.jpg'
-            if os.path.exists(thumbnail_path):
-                os.remove(thumbnail_path)
-            await event.respond('✅ All settings reset successfully. To logout, click /logout')
-        except Exception as e:
-            await event.respond(f'Error resetting settings: {e}')
-    elif event.data == b'remthumb':
-        try:
-            os.remove(f'{user_id}.jpg')
-            await event.respond('Thumbnail removed successfully!')
-        except FileNotFoundError:
-            await event.respond('No thumbnail found to remove.')
 
-async def start_conversation(event, user_id, conv_type, prompt_message):
+    if data in callback_actions:
+        action = callback_actions[data]
+        await start_conversation(query, user_id, action['type'], action['message'])
+    elif data == 'logout':
+        await _do_logout(user_id, query)
+    elif data == 'reset':
+        await _do_reset(user_id, query)
+    elif data == 'remthumb':
+        await _do_remthumb(user_id, query)
+
+    await query.answer()
+
+
+async def _do_logout(user_id, query):
+    from utils.func import users_collection
+    result = await users_collection.update_one(
+        {'user_id': user_id},
+        {'$unset': {'session_string': ''}}
+    )
+    if result.modified_count > 0:
+        await query.message.reply_text('已成功退出登录并删除会话。')
+    else:
+        await query.message.reply_text('您尚未登录。')
+
+
+async def _do_reset(user_id, query):
+    from utils.func import users_collection
+    try:
+        await users_collection.update_one(
+            {'user_id': user_id},
+            {'$unset': {
+                'delete_words': '',
+                'replacement_words': '',
+                'rename_tag': '',
+                'caption': '',
+                'chat_id': ''
+            }}
+        )
+        thumbnail_path = f'{user_id}.jpg'
+        if os.path.exists(thumbnail_path):
+            os.remove(thumbnail_path)
+        await query.message.reply_text('✅ 所有设置已成功重置。如需退出登录，请点击 /logout')
+    except Exception as e:
+        await query.message.reply_text(f'重置设置时出错：{e}')
+
+
+async def _do_remthumb(user_id, query):
+    try:
+        os.remove(f'{user_id}.jpg')
+        await query.message.reply_text('缩略图已成功移除！')
+    except FileNotFoundError:
+        await query.message.reply_text('未找到可移除的缩略图。')
+
+
+async def start_conversation(query, user_id, conv_type, prompt_message):
     if user_id in active_conversations:
-        await event.respond('Previous conversation cancelled. Starting new one.')
-    
-    msg = await event.respond(f'{prompt_message}\n\n(Send /cancel to cancel this operation)')
+        await query.message.reply_text('上一次对话已取消，开始新的对话。')
+
+    msg = await query.message.reply_text(f'{prompt_message}\n\n（发送 /cancel 取消此操作）')
     active_conversations[user_id] = {'type': conv_type, 'message_id': msg.id}
 
-@gf.on(events.NewMessage(pattern='/cancel'))
-async def cancel_conversation(event):
-    user_id = event.sender_id
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_conversation(client, message):
+    user_id = message.from_user.id
     if user_id in active_conversations:
-        await event.respond('Cancelled enjoy baby...')
+        await message.reply_text('已取消。')
         del active_conversations[user_id]
 
-@gf.on(events.NewMessage())
-async def handle_conversation_input(event):
-    user_id = event.sender_id
-    if user_id not in active_conversations or event.message.text.startswith('/'):
+
+@app.on_message(filters.private & ~filters.command([
+    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set',
+    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys',
+    'setbot', 'rembot', 'status', 'myplan', 'transfer', 'rem', 'add', 'plan', 'terms', 'help',
+    'settings', 'dl', 'adl']))
+async def handle_conversation_input(client, message):
+    user_id = message.from_user.id
+    if user_id not in active_conversations:
         return
-        
+    if message.text and message.text.startswith('/'):
+        return
+
     conv_type = active_conversations[user_id]['type']
-    
+
     handlers = {
         'setchat': handle_setchat,
         'setrename': handle_setrename,
@@ -159,71 +178,72 @@ async def handle_conversation_input(event):
         'deleteword': handle_deleteword,
         'setthumb': handle_setthumb
     }
-    
+
     if conv_type in handlers:
-        await handlers[conv_type](event, user_id)
-    
+        await handlers[conv_type](message, user_id)
+
     if user_id in active_conversations:
         del active_conversations[user_id]
 
-async def handle_setchat(event, user_id):
+
+async def handle_setchat(message, user_id):
     try:
-        chat_id = event.text.strip()
+        chat_id = message.text.strip()
         await save_user_data(user_id, 'chat_id', chat_id)
-        await event.respond('✅ Chat ID set successfully!')
+        await message.reply_text('✅ 聊天 ID 设置成功！')
     except Exception as e:
-        await event.respond(f'❌ Error setting chat ID: {e}')
+        await message.reply_text(f'❌ 设置聊天 ID 时出错：{e}')
 
-async def handle_setrename(event, user_id):
-    rename_tag = event.text.strip()
+async def handle_setrename(message, user_id):
+    rename_tag = message.text.strip()
     await save_user_data(user_id, 'rename_tag', rename_tag)
-    await event.respond(f'✅ Rename tag set to: {rename_tag}')
+    await message.reply_text(f'✅ 重命名标签已设置为：{rename_tag}')
 
-async def handle_setcaption(event, user_id):
-    caption = event.text
+async def handle_setcaption(message, user_id):
+    caption = message.text
     await save_user_data(user_id, 'caption', caption)
-    await event.respond(f'✅ Caption set successfully!')
+    await message.reply_text('✅ 标题设置成功！')
 
-async def handle_setreplacement(event, user_id):
-    match = re.match("'(.+)' '(.+)'", event.text)
+async def handle_setreplacement(message, user_id):
+    match = re.match("'(.+)' '(.+)'", message.text)
     if not match:
-        await event.respond("❌ Invalid format. Usage: 'WORD(s)' 'REPLACEWORD'")
+        await message.reply_text("❌ 格式无效。用法：'WORD(s)' 'REPLACEWORD'")
     else:
         word, replace_word = match.groups()
         delete_words = await get_user_data_key(user_id, 'delete_words', [])
         if word in delete_words:
-            await event.respond(f"❌ The word '{word}' is in the delete list and cannot be replaced.")
+            await message.reply_text(f"❌ 词语 '{word}' 在删除列表中，无法替换。")
         else:
             replacements = await get_user_data_key(user_id, 'replacement_words', {})
             replacements[word] = replace_word
             await save_user_data(user_id, 'replacement_words', replacements)
-            await event.respond(f"✅ Replacement saved: '{word}' will be replaced with '{replace_word}'")
+            await message.reply_text(f"✅ 已保存替换规则：'{word}' 将替换为 '{replace_word}'")
 
-async def handle_addsession(event, user_id):
-    session_string = event.text.strip()
+async def handle_addsession(message, user_id):
+    session_string = message.text.strip()
     await save_user_data(user_id, 'session_string', session_string)
-    await event.respond('✅ Session string added successfully!')
+    await message.reply_text('✅ 会话字符串添加成功！')
 
-async def handle_deleteword(event, user_id):
-    words_to_delete = event.message.text.split()
+async def handle_deleteword(message, user_id):
+    words_to_delete = message.text.split()
     delete_words = await get_user_data_key(user_id, 'delete_words', [])
     delete_words = list(set(delete_words + words_to_delete))
     await save_user_data(user_id, 'delete_words', delete_words)
-    await event.respond(f"✅ Words added to delete list: {', '.join(words_to_delete)}")
+    await message.reply_text(f"✅ 已添加到删除列表的词语：{', '.join(words_to_delete)}")
 
-async def handle_setthumb(event, user_id):
-    if event.photo:
-        temp_path = await event.download_media()
+async def handle_setthumb(message, user_id):
+    if message.photo:
+        temp_path = await app.download_media(message)
         try:
             thumb_path = f'{user_id}.jpg'
             if os.path.exists(thumb_path):
                 os.remove(thumb_path)
             os.rename(temp_path, thumb_path)
-            await event.respond('✅ Thumbnail saved successfully!')
+            await message.reply_text('✅ 缩略图保存成功！')
         except Exception as e:
-            await event.respond(f'❌ Error saving thumbnail: {e}')
+            await message.reply_text(f'❌ 保存缩略图时出错：{e}')
     else:
-        await event.respond('❌ Please send a photo. Operation cancelled.')
+        await message.reply_text('❌ 请发送照片，操作已取消。')
 
 def generate_random_name(length=7):
     characters = string.ascii_letters + string.digits
@@ -266,4 +286,3 @@ async def rename_file(file, sender, edit):
     except Exception as e:
         print(f"Rename error: {e}")
         return file
-        
