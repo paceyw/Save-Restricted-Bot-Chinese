@@ -9,27 +9,41 @@ from pyrogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarku
 from config import LOG_GROUP, OWNER_ID, FORCE_SUB, PAY_NOTICE, ADMIN_CONTACT
 
 async def subscribe(app, message):
-    if FORCE_SUB:
-        try:
-          user = await app.get_chat_member(FORCE_SUB, message.from_user.id)
-          if str(user.status) == "ChatMemberStatus.BANNED":
-              await message.reply_text("您已被封禁。请联系 -- Team SPY")
-              return 1
-        except UserNotParticipant:
-            link = await app.export_chat_invite_link(FORCE_SUB)
-            caption = f"加入我们的频道后即可使用机器人"
-            await message.reply_photo(photo="https://graph.org/file/d44f024a08ded19452152.jpg",caption=caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("立即加入...", url=f"{link}")]]))
+    if not FORCE_SUB:
+        return 0
+
+    try:
+        user = await app.get_chat_member(FORCE_SUB, message.from_user.id)
+        status = str(getattr(user, "status", "")).rsplit(".", 1)[-1].upper()
+        is_member = (
+            status in {"MEMBER", "ADMINISTRATOR", "CREATOR", "OWNER"}
+            or (status == "RESTRICTED" and bool(getattr(user, "is_member", False)))
+        )
+        if is_member:
+            return 0
+
+        if status == "BANNED":
+            await message.reply_text("您已被封禁。请联系 -- Team SPY")
             return 1
-        except Exception as ggn:
-            await message.reply_text(f"出现错误。请联系管理员……以下是错误信息：{ggn}")
-            return 1 
+
+        link = await app.export_chat_invite_link(FORCE_SUB)
+        caption = f"加入我们的频道后即可使用机器人"
+        await message.reply_photo(photo="https://graph.org/file/d44f024a08ded19452152.jpg",caption=caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("立即加入...", url=f"{link}")]]))
+        return 1
+    except UserNotParticipant:
+        link = await app.export_chat_invite_link(FORCE_SUB)
+        caption = f"加入我们的频道后即可使用机器人"
+        await message.reply_photo(photo="https://graph.org/file/d44f024a08ded19452152.jpg",caption=caption, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("立即加入...", url=f"{link}")]]))
+        return 1
+    except Exception as ggn:
+        await message.reply_text(f"出现错误。请联系管理员……以下是错误信息：{ggn}")
+        return 1
      
 @app.on_message(filters.command("set"))
 async def set(_, message):
     if message.from_user.id not in OWNER_ID:
         await message.reply("您没有权限使用此命令。")
         return
-     
     await app.set_bot_commands([
         BotCommand("start", "🚀 启动机器人"),
         BotCommand("batch", "🫠 批量提取"),
@@ -44,6 +58,8 @@ async def set(_, message):
         BotCommand("add", "➕ 添加用户为会员"),
         BotCommand("rem", "➖ 移除会员"),
         BotCommand("settings", "⚙️ 个性化设置"),
+        BotCommand("dl", "🎬 下载视频"),
+        BotCommand("adl", "🎵 提取音频"),
         BotCommand("plan", "🗓️ 查看会员方案"),
         BotCommand("pay", "💎 开通/续费会员"),
         BotCommand("terms", "🥺 条款和条件"),
@@ -68,6 +84,8 @@ help_pages = [
         "📥 **内容提取**\n"
         "• **/batch** — 批量提取帖子（登录后使用）\n"
         "• **/single** — 单条提取\n"
+        "• **/dl** — 下载视频\n"
+        "• **/adl** — 提取音频\n"
         "• **/cancel** / **/stop** — 取消进行中的任务\n\n"
         "⚙️ **个性化**\n"
         "• **/settings** — 重命名标签 / 标题 / 缩略图 / 会话等设置\n"
