@@ -16,7 +16,7 @@ if _WORKDIR.endswith("/tmp"):
     _WORKDIR = _WORKDIR[:-4]
 _WORKDIR = _WORKDIR or os.getcwd()
 
-client = TelegramClient("telethonbot", API_ID, API_HASH)
+client = TelegramClient(os.path.join(_WORKDIR, "telethonbot"), API_ID, API_HASH, receive_updates=False)
 app = Client("pyrogrambot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=_WORKDIR)
 userbot = Client("4gbbot", api_id=API_ID, api_hash=API_HASH, session_string=STRING, workdir=_WORKDIR)
 
