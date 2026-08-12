@@ -27,22 +27,6 @@ premium_users_collection = db["premium_users"]
 statistics_collection = db["statistics"]
 codedb = db["redeem_code"]
 
-# ------- < start > Session Encoder don't change -------
-
-a1 = "c2F2ZV9yZXN0cmljdGVkX2NvbnRlbnRfYm90cw=="
-a2 = "Nzk2"
-a3 = "Z2V0X21lc3NhZ2Vz" 
-a4 = "cmVwbHlfcGhvdG8=" 
-a5 = "c3RhcnQ="
-attr1 = "cGhvdG8="
-attr2 = "ZmlsZV9pZA=="
-a7 = "5ZeoIPCfkYsg5qyi6L+O5L2/55So77yBCgrinLPvuI8g5oiR5Y+v5Lul5L+d5a2Y5bey56aB5q2i6L2s5Y+R55qE6aKR6YGTL+e+pOe7hOS4reeahOW4luWtkO+8jOi/mOiDveS7jiBZb3VUdWJl44CBSW5zdGFncmFtIOetieekvuS6pOW5s+WPsOS4i+i9veinhumikS/pn7PpopEK4pyz77iPIOebtOaOpeWPkemAgeWFrOW8gOmikemBk+eahOW4luWtkOmTvuaOpeWNs+WPr+OAguengeWvhumikemBk+ivt+WFiCAvbG9naW7jgILlj5HpgIEgL2hlbHAg5LqG6Kej5pu05aSa44CC"
-a8 = "5Yqg5YWl6aKR6YGT"
-a9 = "6I635Y+W5Lya5ZGY"
-a10 = "aHR0cHM6Ly90Lm1lL3RlYW1fc3B5X3Bybw==" 
-a11 = "aHR0cHM6Ly90Lm1lL2tpbmdvZnBhdGFs" 
-
-# ------- < end > Session Encoder don't change --------
 
 def is_private_link(link):
     return bool(PRIVATE_LINK_PATTERN.match(link))

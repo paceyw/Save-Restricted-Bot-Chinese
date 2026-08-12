@@ -7,6 +7,9 @@ from pyrogram.types import Message
 from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified
 import logging
 import os
+import re
+import time
+import unicodedata
 from config import API_HASH, API_ID
 from shared_client import app as bot, _WORKDIR
 from utils.func import save_user_session, get_user_data, remove_user_session, save_user_bot, remove_user_bot
@@ -22,9 +25,78 @@ STEP_CODE = 2
 STEP_PASSWORD = 3
 login_cache = {}
 
+
+def _mask_phone(phone):
+    """Mask a phone number for logs: keep country prefix shape and last 2 digits."""
+    digits = re.sub(r'\D', '', phone or '')
+    if len(digits) <= 4:
+        return '***'
+    return f'+{digits[:2]}***{digits[-2:]}'
+
+
+def normalize_login_code(text):
+    """Extract digit characters from various user inputs.
+    
+    Accepts formats like: 12345, 1 2 3 4 5, 1-2-3-4-5, s12345, etc.
+    Telegram immediately invalidates codes sent in plain text, so users must obfuscate.
+    """
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    digits = []
+    for char in normalized:
+        if char.isdecimal():
+            digits.append(str(unicodedata.digit(char)))
+        elif char.isspace() or char in "-_.,;:/*\\|=+()[]{}~`!@#$%^&<>?":
+            continue
+        else:
+            # Any other letter/symbol makes the input invalid — user must use pure digits + separators
+            return ""
+    return "".join(digits)
+
+
+def extract_digits(text):
+    """Extract only decimal digits from any input (letters, symbols, whitespace ignored).
+    
+    Used as a robust fallback when users obfuscate codes like 's12345' or '1a2a3a4a5'.
+    """
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(
+        str(unicodedata.digit(char))
+        for char in normalized
+        if char.isdecimal()
+    )
+
+
+async def cleanup_temp_login(user_id, temp_client=None):
+    if temp_client is None:
+        temp_client = login_cache.get(user_id, {}).get("temp_client")
+    if temp_client is not None:
+        try:
+            await temp_client.disconnect()
+        except Exception:
+            pass
+    for ext in ("", "-journal", "-wal", "-shm"):
+        try:
+            os.remove(os.path.join(_WORKDIR, f"temp_{user_id}.session{ext}"))
+        except OSError:
+            pass
+
+async def request_login_code(user_id, temp_client, phone):
+    sent_code = await temp_client.send_code(phone)
+    login_cache[user_id]['phone'] = phone
+    login_cache[user_id]['phone_code_hash'] = sent_code.phone_code_hash
+    login_cache[user_id]['temp_client'] = temp_client
+    login_cache[user_id]['code_sent_at'] = time.monotonic()
+    login_cache[user_id]['dc_id'] = await temp_client.storage.dc_id()
+    return sent_code
+
 @bot.on_message(filters.command('login'))
 async def login_command(client, message):
     user_id = message.from_user.id
+    await cleanup_temp_login(user_id)
     set_user_step(user_id, STEP_PHONE)
     login_cache.pop(user_id, None)
     await message.delete()
@@ -38,57 +110,56 @@ async def login_command(client, message):
 @bot.on_message(filters.command("setbot"))
 async def set_bot_token(C, m):
     user_id = m.from_user.id
-    args = m.text.split(" ", 1)
-    if user_id in UB:
-        try:
-            await UB[user_id].stop()
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary
-                
-            try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
-            
-            print(f"Stopped and removed old bot for user {user_id}")
-        except Exception as e:
-            print(f"Error stopping old bot for user {user_id}: {e}")
-            del UB[user_id]  # Remove from dictionary
+    command_text = (m.text or "").strip()
+    args = command_text.split(maxsplit=1)
 
-    if len(args) < 2:
+    if len(args) < 2 or not args[1].strip():
         await m.reply_text("⚠️ 请提供机器人令牌。用法：`/setbot token`", quote=True)
         return
 
     bot_token = args[1].strip()
-    await save_user_bot(user_id, bot_token)
+    if not await save_user_bot(user_id, bot_token):
+        await m.reply_text("❌ 机器人令牌保存失败，请稍后重试。", quote=True)
+        return
+
+    session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
+    if user_id in UB:
+        try:
+            await UB[user_id].stop()
+            print(f"Stopped old bot for user {user_id}")
+        except Exception as e:
+            print(f"Error stopping old bot for user {user_id}: {e}")
+        finally:
+            UB.pop(user_id, None)
+
+    try:
+        if os.path.exists(session_path):
+            os.remove(session_path)
+    except Exception as e:
+        print(f"Error removing bot session for user {user_id}: {e}")
+
     await m.reply_text("✅ 机器人令牌保存成功。", quote=True)
-    
-    
+
+
 @bot.on_message(filters.command("rembot"))
 async def rem_bot_token(C, m):
     user_id = m.from_user.id
     if user_id in UB:
         try:
             await UB[user_id].stop()
-            
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary # Remove from dictionary
-            print(f"Stopped and removed old bot for user {user_id}")
-            try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
+            print(f"Stopped old bot for user {user_id}")
         except Exception as e:
             print(f"Error stopping old bot for user {user_id}: {e}")
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary  # Remove from dictionary
-            try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
+        finally:
+            UB.pop(user_id, None)
+
+    session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
+    try:
+        if os.path.exists(session_path):
+            os.remove(session_path)
+    except Exception as e:
+        print(f"Error removing bot session for user {user_id}: {e}")
+
     await remove_user_bot(user_id)
     await m.reply_text("✅ 机器人令牌已成功移除。", quote=True)
 
@@ -98,132 +169,193 @@ async def rem_bot_token(C, m):
     'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
 async def handle_login_steps(client, message):
     user_id = message.from_user.id
-    text = message.text.strip()
+    text = (message.text or "")
+    if get_user_step(user_id) != STEP_PASSWORD:
+        text = text.strip()
     step = get_user_step(user_id)
+
     try:
         await message.delete()
     except Exception as e:
         logger.warning(f'Could not delete message: {e}')
+
     status_msg = login_cache[user_id].get('status_msg')
     if not status_msg:
         status_msg = await message.reply('处理中...')
         login_cache[user_id]['status_msg'] = status_msg
+
     try:
         if step == STEP_PHONE:
             if not text.startswith('+'):
-                await edit_message_safely(status_msg,
-                    '❌ 请提供以 + 开头的有效手机号码')
+                await edit_message_safely(
+                    status_msg,
+                    '❌ 请提供以 + 开头的有效手机号码',
+                )
                 return
-            await edit_message_safely(status_msg,
-                '🔄 正在处理手机号码...')
-            temp_client = Client(f'temp_{user_id}', api_id=API_ID, api_hash
-                =API_HASH, device_model=model, workdir=_WORKDIR)
+
+            await edit_message_safely(status_msg, '🔄 正在处理手机号码...')
+            temp_client = Client(
+                f'temp_{user_id}',
+                api_id=API_ID,
+                api_hash=API_HASH,
+                device_model=model,
+                workdir=_WORKDIR,
+                in_memory=True,
+            )
             try:
                 await temp_client.connect()
-                import time as _time
-                sent_code = await temp_client.send_code(text)
-                logger.info(f'LOGIN send_code OK phone={text} type={sent_code.type}')
-                login_cache[user_id]['phone'] = text
-                login_cache[user_id]['phone_code_hash'
-                    ] = sent_code.phone_code_hash
-                login_cache[user_id]['temp_client'] = temp_client
-                login_cache[user_id]['code_sent_at'] = _time.time()
-                # Track which DC the code was actually sent from (may differ from initial DC)
-                login_cache[user_id]['dc_id'] = await temp_client.storage.dc_id()
+                sent_code = await request_login_code(user_id, temp_client, text)
+                logger.info(
+                    f'LOGIN send_code OK phone={_mask_phone(text)} type={sent_code.type} '
+                    f'dc={login_cache[user_id]["dc_id"]}'
+                )
                 set_user_step(user_id, STEP_CODE)
-                await edit_message_safely(status_msg,
+                await edit_message_safely(
+                    status_msg,
                     """✅ 验证码已发送到您的 Telegram 账户。
 
-请直接输入收到的验证码（加不加空格都可以）："""
-                    )
+⚠️ **请勿直接发送原始验证码**（Telegram 会将其立即失效）。
+请按以下任一格式输入（Bot 会自动提取数字）：
+• `1 2 3 4 5`
+• `s12345`
+• `1-2-3-4-5`""",
+                )
             except BadRequest as e:
-                await edit_message_safely(status_msg,
+                await edit_message_safely(
+                    status_msg,
                     f"""❌ 错误：{str(e)}
-请使用 /login 重试。""")
-                await temp_client.disconnect()
+请使用 /login 重试。""",
+                )
+                await cleanup_temp_login(user_id, temp_client)
                 set_user_step(user_id, None)
+
         elif step == STEP_CODE:
-            code = text.replace(' ', '')
+            # Extract digits from any format (plain, spaced, letter-mixed)
+            code = extract_digits(text)
+            if not code:
+                # Fallback to strict validation for truly invalid inputs
+                code = normalize_login_code(text)
+                if not code:
+                    await edit_message_safely(
+                        status_msg,
+                        '❌ 无法识别验证码。请使用混淆格式输入（如 `1 2 3 4 5` 或 `s12345`）：',
+                    )
+                    return
+
             phone = login_cache[user_id]['phone']
             phone_code_hash = login_cache[user_id]['phone_code_hash']
             temp_client = login_cache[user_id]['temp_client']
-            logger.info(f'LOGIN sign_in: phone={phone}')
-            _expected_dc = login_cache[user_id].get('dc_id', '?')
+            code_age = time.monotonic() - login_cache[user_id].get(
+                'code_sent_at',
+                time.monotonic(),
+            )
+            logger.info(
+                f'LOGIN sign_in: phone={_mask_phone(phone)} '
+                f'raw_length={len(text)} '
+                f'whitespace_count={sum(char.isspace() for char in text)} '
+                f'code_length={len(code)} '
+                f'code_age={code_age:.1f}s '
+                f'dc={login_cache[user_id].get("dc_id", "?")}'
+            )
+
             try:
                 await edit_message_safely(status_msg, '🔄 正在验证验证码...')
                 await temp_client.sign_in(phone, phone_code_hash, code)
                 session_string = await temp_client.export_session_string()
                 encrypted_session = ecs(session_string)
                 await save_user_session(user_id, encrypted_session)
-                await temp_client.disconnect()
+                await cleanup_temp_login(user_id, temp_client)
                 temp_status_msg = login_cache[user_id]['status_msg']
                 login_cache.pop(user_id, None)
                 login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg,
-                    """✅ 登录成功！！"""
-                    )
+                await edit_message_safely(status_msg, '✅ 登录成功！！')
                 set_user_step(user_id, None)
+            except PhoneCodeExpired:
+                logger.warning(
+                    f'LOGIN PhoneCodeExpired after {code_age:.1f}s; '
+                    'requesting a fresh code'
+                )
+                try:
+                    sent_code = await request_login_code(
+                        user_id,
+                        temp_client,
+                        phone,
+                    )
+                    set_user_step(user_id, STEP_CODE)
+                    await edit_message_safely(
+                        status_msg,
+                        """❌ 上一个验证码已失效。
+已重新发送验证码，**请勿直接发送原始验证码**，请用混淆格式输入（如 `1 2 3 4 5` 或 `s12345`）：""",
+                    )
+                    logger.info(
+                        f'LOGIN resend_code OK type={sent_code.type} '
+                        f'dc={login_cache[user_id]["dc_id"]}'
+                    )
+                except Exception as resend_error:
+                    logger.error(
+                        f'LOGIN resend_code failed: '
+                        f'{type(resend_error).__name__}: {resend_error}'
+                    )
+                    await cleanup_temp_login(user_id, temp_client)
+                    login_cache.pop(user_id, None)
+                    set_user_step(user_id, None)
+                    await edit_message_safely(
+                        status_msg,
+                        '❌ 验证码已失效且重新发送失败，请重新发送 /login。',
+                    )
             except SessionPasswordNeeded:
                 set_user_step(user_id, STEP_PASSWORD)
-                await edit_message_safely(status_msg,
+                await edit_message_safely(
+                    status_msg,
                     """🔒 已启用两步验证。
-请输入您的密码："""
-                    )
-            except PhoneCodeExpired as e:
-                logger.warning(f'LOGIN PhoneCodeExpired (dc={_expected_dc}), file session should fix this')
-                # With file-based sessions this shouldn't happen, but if it does,
-                # clean up and ask user to retry
-                try:
-                    await temp_client.disconnect()
-                except Exception:
-                    pass
-                for ext in ('', '-journal', '-wal', '-shm'):
-                    try:
-                        os.remove(os.path.join(_WORKDIR, f'temp_{user_id}.session{ext}'))
-                    except OSError:
-                        pass
+请输入您的密码：""",
+                )
+            except PhoneCodeInvalid as e:
+                logger.warning('LOGIN PhoneCodeInvalid; keeping session for retry')
+                await edit_message_safely(
+                    status_msg,
+                    f'❌ 验证码错误：{str(e)}。请重新输入当前验证码。',
+                )
+            except Exception as e:
+                logger.error(
+                    f'LOGIN sign_in failed: {type(e).__name__}: {e}'
+                )
+                await edit_message_safely(
+                    status_msg,
+                    f'❌ {str(e)}。请使用 /login 重试。',
+                )
+                await cleanup_temp_login(user_id, temp_client)
                 login_cache.pop(user_id, None)
                 set_user_step(user_id, None)
-                await edit_message_safely(status_msg,
-                    '❌ 验证码已失效，临时会话已清理。请重新发送 /login。')
-            except (PhoneCodeInvalid, Exception) as e:
-                logger.error(f'LOGIN sign_in failed: {type(e).__name__}: {e}')
-                await edit_message_safely(status_msg,
-                    f'❌ {str(e)}。请使用 /login 重试。')
-                try:
-                    await temp_client.disconnect()
-                except Exception:
-                    pass
-                login_cache.pop(user_id, None)
-                set_user_step(user_id, None)
+
         elif step == STEP_PASSWORD:
             temp_client = login_cache[user_id]['temp_client']
             try:
-                await edit_message_safely(status_msg, '🔄 正在验证密码...'
-                    )
+                await edit_message_safely(status_msg, '🔄 正在验证密码...')
                 await temp_client.check_password(text)
                 session_string = await temp_client.export_session_string()
                 encrypted_session = ecs(session_string)
                 await save_user_session(user_id, encrypted_session)
-                await temp_client.disconnect()
+                await cleanup_temp_login(user_id, temp_client)
                 temp_status_msg = login_cache[user_id]['status_msg']
                 login_cache.pop(user_id, None)
                 login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg,
-                    """✅ 登录成功！！"""
-                    )
+                await edit_message_safely(status_msg, '✅ 登录成功！！')
                 set_user_step(user_id, None)
             except BadRequest as e:
-                await edit_message_safely(status_msg,
+                await edit_message_safely(
+                    status_msg,
                     f"""❌ 密码错误：{str(e)}
-请重试：""")
+请重试：""",
+                )
     except Exception as e:
         logger.error(f'Error in login flow: {str(e)}')
-        await edit_message_safely(status_msg,
+        await edit_message_safely(
+            status_msg,
             f"""❌ 发生错误：{str(e)}
-请使用 /login 重试。""")
-        if user_id in login_cache and 'temp_client' in login_cache[user_id]:
-            await login_cache[user_id]['temp_client'].disconnect()
+请使用 /login 重试。""",
+        )
+        await cleanup_temp_login(user_id)
         login_cache.pop(user_id, None)
         set_user_step(user_id, None)
 async def edit_message_safely(message, text):
@@ -241,8 +373,7 @@ async def cancel_command(client, message):
     await message.delete()
     if get_user_step(user_id):
         status_msg = login_cache.get(user_id, {}).get('status_msg')
-        if user_id in login_cache and 'temp_client' in login_cache[user_id]:
-            await login_cache[user_id]['temp_client'].disconnect()
+        await cleanup_temp_login(user_id)
         login_cache.pop(user_id, None)
         set_user_step(user_id, None)
         if status_msg:

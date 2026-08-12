@@ -4,12 +4,12 @@
 
 import os, re, time, asyncio, json, asyncio 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
-from shared_client import app as X
+from shared_client import app as X, _WORKDIR
 from plugins.settings import rename_file
 from plugins.start import subscribe as sub
 from utils.custom_filters import login_in_progress
@@ -89,78 +89,82 @@ async def upd_dlg(c):
 async def get_msg(c, u, i, d, lt):
     try:
         if lt == 'public':
-            try:
-                if str(i).lower().endswith('bot'):
-                    emp[i] = False
-                    xm = await u.get_messages(i, d)
-                    emp[i] = getattr(xm, "empty", False)
-                    if not emp[i]:
-                        emp[i] = True
-                        print(f"Bot chat found successfully...")
-                        return xm
-                    
-                if emp[i]:
-                    xm = await c.get_messages(i, d)
-                    print(f"fetched by {c.me.username}")
-                    emp[i] = getattr(xm, "empty", False)
-                    if emp[i]:
-                        print(f"Not fetched by {c.me.username}")
-                        try: await u.join_chat(i)
-                        except: pass
-                        xm = await u.get_messages((await u.get_chat(f"@{i}")).id, d)
-                    
-                    return xm                   
-            except Exception as e:
-                print(f'Error fetching public message: {e}')
-                return None
-        else:
+            clients = []
+            if u:
+                clients.append(('user', u, False))
+            if c and c is not u:
+                clients.append(('bot', c, True))
+
+            for label, client, fetched_by_bot in clients:
+                try:
+                    xm = await client.get_messages(i, d)
+                except Exception as e:
+                    print(f'Error fetching public message with {label} client: {e}')
+                    continue
+
+                if xm and not getattr(xm, 'empty', False):
+                    emp[i] = not fetched_by_bot
+                    print(f'Fetched public message with {label} client')
+                    return xm
+
             if u:
                 try:
-                    async for _ in u.get_dialogs(limit=50): pass
-                    
-                    # Try with -100 prefix first
-                    if str(i).startswith('-100'):
-                        chat_id_100 = i
-                        # For - prefix, remove -100 and add just -
-                        base_id = str(i)[4:]  # Remove -100
-                        chat_id_dash = f"-{base_id}"
-                    elif i.isdigit():
-                        chat_id_100 = f"-100{i}"
-                        chat_id_dash = f"-{i}"
-                    else:
-                        chat_id_100 = i
-                        chat_id_dash = i
-                    
-                    # Try -100 format first
-                    try:
-                        result = await u.get_messages(chat_id_100, d)
-                        if result and not getattr(result, "empty", False):
-                            return result
-                    except Exception:
-                        pass
-                    
-                    # Try - format second
-                    try:
-                        result = await u.get_messages(chat_id_dash, d)
-                        if result and not getattr(result, "empty", False):
-                            return result
-                    except Exception:
-                        pass
-                    
-                    # Final fallback - refresh dialogs and try original
-                    try:
-                        async for _ in u.get_dialogs(limit=200): pass
-                        result = await u.get_messages(i, d)
-                        if result and not getattr(result, "empty", False):
-                            return result
-                    except Exception:
-                        pass
-                    
-                    return None
-                            
+                    await u.join_chat(i)
+                    chat = await u.get_chat(f'@{i}')
+                    xm = await u.get_messages(chat.id, d)
+                    if xm and not getattr(xm, 'empty', False):
+                        emp[i] = True
+                        return xm
                 except Exception as e:
-                    print(f'Private channel error: {e}')
-                    return None
+                    print(f'Error joining public chat {i}: {e}')
+
+            return None
+
+        if not u:
+            return None
+
+        try:
+            async for _ in u.get_dialogs(limit=50):
+                pass
+
+            # Try with -100 prefix first
+            if str(i).startswith('-100'):
+                chat_id_100 = i
+                base_id = str(i)[4:]
+                chat_id_dash = f"-{base_id}"
+            elif i.isdigit():
+                chat_id_100 = f"-100{i}"
+                chat_id_dash = f"-{i}"
+            else:
+                chat_id_100 = i
+                chat_id_dash = i
+
+            try:
+                result = await u.get_messages(chat_id_100, d)
+                if result and not getattr(result, "empty", False):
+                    return result
+            except Exception:
+                pass
+
+            try:
+                result = await u.get_messages(chat_id_dash, d)
+                if result and not getattr(result, "empty", False):
+                    return result
+            except Exception:
+                pass
+
+            try:
+                async for _ in u.get_dialogs(limit=200):
+                    pass
+                result = await u.get_messages(i, d)
+                if result and not getattr(result, "empty", False):
+                    return result
+            except Exception:
+                pass
+
+            return None
+        except Exception as e:
+            print(f'Private channel error: {e}')
             return None
     except Exception as e:
         print(f'Error fetching message: {e}')
@@ -169,14 +173,31 @@ async def get_msg(c, u, i, d, lt):
 
 async def get_ubot(uid):
     bt = await get_user_data_key(uid, "bot_token", None)
-    if not bt: return None
-    if uid in UB: return UB.get(uid)
+    if isinstance(bt, str):
+        bt = bt.strip()
+    if not bt:
+        return None
+    if uid in UB:
+        return UB.get(uid)
+
+    bot = None
     try:
-        bot = Client(f"user_{uid}", bot_token=bt, api_id=API_ID, api_hash=API_HASH)
+        bot = Client(
+            f"user_{uid}",
+            bot_token=bt,
+            api_id=API_ID,
+            api_hash=API_HASH,
+            workdir=_WORKDIR,
+        )
         await bot.start()
         UB[uid] = bot
         return bot
     except Exception as e:
+        if bot is not None:
+            try:
+                await bot.stop()
+            except Exception:
+                pass
         print(f"Error starting bot for user {uid}: {e}")
         return None
 
@@ -190,14 +211,14 @@ async def get_uclient(uid):
     if xxx:
         try:
             ss = dcs(xxx)
-            gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss)
+            gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, workdir=_WORKDIR)
             await gg.start()
             await upd_dlg(gg)
             UC[uid] = gg
             return gg
         except Exception as e:
             print(f'User client error: {e}')
-            return ubot if ubot else Y
+            return None
     return Y
 
 async def prog(c, t, C, h, m, st):
@@ -218,40 +239,223 @@ async def prog(c, t, C, h, m, st):
 async def send_direct(c, m, tcid, ft=None, rtmid=None):
     try:
         if m.video:
-            await c.send_video(tcid, m.video.file_id, caption=ft, duration=m.video.duration, width=m.video.width, height=m.video.height, reply_to_message_id=rtmid)
+            await c.send_video(
+                tcid,
+                m.video.file_id,
+                caption=ft,
+                duration=m.video.duration,
+                width=m.video.width,
+                height=m.video.height,
+                reply_to_message_id=rtmid,
+            )
         elif m.video_note:
-            await c.send_video_note(tcid, m.video_note.file_id, reply_to_message_id=rtmid)
+            await c.send_video_note(
+                tcid,
+                m.video_note.file_id,
+                reply_to_message_id=rtmid,
+            )
         elif m.voice:
-            await c.send_voice(tcid, m.voice.file_id, reply_to_message_id=rtmid)
+            await c.send_voice(
+                tcid,
+                m.voice.file_id,
+                reply_to_message_id=rtmid,
+            )
         elif m.sticker:
-            await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+            await c.send_sticker(
+                tcid,
+                m.sticker.file_id,
+                reply_to_message_id=rtmid,
+            )
         elif m.audio:
-            await c.send_audio(tcid, m.audio.file_id, caption=ft, duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title, reply_to_message_id=rtmid)
+            await c.send_audio(
+                tcid,
+                m.audio.file_id,
+                caption=ft,
+                duration=m.audio.duration,
+                performer=m.audio.performer,
+                title=m.audio.title,
+                reply_to_message_id=rtmid,
+            )
         elif m.photo:
-            photo_id = m.photo.file_id if hasattr(m.photo, 'file_id') else m.photo[-1].file_id
-            await c.send_photo(tcid, photo_id, caption=ft, reply_to_message_id=rtmid)
+            photo_id = (
+                m.photo.file_id
+                if hasattr(m.photo, 'file_id')
+                else m.photo[-1].file_id
+            )
+            await c.send_photo(
+                tcid,
+                photo_id,
+                caption=ft,
+                reply_to_message_id=rtmid,
+            )
         elif m.document:
-            await c.send_document(tcid, m.document.file_id, caption=ft, file_name=m.document.file_name, reply_to_message_id=rtmid)
+            await c.send_document(
+                tcid,
+                m.document.file_id,
+                caption=ft,
+                file_name=m.document.file_name,
+                reply_to_message_id=rtmid,
+            )
         else:
-            return False
-        return True
+            return False, '消息没有可直接发送的媒体'
+        return True, None
     except Exception as e:
-        print(f'Direct send error: {e}')
-        return False
+        error = str(e)
+        print(f'Direct send error: {error}')
+        return False, error
+
+async def resolve_delivery(d):
+    """Resolve the delivery target for user chat ``d``.
+
+    Priority:
+    1. /settings chat_id (per-user, custom bot must be admin there)
+    2. LOG_GROUP from .env (deployment-level channel, custom bot must be a member)
+    3. the user's own chat (fallback, delivered via the user client)
+
+    Returns (tcid, rtmid, deliver_via_bot).
+    """
+    cfg_chat = await get_user_data_key(d, 'chat_id', None)
+    if cfg_chat is not None:
+        cfg_chat = str(cfg_chat).strip()
+    tcid = d
+    rtmid = None
+    deliver_via_bot = False
+    if cfg_chat:
+        if '/' in cfg_chat:
+            parts = cfg_chat.split('/', 1)
+            tcid = int(parts[0])
+            rtmid = int(parts[1]) if len(parts) > 1 else None
+        else:
+            tcid = int(cfg_chat)
+        deliver_via_bot = True
+    elif LOG_GROUP:
+        tcid = LOG_GROUP
+        deliver_via_bot = True
+    elif isinstance(tcid, str):
+        try:
+            tcid = int(tcid)
+        except ValueError:
+            pass
+    return tcid, rtmid, deliver_via_bot
+
+
+async def process_album(c, u, msgs, d, lt, uid, i):
+    """Forward an album 1:1 — grouping, order, caption and tags preserved.
+
+    Fast path: server-side copy_media_group (works for unrestricted chats).
+    Fallback: download every item with the user client and re-upload as ONE
+    media group (works for restricted content). Progress reports go to the
+    user's chat with the main bot, never to the target channel.
+    """
+    tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+    sender = c if deliver_via_bot else (u or c)
+    did = int(d)
+    p = await X.send_message(did, f'正在处理相册（{len(msgs)} 项）...')
+
+    orig_caption = next((one.caption.markdown for one in msgs if one.caption), '')
+    proc_text = await process_text_with_rules(d, orig_caption)
+    user_cap = await get_user_data_key(d, 'caption', '')
+    ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
+
+    if deliver_via_bot:
+        try:
+            await sender.copy_media_group(tcid, msgs[0].chat.id, msgs[0].id)
+            await X.delete_messages(did, p.id)
+            return f'✅ 相册已一比一转发（{len(msgs)} 项）'
+        except Exception as e:
+            print(f'copy_media_group failed, falling back to re-upload: {e}')
+
+    st = time.time()
+    media = []
+    files = []
+    for idx, one in enumerate(msgs):
+        if not (one.photo or one.video or one.document or one.audio):
+            continue
+        await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
+        f = await u.download_media(
+            one,
+            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{int(time.time())}_{idx}'),
+            progress=prog, progress_args=(X, did, p.id, st),
+        )
+        if not f:
+            print(f'Album item {idx + 1} download failed, skipping')
+            continue
+        files.append(f)
+        if one.photo:
+            media.append(InputMediaPhoto(f))
+        elif one.video:
+            # Keep the source channel's thumbnail; without one Telegram shows
+            # the first frame, which is often black.
+            thumb_path = None
+            if one.video.thumbs:
+                try:
+                    thumb_path = await u.download_media(
+                        one.video.thumbs[-1].file_id,
+                        file_name=os.path.join(
+                            _WORKDIR, 'downloads',
+                            f'album_thumb_{int(time.time())}_{idx}.jpg',
+                        ),
+                    )
+                except Exception as e:
+                    print(f'Thumb download failed for album item {idx + 1}: {e}')
+            if thumb_path:
+                files.append(thumb_path)
+            media.append(InputMediaVideo(
+                f, duration=one.video.duration,
+                width=one.video.width, height=one.video.height,
+                thumb=thumb_path,
+            ))
+        elif one.audio:
+            media.append(InputMediaAudio(f, duration=one.audio.duration))
+        else:
+            media.append(InputMediaDocument(f))
+
+    if not media:
+        await X.edit_message_text(did, p.id, '相册下载失败')
+        return '❌ 相册下载失败'
+
+    if ft:
+        media[0].caption = ft
+
+    await X.edit_message_text(did, p.id, f'正在上传相册（{len(media)} 项）...')
+    upload_error = None
+    try:
+        await sender.send_media_group(tcid, media, reply_to_message_id=rtmid)
+    except TypeError as e:
+        if 'keyword-only argument' in str(e):
+            # pyrofork 2.3.69 breaks parsing the SendMultiMedia response AFTER
+            # the RPC already succeeded — the album is already delivered.
+            # Treat the parse bug as success.
+            print(f'send_media_group response parse bug (treating as success): {e}')
+        else:
+            upload_error = str(e)
+    except Exception as e:
+        upload_error = str(e)
+
+    if upload_error:
+        err = upload_error
+        if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
+            hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
+        else:
+            hint = ''
+        await X.edit_message_text(did, p.id, f'相册上传失败：{err[:60]} {hint}')
+        for f in files:
+            if os.path.exists(f):
+                os.remove(f)
+        return f'❌ 相册上传失败：{err[:60]}'
+
+    for f in files:
+        if os.path.exists(f):
+            os.remove(f)
+    await X.delete_messages(did, p.id)
+    return f'✅ 相册已发送（{len(media)} 项）'
+
 
 async def process_msg(c, u, m, d, lt, uid, i):
     try:
-        cfg_chat = await get_user_data_key(d, 'chat_id', None)
-        tcid = d
-        rtmid = None
-        if cfg_chat:
-            if '/' in cfg_chat:
-                parts = cfg_chat.split('/', 1)
-                tcid = int(parts[0])
-                rtmid = int(parts[1]) if len(parts) > 1 else None
-            else:
-                tcid = int(cfg_chat)
-        
+        tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+        did = int(d)
+
         if m.media:
             orig_text = m.caption.markdown if m.caption else ''
             proc_text = await process_text_with_rules(d, orig_text)
@@ -259,11 +463,28 @@ async def process_msg(c, u, m, d, lt, uid, i):
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
             if lt == 'public' and not emp.get(i, False):
-                await send_direct(c, m, tcid, ft, rtmid)
-                return 'Sent directly.'
+                # Direct file reference send requires the file reference holder's client.
+                sent, error = await send_direct(c, m, tcid, ft, rtmid)
+                if sent:
+                    return 'Sent directly.'
+                if error and 'PEER_ID_INVALID' in error:
+                    return (
+                        '发送失败：目标聊天不可用。请在 /settings 设置正确的 '
+                        '-100... 聊天 ID，并将 /setbot 机器人加入该频道且设为管理员。'
+                    )
+                return f'发送失败：{error[:80] if error else "未知错误"}'
             
+            # Sender selection: a custom bot CANNOT message a user who never
+            # started it (PEER_ID_INVALID on resolve_peer). When delivering to
+            # a bot-managed target (configured chat or LOG_GROUP), use the
+            # custom bot — it must be a member there. When falling back to the
+            # user's own chat, use the user client (messaging self always works).
+            # Progress reports go through the main bot (X) to the user's bot
+            # chat, so channels are never spammed and the client always edits
+            # its own messages.
+            sender = c if deliver_via_bot else (u or c)
             st = time.time()
-            p = await c.send_message(d, '正在下载...')
+            p = await X.send_message(did, '正在下载...')
 
             c_name = f"{time.time()}"
             if m.video:
@@ -286,13 +507,17 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 file_name = f"{time.time()}.jpg"
                 c_name = sanitize(file_name)
     
-            f = await u.download_media(m, file_name=c_name, progress=prog, progress_args=(c, d, p.id, st))
+            # pyrofork download_media resolves relative names against PARENT_DIR
+            # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
+            # client workdir. Pass an absolute path under the writable volume.
+            download_path = os.path.join(_WORKDIR, 'downloads', c_name)
+            f = await u.download_media(m, file_name=download_path, progress=prog, progress_args=(X, did, p.id, st))
             
             if not f:
-                await c.edit_message_text(d, p.id, '失败。')
+                await X.edit_message_text(did, p.id, '失败。')
                 return 'Failed.'
             
-            await c.edit_message_text(d, p.id, '正在重命名...')
+            await X.edit_message_text(did, p.id, '正在重命名...')
             if (
                 (m.video and m.video.file_name) or
                 (m.audio and m.audio.file_name) or
@@ -305,7 +530,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
             
             if fsize > 2 and Y:
                 st = time.time()
-                await c.edit_message_text(d, p.id, '文件大于 2GB，正在使用备用方法...')
+                await X.edit_message_text(did, p.id, '文件大于 2GB，正在使用备用方法...')
                 await upd_dlg(Y)
                 mtd = await get_video_metadata(f)
                 dur, h, w = mtd['duration'], mtd['width'], mtd['height']
@@ -323,19 +548,19 @@ async def process_msg(c, u, m, d, lt, uid, i):
                                         height=h if mtype == 'video' else None,
                                         width=w if mtype == 'video' else None,
                                         caption=ft if m.caption and mtype not in ['video_note', 'voice'] else None, 
-                                        reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+                                        reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st))
                         break
                 else:
                     sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft if m.caption else None,
-                                                reply_to_message_id=rtmid, progress=prog, progress_args=(c, d, p.id, st))
+                                                reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st))
                 
-                await c.copy_message(d, LOG_GROUP, sent.id)
+                await sender.copy_message(tcid, LOG_GROUP, sent.id)
                 os.remove(f)
-                await c.delete_messages(d, p.id)
+                await X.delete_messages(did, p.id)
                 
                 return 'Done (Large file).'
             
-            await c.edit_message_text(d, p.id, '正在上传...')
+            await X.edit_message_text(did, p.id, '正在上传...')
             st = time.time()
 
             try:
@@ -346,46 +571,55 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     mtd = await get_video_metadata(f)
                     dur, h, w = mtd['duration'], mtd['width'], mtd['height']
                     th = await screenshot(f, dur, d)
-                    await c.send_video(tcid, video=f, caption=ft if m.caption else None, 
+                    await sender.send_video(tcid, video=f, caption=ft if m.caption else None, 
                                     thumb=th, width=w, height=h, duration=dur, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
+                                    progress=prog, progress_args=(X, did, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.video_note:
-                    await c.send_video_note(tcid, video_note=f, progress=prog, 
-                                        progress_args=(c, d, p.id, st), reply_to_message_id=rtmid)
+                    await sender.send_video_note(tcid, video_note=f, progress=prog, 
+                                        progress_args=(X, did, p.id, st), reply_to_message_id=rtmid)
                 elif m.voice:
-                    await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st), 
+                    await sender.send_voice(tcid, f, progress=prog, progress_args=(X, did, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.sticker:
-                    await c.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
+                    await sender.send_sticker(tcid, m.sticker.file_id, reply_to_message_id=rtmid)
                 elif m.audio or (m.document and file_ext in audio_extensions):
-                    await c.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(c, d, p.id, st), 
+                    await sender.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
+                                    thumb=th, progress=prog, progress_args=(X, did, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.photo:
-                    await c.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
-                                    progress=prog, progress_args=(c, d, p.id, st), 
+                    await sender.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
+                                    progress=prog, progress_args=(X, did, p.id, st), 
                                     reply_to_message_id=rtmid)
                 elif m.document:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(c, d, p.id, st), 
+                    await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                                        progress=prog, progress_args=(X, did, p.id, st), 
                                         reply_to_message_id=rtmid)
                 else:
-                    await c.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(c, d, p.id, st), 
+                    await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
+                                        progress=prog, progress_args=(X, did, p.id, st), 
                                         reply_to_message_id=rtmid)
             except Exception as e:
-                await c.edit_message_text(d, p.id, f'上传失败：{str(e)[:30]}')
+                err = str(e)
+                if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
+                    hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
+                else:
+                    hint = ''
+                try:
+                    await X.edit_message_text(did, p.id, f'上传失败：{err[:60]} {hint}')
+                except Exception:
+                    pass
                 if os.path.exists(f): os.remove(f)
-                return 'Failed.'
+                return f'上传失败：{err[:60]} {hint}'.strip()
             
             os.remove(f)
-            await c.delete_messages(d, p.id)
+            await X.delete_messages(did, p.id)
             
             return 'Done.'
             
         elif m.text:
-            await c.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
+            sender = c if deliver_via_bot else (u or c)
+            await sender.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
             return 'Sent.'
     except Exception as e:
         return f'Error: {str(e)[:50]}'
@@ -401,14 +635,21 @@ async def process_cmd(c, m):
     
     if await sub(c, m) == 1: return
     pro = await m.reply_text('正在进行检查，请稍候...')
-    
+
     if is_user_active(uid):
         await pro.edit('您有一个正在进行的任务。使用 /stop 取消。')
         return
-    
+
+    bot_token = await get_user_data_key(uid, "bot_token", None)
+    if isinstance(bot_token, str):
+        bot_token = bot_token.strip()
+
     ubot = await get_ubot(uid)
     if not ubot:
-        await pro.edit('请先使用 /setbot 添加您的机器人')
+        if bot_token:
+            await pro.edit('已保存机器人令牌，但机器人启动失败。请检查令牌后重新使用 /setbot。')
+        else:
+            await pro.edit('请先使用 /setbot 添加您的机器人')
         return
     
     Z[uid] = {'step': 'start' if cmd == 'batch' else 'start_single'}
@@ -434,7 +675,14 @@ async def text_handler(c, m):
     s = Z[uid].get('step')
     x = await get_ubot(uid)
     if not x:
-        await message.reply("请添加您的机器人 /setbot `token`")
+        Z.pop(uid, None)
+        bot_token = await get_user_data_key(uid, "bot_token", None)
+        if isinstance(bot_token, str):
+            bot_token = bot_token.strip()
+        if bot_token:
+            await m.reply_text('已保存机器人令牌，但机器人启动失败。请检查令牌后重新使用 /setbot。')
+        else:
+            await m.reply_text("请先使用 /setbot 添加您的机器人")
         return
 
     if s == 'start':
@@ -466,8 +714,8 @@ async def text_handler(c, m):
             return
         
         uc = await get_uclient(uid)
-        if not uc:
-            await pt.edit('没有用户客户端，无法继续。')
+        if not uc and lt != 'public':
+            await pt.edit('用户会话无效或未登录，请先使用 /login。')
             Z.pop(uid, None)
             return
             
@@ -479,8 +727,28 @@ async def text_handler(c, m):
         try:
             msg = await get_msg(ubot, uc, i, s, lt)
             if msg:
-                res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                await pt.edit(f'1/1: {res}')
+                # Album (media group) expansion: t.me links — even with ?single —
+                # often point at one item of a multi-photo/video album. Users expect
+                # the whole album, not one arbitrary item. Fetch the entire group
+                # with the same client that fetched the original message, so file
+                # references stay valid for that client's session.
+                msgs = [msg]
+                if getattr(msg, 'media_group_id', None):
+                    fetch_client = uc if (uc and (lt == 'private' or emp.get(i, False))) else ubot
+                    try:
+                        group = await fetch_client.get_media_group(i, s)
+                        if group:
+                            msgs = group
+                    except Exception as e:
+                        print(f'Media group fetch failed, falling back to single: {e}')
+
+                total = len(msgs)
+                if total > 1:
+                    res = await process_album(ubot, uc, msgs, str(m.chat.id), lt, uid, i)
+                    await pt.edit(res)
+                else:
+                    res = await process_msg(ubot, uc, msgs[0], str(m.chat.id), lt, uid, i)
+                    await pt.edit(f'1/1: {res}')
             else:
                 await pt.edit('未找到消息')
         except Exception as e:

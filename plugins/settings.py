@@ -8,7 +8,7 @@ import re
 import os
 import string
 import random
-from shared_client import app
+from shared_client import app, _WORKDIR
 from utils.func import get_user_data_key, save_user_data
 
 VIDEO_EXTENSIONS = {
@@ -19,6 +19,14 @@ SET_PIC = 'settings.jpg'
 MESS = '自定义文件设置...'
 
 active_conversations = {}
+def active_conversation_filter(_, __, message):
+    return (
+        message.from_user is not None
+        and message.from_user.id in active_conversations
+    )
+
+active_conversation = filters.create(active_conversation_filter)
+
 
 
 def settings_menu():
@@ -155,7 +163,7 @@ async def cancel_conversation(client, message):
         del active_conversations[user_id]
 
 
-@app.on_message(filters.private & ~filters.command([
+@app.on_message(filters.private & active_conversation & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set',
     'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys',
     'setbot', 'rembot', 'status', 'myplan', 'transfer', 'rem', 'add', 'plan', 'terms', 'help',
@@ -233,7 +241,10 @@ async def handle_deleteword(message, user_id):
 
 async def handle_setthumb(message, user_id):
     if message.photo:
-        temp_path = await app.download_media(message)
+        # Absolute path under the writable volume; pyrofork would otherwise
+        # resolve "downloads/" against PARENT_DIR (/app, read-only).
+        download_path = os.path.join(_WORKDIR, 'downloads', f'thumb_{user_id}.jpg')
+        temp_path = await app.download_media(message, file_name=download_path)
         try:
             thumb_path = f'{user_id}.jpg'
             if os.path.exists(thumb_path):
