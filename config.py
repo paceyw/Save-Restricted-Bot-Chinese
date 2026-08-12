@@ -29,12 +29,22 @@ DB_NAME      = os.getenv("DB_NAME", "telegram_downloader")
 # ─── OWNER / CONTROL SETTINGS ───────────────────────────────────────────────────
 OWNER_ID     = list(map(int, os.getenv("OWNER_ID", "").split()))  # space-separated list
 STRING       = os.getenv("STRING", None)  # optional session string
-LOG_GROUP    = int(os.getenv("LOG_GROUP", "-1001234456"))
-FORCE_SUB    = int(os.getenv("FORCE_SUB", "-10012345567"))
+LOG_GROUP    = int(os.getenv("LOG_GROUP", "0"))
+FORCE_SUB    = int(os.getenv("FORCE_SUB", "0"))
 
 # ─── SECURITY KEYS ──────────────────────────────────────────────────────────────
-MASTER_KEY   = os.getenv("MASTER_KEY", "gK8HzLfT9QpViJcYeB5wRa3DmN7P2xUq")  # session encryption
-IV_KEY       = os.getenv("IV_KEY", "s7Yx5CpVmE3F")  # decryption key
+def _required_key(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is required. Generate it with 'openssl rand -hex 32' "
+            f"and set it in the environment before starting the bot."
+        )
+    return value
+
+
+MASTER_KEY   = _required_key("MASTER_KEY")  # session encryption
+IV_KEY       = _required_key("IV_KEY")  # decryption key
 
 # ─── COOKIES HANDLING ───────────────────────────────────────────────────────────
 YT_COOKIES   = os.getenv("YT_COOKIES", YTUB_COOKIES)
