@@ -223,11 +223,11 @@ def test_get_msg_public_falls_back_without_emp_keyerror(batch_module):
             return types.SimpleNamespace(empty=False, media=False)
 
     message = asyncio.run(
-        module.get_msg(BotClient(), UserClient(), "public_channel", 7, "public")
+        module.get_msg(BotClient(), UserClient(), "public_channel", 7, "public", 42)
     )
 
     assert message is not None
-    assert module.emp["public_channel"] is False
+    assert module.emp[(42, "public_channel")] is False
 
 
 def test_get_msg_public_uses_bot_directly_without_user_client(batch_module):
@@ -239,11 +239,11 @@ def test_get_msg_public_uses_bot_directly_without_user_client(batch_module):
             return types.SimpleNamespace(empty=False, media=False)
 
     message = asyncio.run(
-        module.get_msg(BotClient(), None, "public_channel", 7, "public")
+        module.get_msg(BotClient(), None, "public_channel", 7, "public", 42)
     )
 
     assert message is not None
-    assert module.emp["public_channel"] is False
+    assert module.emp[(42, "public_channel")] is False
 
 def test_get_msg_public_marks_user_source_for_download(batch_module):
     module, _ = batch_module
@@ -254,16 +254,16 @@ def test_get_msg_public_marks_user_source_for_download(batch_module):
             return types.SimpleNamespace(empty=False, media=False)
 
     message = asyncio.run(
-        module.get_msg(None, UserClient(), "public_channel", 7, "public")
+        module.get_msg(None, UserClient(), "public_channel", 7, "public", 42)
     )
 
     assert message is not None
-    assert module.emp["public_channel"] is True
+    assert module.emp[(42, "public_channel")] is True
 
 
 def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
     module, _ = batch_module
-    module.emp["public_channel"] = False
+    module.emp[(42, "public_channel")] = False
 
     async def get_key(user_id, key, default=None):
         return default

@@ -28,13 +28,15 @@ def sanitize(filename):
     return re.sub(r'[<>:"/\\|?*\']', '_', filename).strip(" .")[:255]
 
 def load_active_users():
+    # Runtime batch state is meaningless across restarts: the worker
+    # coroutines no longer exist, so restoring it would lock users out of
+    # /batch forever with no way to clear it. Drop the stale file instead.
     try:
         if os.path.exists(ACTIVE_USERS_FILE):
-            with open(ACTIVE_USERS_FILE, 'r') as f:
-                return json.load(f)
-        return {}
+            os.remove(ACTIVE_USERS_FILE)
     except Exception:
-        return {}
+        pass
+    return {}
 
 async def save_active_users_to_file():
     try:
@@ -44,8 +46,14 @@ async def save_active_users_to_file():
         print(f"Error saving active users: {e}")
 
 async def add_active_batch(user_id: int, batch_info: Dict[str, Any]):
-    ACTIVE_USERS[str(user_id)] = batch_info
+    # Atomic check-and-set (no await between check and set): callers must
+    # treat a False return as "another task is already running".
+    key = str(user_id)
+    if key in ACTIVE_USERS:
+        return False
+    ACTIVE_USERS[key] = batch_info
     await save_active_users_to_file()
+    return True
 
 def is_user_active(user_id: int) -> bool:
     return str(user_id) in ACTIVE_USERS
@@ -86,7 +94,9 @@ async def upd_dlg(c):
         return False
 
 # fixed the old group of 2021-2022 extraction 🌝 (buy krne ka fayda nhi ab old group) ✅ 
-async def get_msg(c, u, i, d, lt):
+async def get_msg(c, u, i, d, lt, uid):
+    # emp is keyed per (uid, channel): concurrent users fetching the same
+    # channel must not overwrite each other's source-client marker.
     try:
         if lt == 'public':
             clients = []
@@ -103,7 +113,7 @@ async def get_msg(c, u, i, d, lt):
                     continue
 
                 if xm and not getattr(xm, 'empty', False):
-                    emp[i] = not fetched_by_bot
+                    emp[(uid, i)] = not fetched_by_bot
                     print(f'Fetched public message with {label} client')
                     return xm
 
@@ -113,7 +123,7 @@ async def get_msg(c, u, i, d, lt):
                     chat = await u.get_chat(f'@{i}')
                     xm = await u.get_messages(chat.id, d)
                     if xm and not getattr(xm, 'empty', False):
-                        emp[i] = True
+                        emp[(uid, i)] = True
                         return xm
                 except Exception as e:
                     print(f'Error joining public chat {i}: {e}')
@@ -171,6 +181,17 @@ async def get_msg(c, u, i, d, lt):
         return None
 
 
+_UB_UC_LOCKS = {}
+
+def _client_lock(uid):
+    # Per-user lock serializing UB/UC creation: concurrent updates must not
+    # start two clients sharing one session file.
+    lock = _UB_UC_LOCKS.get(uid)
+    if lock is None:
+        lock = _UB_UC_LOCKS[uid] = asyncio.Lock()
+    return lock
+
+
 async def get_ubot(uid):
     bt = await get_user_data_key(uid, "bot_token", None)
     if isinstance(bt, str):
@@ -180,26 +201,29 @@ async def get_ubot(uid):
     if uid in UB:
         return UB.get(uid)
 
-    bot = None
-    try:
-        bot = Client(
-            f"user_{uid}",
-            bot_token=bt,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            workdir=_WORKDIR,
-        )
-        await bot.start()
-        UB[uid] = bot
-        return bot
-    except Exception as e:
-        if bot is not None:
-            try:
-                await bot.stop()
-            except Exception:
-                pass
-        print(f"Error starting bot for user {uid}: {e}")
-        return None
+    async with _client_lock(uid):
+        if uid in UB:
+            return UB.get(uid)
+        bot = None
+        try:
+            bot = Client(
+                f"user_{uid}",
+                bot_token=bt,
+                api_id=API_ID,
+                api_hash=API_HASH,
+                workdir=_WORKDIR,
+            )
+            await bot.start()
+            UB[uid] = bot
+            return bot
+        except Exception as e:
+            if bot is not None:
+                try:
+                    await bot.stop()
+                except Exception:
+                    pass
+            print(f"Error starting bot for user {uid}: {e}")
+            return None
 
 async def get_uclient(uid):
     ud = await get_user_data(uid)
@@ -209,16 +233,19 @@ async def get_uclient(uid):
     if not ud: return ubot if ubot else None
     xxx = ud.get('session_string')
     if xxx:
-        try:
-            ss = dcs(xxx)
-            gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, workdir=_WORKDIR)
-            await gg.start()
-            await upd_dlg(gg)
-            UC[uid] = gg
-            return gg
-        except Exception as e:
-            print(f'User client error: {e}')
-            return None
+        async with _client_lock(uid):
+            if uid in UC:
+                return UC.get(uid)
+            try:
+                ss = dcs(xxx)
+                gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, workdir=_WORKDIR)
+                await gg.start()
+                await upd_dlg(gg)
+                UC[uid] = gg
+                return gg
+            except Exception as e:
+                print(f'User client error: {e}')
+                return None
     return Y
 
 async def prog(c, t, C, h, m, st):
@@ -405,7 +432,7 @@ async def process_album(c, u, msgs, d, lt, uid, i):
             ext = os.path.splitext(one.document.file_name or '')[1]
         f = await u.download_media(
             one,
-            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{int(time.time())}_{idx}{ext}'),
+            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{uid}_{int(time.time())}_{idx}{ext}'),
             progress=prog, progress_args=(X, did, p.id, st),
         )
         if not f:
@@ -424,7 +451,7 @@ async def process_album(c, u, msgs, d, lt, uid, i):
                         one.video.thumbs[-1].file_id,
                         file_name=os.path.join(
                             _WORKDIR, 'downloads',
-                            f'album_thumb_{int(time.time())}_{idx}.jpg',
+                            f'album_thumb_{uid}_{int(time.time())}_{idx}.jpg',
                         ),
                     )
                 except Exception as e:
@@ -516,7 +543,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
             user_cap = await get_user_data_key(d, 'caption', '')
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
-            if lt == 'public' and not emp.get(i, False):
+            if lt == 'public' and not emp.get((uid, i), False):
                 # Direct file reference send requires the file reference holder's client.
                 sent, error = await send_direct(c, m, tcid, ft, rtmid)
                 if sent:
@@ -540,26 +567,29 @@ async def process_msg(c, u, m, d, lt, uid, i):
             st = time.time()
             p = await X.send_message(did, '正在下载...')
 
-            c_name = f"{time.time()}"
+            # Temp names carry uid + timestamp: concurrent users must never
+            # share a downloads/ path (overwrite / cross-delivery / premature
+            # cleanup).
+            c_name = f"{uid}_{time.time()}"
             if m.video:
                 file_name = m.video.file_name
                 if not file_name:
                     file_name = f"{time.time()}.mp4"
-                    c_name = sanitize(file_name)
+                    c_name = sanitize(f"{uid}_{file_name}")
             elif m.audio:
                 file_name = m.audio.file_name
                 if not file_name:
                     file_name = f"{time.time()}.mp3"
-                    c_name = sanitize(file_name)
+                    c_name = sanitize(f"{uid}_{file_name}")
             elif m.document:
                 file_name = m.document.file_name
                 if not file_name:
                     file_name = f"{time.time()}"
                 else:
-                    c_name = sanitize(file_name)
+                    c_name = sanitize(f"{uid}_{int(time.time())}_{file_name}")
             elif m.photo:
                 file_name = f"{time.time()}.jpg"
-                c_name = sanitize(file_name)
+                c_name = sanitize(f"{uid}_{file_name}")
     
             # pyrofork download_media resolves relative names against PARENT_DIR
             # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
@@ -721,12 +751,12 @@ async def _process_one_link(ubot, uc, i, s, lt, d, uid):
     """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
     if not uc and lt != 'public':
         return '用户会话无效或未登录，请先使用 /login。'
-    msg = await get_msg(ubot, uc, i, s, lt)
+    msg = await get_msg(ubot, uc, i, s, lt, uid)
     if not msg:
         return '未找到消息'
     msgs = [msg]
     if getattr(msg, 'media_group_id', None):
-        fetch_client = uc if (uc and (lt == 'private' or emp.get(i, False))) else ubot
+        fetch_client = uc if (uc and (lt == 'private' or emp.get((uid, i), False))) else ubot
         try:
             group = await fetch_client.get_media_group(i, s)
             if group:
@@ -835,13 +865,16 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
 
-        await add_active_batch(uid, {
+        if not await add_active_batch(uid, {
             "total": n,
             "current": 0,
             "success": 0,
             "cancel_requested": False,
             "progress_message_id": pt.id
-            })
+            }):
+            await pt.edit('存在正在进行的任务。请先使用 /stop。')
+            Z.pop(uid, None)
+            return
 
         success = 0
         try:
@@ -926,13 +959,16 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
         
-        await add_active_batch(uid, {
+        if not await add_active_batch(uid, {
             "total": n,
             "current": 0,
             "success": 0,
             "cancel_requested": False,
             "progress_message_id": pt.id
-            })
+            }):
+            await pt.edit('存在正在进行的任务。请先使用 /stop。')
+            Z.pop(uid, None)
+            return
         
         try:
             for j in range(n):
@@ -946,7 +982,7 @@ async def text_handler(c, m):
                 mid = int(s) + j
                 
                 try:
-                    msg = await get_msg(ubot, uc, i, mid, lt)
+                    msg = await get_msg(ubot, uc, i, mid, lt, uid)
                     if msg:
                         res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
                         if 'Done' in res or 'Copied' in res or 'Sent' in res:
