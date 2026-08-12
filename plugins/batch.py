@@ -372,9 +372,19 @@ async def process_album(c, u, msgs, d, lt, uid, i):
         if not (one.photo or one.video or one.document or one.audio):
             continue
         await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
+        # Telegram's SendMultiMedia validates uploads by file extension
+        # (PHOTO_EXT_INVALID otherwise), so the temp name must carry one.
+        if one.photo:
+            ext = '.jpg'
+        elif one.video:
+            ext = os.path.splitext(one.video.file_name or '')[1] or '.mp4'
+        elif one.audio:
+            ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
+        else:
+            ext = os.path.splitext(one.document.file_name or '')[1]
         f = await u.download_media(
             one,
-            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{int(time.time())}_{idx}'),
+            file_name=os.path.join(_WORKDIR, 'downloads', f'album_{int(time.time())}_{idx}{ext}'),
             progress=prog, progress_args=(X, did, p.id, st),
         )
         if not f:
