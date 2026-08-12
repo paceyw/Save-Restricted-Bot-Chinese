@@ -46,7 +46,8 @@ async def myplan_handler(client, message):
     """Handle /myplan command to show the user's current subscription plan"""
     user_id = message.from_user.id
     premium_details = await get_premium_details(user_id)
-    if premium_details:
+    expiry_utc = premium_details.get("subscription_end") if premium_details else None
+    if expiry_utc and expiry_utc > datetime.now():
         expiry_utc = premium_details["subscription_end"]
         expiry_ist = expiry_utc + timedelta(hours=5, minutes=30)
         formatted_expiry = expiry_ist.strftime("%d-%b-%Y %I:%M:%S %p")
@@ -64,10 +65,6 @@ async def transfer_premium_handler(client, message):
     user_id = message.from_user.id
     sender = message.from_user
     sender_name = get_display_name(sender)
-    if not await is_premium_user(user_id):
-        await message.reply_text(
-            "❌ 您没有可转赠的高级会员订阅。")
-        return
     args = message.text.split()
     if len(args) != 2:
         await message.reply_text(
@@ -79,32 +76,62 @@ async def transfer_premium_handler(client, message):
         await message.reply_text(
             '❌ 用户 ID 无效。请提供有效的数字用户 ID。')
         return
+    if target_user_id <= 0:
+        await message.reply_text(
+            '❌ 用户 ID 无效。请提供有效的正数用户 ID。')
+        return
     if target_user_id == user_id:
         await message.reply_text('❌ 您不能将高级会员转赠给自己。')
         return
+
+    try:
+        target_entity = await app.get_users(target_user_id)
+        if target_entity is None:
+            raise ValueError("target user was not found")
+        target_name = get_display_name(target_entity)
+    except Exception as e:
+        logger.warning(f'Could not get target user {target_user_id}: {e}')
+        await message.reply_text(
+            '❌ 无法找到目标用户，请提供有效的用户 ID。')
+        return
+
     if await is_premium_user(target_user_id):
         await message.reply_text(
             '❌ 目标用户已有高级会员订阅。')
         return
+
     try:
         premium_details = await get_premium_details(user_id)
         if not premium_details:
             await message.reply_text('❌ 获取您的会员详情时出错。')
             return
-        target_name = '未知用户'
-        try:
-            target_entity = await app.get_users(target_user_id)
-            target_name = get_display_name(target_entity)
-        except Exception as e:
-            logger.warning(f'Could not get target user name: {e}')
+        expiry_date = premium_details.get('subscription_end')
         now = datetime.now()
-        expiry_date = premium_details['subscription_end']
-        await premium_users_collection.update_one({'user_id':
-            target_user_id}, {'$set': {'user_id': target_user_id,
-            'subscription_start': now, 'subscription_end': expiry_date,
-            'expireAt': expiry_date, 'transferred_from': user_id,
-            'transferred_from_name': sender_name}}, upsert=True)
-        await premium_users_collection.delete_one({'user_id': user_id})
+        claim_result = await premium_users_collection.delete_one({
+            'user_id': user_id,
+            'subscription_end': {'$gt': now},
+        })
+        if claim_result.deleted_count != 1:
+            await message.reply_text(
+                '❌ 您的会员订阅已过期或已被转赠。')
+            return
+
+        try:
+            await premium_users_collection.update_one({'user_id':
+                target_user_id}, {'$set': {'user_id': target_user_id,
+                'subscription_start': now, 'subscription_end': expiry_date,
+                'expireAt': expiry_date, 'transferred_from': user_id,
+                'transferred_from_name': sender_name}}, upsert=True)
+        except Exception:
+            # Compensate the non-transactional two-step write: the claim
+            # delete already removed the sender's document, so a failed
+            # target upsert must restore it instead of losing the plan.
+            try:
+                await premium_users_collection.insert_one(premium_details)
+            except Exception as e:
+                logger.error(
+                    f'Premium transfer rollback failed for user {user_id}: {e}')
+            raise
         expiry_ist = expiry_date + timedelta(hours=5, minutes=30)
         formatted_expiry = expiry_ist.strftime('%d-%b-%Y %I:%M:%S %p')
         await message.reply_text(
