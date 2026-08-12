@@ -5,7 +5,7 @@
 import os, re, time, asyncio, json, asyncio 
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, FloodWait
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
@@ -339,6 +339,27 @@ async def resolve_delivery(d):
     return tcid, rtmid, deliver_via_bot
 
 
+async def _send_album_item(sender, tcid, im, rtmid):
+    """Send one InputMedia item individually (fallback when SendMultiMedia rejects the group)."""
+    cap = getattr(im, 'caption', None)
+    if isinstance(im, InputMediaPhoto):
+        return await sender.send_photo(tcid, im.media, caption=cap, reply_to_message_id=rtmid)
+    if isinstance(im, InputMediaVideo):
+        return await sender.send_video(
+            tcid, im.media, caption=cap, duration=im.duration,
+            width=im.width, height=im.height, thumb=im.thumb,
+            reply_to_message_id=rtmid,
+        )
+    if isinstance(im, InputMediaAudio):
+        return await sender.send_audio(tcid, im.media, caption=cap, duration=im.duration,
+                                       reply_to_message_id=rtmid)
+    return await sender.send_document(tcid, im.media, caption=cap, reply_to_message_id=rtmid)
+
+
+def _flood_secs(e):
+    return getattr(e, 'value', getattr(e, 'x', 10))
+
+
 async def process_album(c, u, msgs, d, lt, uid, i):
     """Forward an album 1:1 — grouping, order, caption and tags preserved.
 
@@ -444,14 +465,37 @@ async def process_album(c, u, msgs, d, lt, uid, i):
 
     if upload_error:
         err = upload_error
+        # Telegram rejects some groups (e.g. MEDIA_EMPTY when a no-audio-track
+        # video is treated as an animation and mixed into an album). Sending the
+        # items individually still delivers the good ones — partial success
+        # beats total failure.
+        print(f'send_media_group failed ({err}), falling back to per-item sends')
+        sent = 0
+        for im in media:
+            try:
+                await _send_album_item(sender, tcid, im, rtmid)
+                sent += 1
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                try:
+                    await _send_album_item(sender, tcid, im, rtmid)
+                    sent += 1
+                except Exception as e2:
+                    print(f'Per-item send failed after flood wait: {e2}')
+            except Exception as e2:
+                print(f'Per-item send failed: {e2}')
+            await asyncio.sleep(2)
+        for f in files:
+            if os.path.exists(f):
+                os.remove(f)
+        if sent:
+            await X.delete_messages(did, p.id)
+            return f'⚠️ 整组发送被拒，已逐条发送 {sent}/{len(media)} 项（{err[:40]}）'
         if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
             hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
         else:
             hint = ''
         await X.edit_message_text(did, p.id, f'相册上传失败：{err[:60]} {hint}')
-        for f in files:
-            if os.path.exists(f):
-                os.remove(f)
         return f'❌ 相册上传失败：{err[:60]}'
 
     for f in files:
@@ -656,11 +700,24 @@ def parse_link_lines(text):
 
 
 def _ok(res):
-    return ('Done' in res or 'Copied' in res or 'Sent' in res
-            or res.startswith('相册已'))
+    # Success strings are either process_msg's English markers or the
+    # emoji-prefixed album results (✅ full, ⚠️ partial per-item fallback).
+    return (res.startswith(('✅', '⚠️'))
+            or 'Done' in res or 'Copied' in res or 'Sent' in res)
 
 
 async def process_one_link(ubot, uc, i, s, lt, d, uid):
+    """Fetch and deliver one t.me link (expanding albums), with one FloodWait retry."""
+    try:
+        return await _process_one_link(ubot, uc, i, s, lt, d, uid)
+    except FloodWait as e:
+        secs = _flood_secs(e)
+        print(f'FloodWait {secs}s on {i}/{s}, waiting and retrying once')
+        await asyncio.sleep(secs)
+        return await _process_one_link(ubot, uc, i, s, lt, d, uid)
+
+
+async def _process_one_link(ubot, uc, i, s, lt, d, uid):
     """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
     if not uc and lt != 'public':
         return '用户会话无效或未登录，请先使用 /login。'

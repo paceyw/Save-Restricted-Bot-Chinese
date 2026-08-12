@@ -94,6 +94,7 @@ def batch_module(monkeypatch):
 
     pyrogram_errors = types.ModuleType("pyrogram.errors")
     pyrogram_errors.UserNotParticipant = type("UserNotParticipant", (Exception,), {})
+    pyrogram_errors.FloodWait = type("FloodWait", (Exception,), {})
     monkeypatch.setitem(sys.modules, "pyrogram.errors", pyrogram_errors)
 
     config = types.ModuleType("config")
