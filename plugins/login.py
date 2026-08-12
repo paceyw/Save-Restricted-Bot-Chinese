@@ -5,6 +5,7 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified
+import asyncio
 import logging
 import os
 import re
@@ -15,6 +16,10 @@ from shared_client import app as bot, _WORKDIR
 from utils.func import save_user_session, get_user_data, remove_user_session, save_user_bot, remove_user_bot
 from utils.encrypt import ecs, dcs
 from plugins.batch import UB, UC
+try:
+    from plugins.batch import Y
+except ImportError:
+    Y = None
 from utils.custom_filters import login_in_progress, set_user_step, get_user_step
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,7 +28,85 @@ model = "v3saver Team SPY"
 STEP_PHONE = 1
 STEP_CODE = 2
 STEP_PASSWORD = 3
+LOGIN_TTL = 10 * 60
 login_cache = {}
+login_step_times = {}
+login_locks = {}
+
+
+def _get_login_lock(user_id):
+    lock = login_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        login_locks[user_id] = lock
+    return lock
+
+
+def _set_login_step(user_id, step=None):
+    set_user_step(user_id, step)
+    if step is None:
+        login_step_times.pop(user_id, None)
+    else:
+        login_step_times[user_id] = time.monotonic()
+
+
+def _login_state_expired(user_id):
+    now = time.monotonic()
+    cache = login_cache.get(user_id)
+    step = get_user_step(user_id)
+    if cache is None and step is not None:
+        return True
+    timestamps = []
+    if cache is not None:
+        created_at = cache.get('created_at')
+        if created_at is None:
+            created_at = now
+            cache['created_at'] = created_at
+        timestamps.append(created_at)
+    step_started_at = login_step_times.get(user_id)
+    if step is not None and step_started_at is None:
+        step_started_at = cache.get('created_at', now) if cache else now
+        login_step_times[user_id] = step_started_at
+    if step_started_at is not None:
+        timestamps.append(step_started_at)
+    return any(now - timestamp > LOGIN_TTL for timestamp in timestamps)
+
+
+async def _clear_login_state(user_id, temp_client=None):
+    await cleanup_temp_login(user_id, temp_client)
+    login_cache.pop(user_id, None)
+    _set_login_step(user_id, None)
+
+
+async def _stop_cached_user_client(user_id):
+    old_client = UC.pop(user_id, None)
+    if old_client is not None and old_client is not Y:
+        try:
+            await old_client.stop()
+        except Exception as e:
+            logger.warning(f'Error stopping cached user client for {user_id}: {e}')
+
+
+async def _complete_login(user_id, status_msg, temp_client, session_string):
+    encrypted_session = ecs(session_string)
+    if not await save_user_session(user_id, encrypted_session):
+        await cleanup_temp_login(user_id, temp_client)
+        login_cache.pop(user_id, None)
+        _set_login_step(user_id, None)
+        await edit_message_safely(status_msg, '登录状态保存失败,请重试')
+        return False
+
+    await cleanup_temp_login(user_id, temp_client)
+    await _stop_cached_user_client(user_id)
+    temp_status_msg = login_cache.get(user_id, {}).get('status_msg', status_msg)
+    login_cache.pop(user_id, None)
+    login_cache[user_id] = {
+        'status_msg': temp_status_msg,
+        'created_at': time.monotonic(),
+    }
+    await edit_message_safely(status_msg, '✅ 登录成功！！')
+    _set_login_step(user_id, None)
+    return True
 
 
 def _mask_phone(phone):
@@ -86,6 +169,7 @@ async def cleanup_temp_login(user_id, temp_client=None):
 
 async def request_login_code(user_id, temp_client, phone):
     sent_code = await temp_client.send_code(phone)
+    login_cache[user_id].setdefault('created_at', time.monotonic())
     login_cache[user_id]['phone'] = phone
     login_cache[user_id]['phone_code_hash'] = sent_code.phone_code_hash
     login_cache[user_id]['temp_client'] = temp_client
@@ -96,15 +180,18 @@ async def request_login_code(user_id, temp_client, phone):
 @bot.on_message(filters.command('login'))
 async def login_command(client, message):
     user_id = message.from_user.id
-    await cleanup_temp_login(user_id)
-    set_user_step(user_id, STEP_PHONE)
-    login_cache.pop(user_id, None)
-    await message.delete()
-    status_msg = await message.reply(
-        """请发送带国家区号的手机号码
+    async with _get_login_lock(user_id):
+        await _clear_login_state(user_id)
+        _set_login_step(user_id, STEP_PHONE)
+        await message.delete()
+        status_msg = await message.reply(
+            """请发送带国家区号的手机号码
 示例：`+12345678900`"""
-        )
-    login_cache[user_id] = {'status_msg': status_msg}
+            )
+        login_cache[user_id] = {
+            'status_msg': status_msg,
+            'created_at': time.monotonic(),
+        }
     
     
 @bot.on_message(filters.command("setbot"))
@@ -169,6 +256,27 @@ async def rem_bot_token(C, m):
     'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
 async def handle_login_steps(client, message):
     user_id = message.from_user.id
+    async with _get_login_lock(user_id):
+        status_msg = login_cache.get(user_id, {}).get('status_msg')
+        if _login_state_expired(user_id):
+            await _clear_login_state(user_id)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            if status_msg:
+                await edit_message_safely(
+                    status_msg,
+                    '❌ 登录流程已过期，请使用 /login 重新开始。',
+                )
+            else:
+                await message.reply('❌ 登录流程已过期，请使用 /login 重新开始。')
+            return
+        await _handle_login_steps(client, message)
+
+
+async def _handle_login_steps(client, message):
+    user_id = message.from_user.id
     text = (message.text or "")
     if get_user_step(user_id) != STEP_PASSWORD:
         text = text.strip()
@@ -184,6 +292,7 @@ async def handle_login_steps(client, message):
         status_msg = await message.reply('处理中...')
         login_cache[user_id]['status_msg'] = status_msg
 
+    temp_client = None
     try:
         if step == STEP_PHONE:
             if not text.startswith('+'):
@@ -209,7 +318,7 @@ async def handle_login_steps(client, message):
                     f'LOGIN send_code OK phone={_mask_phone(text)} type={sent_code.type} '
                     f'dc={login_cache[user_id]["dc_id"]}'
                 )
-                set_user_step(user_id, STEP_CODE)
+                _set_login_step(user_id, STEP_CODE)
                 await edit_message_safely(
                     status_msg,
                     """✅ 验证码已发送到您的 Telegram 账户。
@@ -227,7 +336,7 @@ async def handle_login_steps(client, message):
 请使用 /login 重试。""",
                 )
                 await cleanup_temp_login(user_id, temp_client)
-                set_user_step(user_id, None)
+                _set_login_step(user_id, None)
 
         elif step == STEP_CODE:
             # Extract digits from any format (plain, spaced, letter-mixed)
@@ -262,14 +371,12 @@ async def handle_login_steps(client, message):
                 await edit_message_safely(status_msg, '🔄 正在验证验证码...')
                 await temp_client.sign_in(phone, phone_code_hash, code)
                 session_string = await temp_client.export_session_string()
-                encrypted_session = ecs(session_string)
-                await save_user_session(user_id, encrypted_session)
-                await cleanup_temp_login(user_id, temp_client)
-                temp_status_msg = login_cache[user_id]['status_msg']
-                login_cache.pop(user_id, None)
-                login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg, '✅ 登录成功！！')
-                set_user_step(user_id, None)
+                await _complete_login(
+                    user_id,
+                    status_msg,
+                    temp_client,
+                    session_string,
+                )
             except PhoneCodeExpired:
                 logger.warning(
                     f'LOGIN PhoneCodeExpired after {code_age:.1f}s; '
@@ -281,7 +388,7 @@ async def handle_login_steps(client, message):
                         temp_client,
                         phone,
                     )
-                    set_user_step(user_id, STEP_CODE)
+                    _set_login_step(user_id, STEP_CODE)
                     await edit_message_safely(
                         status_msg,
                         """❌ 上一个验证码已失效。
@@ -298,13 +405,13 @@ async def handle_login_steps(client, message):
                     )
                     await cleanup_temp_login(user_id, temp_client)
                     login_cache.pop(user_id, None)
-                    set_user_step(user_id, None)
+                    _set_login_step(user_id, None)
                     await edit_message_safely(
                         status_msg,
                         '❌ 验证码已失效且重新发送失败，请重新发送 /login。',
                     )
             except SessionPasswordNeeded:
-                set_user_step(user_id, STEP_PASSWORD)
+                _set_login_step(user_id, STEP_PASSWORD)
                 await edit_message_safely(
                     status_msg,
                     """🔒 已启用两步验证。
@@ -326,7 +433,7 @@ async def handle_login_steps(client, message):
                 )
                 await cleanup_temp_login(user_id, temp_client)
                 login_cache.pop(user_id, None)
-                set_user_step(user_id, None)
+                _set_login_step(user_id, None)
 
         elif step == STEP_PASSWORD:
             temp_client = login_cache[user_id]['temp_client']
@@ -334,14 +441,12 @@ async def handle_login_steps(client, message):
                 await edit_message_safely(status_msg, '🔄 正在验证密码...')
                 await temp_client.check_password(text)
                 session_string = await temp_client.export_session_string()
-                encrypted_session = ecs(session_string)
-                await save_user_session(user_id, encrypted_session)
-                await cleanup_temp_login(user_id, temp_client)
-                temp_status_msg = login_cache[user_id]['status_msg']
-                login_cache.pop(user_id, None)
-                login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg, '✅ 登录成功！！')
-                set_user_step(user_id, None)
+                await _complete_login(
+                    user_id,
+                    status_msg,
+                    temp_client,
+                    session_string,
+                )
             except BadRequest as e:
                 await edit_message_safely(
                     status_msg,
@@ -355,9 +460,9 @@ async def handle_login_steps(client, message):
             f"""❌ 发生错误：{str(e)}
 请使用 /login 重试。""",
         )
-        await cleanup_temp_login(user_id)
+        await cleanup_temp_login(user_id, temp_client)
         login_cache.pop(user_id, None)
-        set_user_step(user_id, None)
+        _set_login_step(user_id, None)
 async def edit_message_safely(message, text):
     """Helper function to edit message and handle errors"""
     try:
@@ -373,9 +478,7 @@ async def cancel_command(client, message):
     await message.delete()
     if get_user_step(user_id):
         status_msg = login_cache.get(user_id, {}).get('status_msg')
-        await cleanup_temp_login(user_id)
-        login_cache.pop(user_id, None)
-        set_user_step(user_id, None)
+        await _clear_login_state(user_id)
         if status_msg:
             await edit_message_safely(status_msg,
                 '✅ 登录流程已取消。使用 /login 重新开始。')
@@ -395,6 +498,7 @@ async def logout_command(client, message):
         session_data = await get_user_data(user_id)
         
         if not session_data or 'session_string' not in session_data:
+            await _stop_cached_user_client(user_id)
             await edit_message_safely(status_msg,
                 '❌ 未找到您账户的有效会话。')
             return
@@ -424,16 +528,14 @@ async def logout_command(client, message):
                 os.remove(f"{user_id}_client.session")
         except Exception:
             pass
-        if UC.get(user_id, None):
-            del UC[user_id]
+        await _stop_cached_user_client(user_id)
     except Exception as e:
         logger.error(f'Error in logout command: {str(e)}')
         try:
             await remove_user_session(user_id)
         except Exception:
             pass
-        if UC.get(user_id, None):
-            del UC[user_id]
+        await _stop_cached_user_client(user_id)
         await edit_message_safely(status_msg,
             f'❌ 退出登录时发生错误：{str(e)}')
         try:
