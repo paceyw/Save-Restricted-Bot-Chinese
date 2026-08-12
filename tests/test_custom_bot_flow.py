@@ -117,7 +117,19 @@ def batch_module(monkeypatch):
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
-    func.E = None
+
+    import re as _re
+
+    def _E(L):
+        private_match = _re.match(r'https://t\.me/c/(\d+)/(?:\d+/)?(\d+)', L)
+        public_match = _re.match(r'https://t\.me/([^/]+)/(?:\d+/)?(\d+)', L)
+        if private_match:
+            return f'-100{private_match.group(1)}', int(private_match.group(2)), 'private'
+        if public_match:
+            return public_match.group(1), int(public_match.group(2)), 'public'
+        return None, None, None
+
+    func.E = _E
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     custom_filters = types.ModuleType("utils.custom_filters")
@@ -337,3 +349,45 @@ def test_resolve_delivery_defaults_to_user_chat(batch_module):
     assert tcid == 42
     assert isinstance(tcid, int)
     assert via_bot is False
+
+
+def test_parse_link_lines_single_line_is_range(batch_module):
+    module, _ = batch_module
+
+    mode, payload = module.parse_link_lines('https://t.me/fancha103/7823?single')
+
+    assert mode == 'range'
+    assert payload == ('fancha103', 7823, 'public')
+
+
+def test_parse_link_lines_multi_lines(batch_module):
+    module, _ = batch_module
+
+    mode, payload = module.parse_link_lines(
+        'https://t.me/fancha103/7823\n\n  https://t.me/c/1234567/88 \nhttps://t.me/other/9?single\n'
+    )
+
+    assert mode == 'multi'
+    assert payload == [
+        ('fancha103', 7823, 'public'),
+        ('-1001234567', 88, 'private'),
+        ('other', 9, 'public'),
+    ]
+
+
+def test_parse_link_lines_reports_bad_line_number(batch_module):
+    module, _ = batch_module
+
+    mode, payload = module.parse_link_lines('https://t.me/fancha103/7823\nnot-a-link\nhttps://t.me/other/9')
+
+    assert mode == 'invalid'
+    assert payload[0] == 2
+    assert 'not-a-link' in payload[1]
+
+
+def test_parse_link_lines_rejects_empty_text(batch_module):
+    module, _ = batch_module
+
+    mode, _ = module.parse_link_lines('   \n  \n')
+
+    assert mode == 'invalid'

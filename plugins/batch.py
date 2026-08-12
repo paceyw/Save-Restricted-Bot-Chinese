@@ -624,6 +624,53 @@ async def process_msg(c, u, m, d, lt, uid, i):
     except Exception as e:
         return f'Error: {str(e)[:50]}'
         
+def parse_link_lines(text):
+    """Parse /batch input.
+
+    One non-empty line  -> ('range', (cid, sid, lt))   # start link + count flow
+    Multiple lines      -> ('multi', [(cid, sid, lt), ...])
+    Any unparsable line -> ('invalid', (line_no, line_text))
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    parsed = []
+    for idx, ln in enumerate(lines, 1):
+        ci, di, lti = E(ln)
+        if not ci or not di:
+            return 'invalid', (idx, ln)
+        parsed.append((ci, di, lti))
+    if not parsed:
+        return 'invalid', (1, text.strip()[:50])
+    if len(parsed) == 1:
+        return 'range', parsed[0]
+    return 'multi', parsed
+
+
+def _ok(res):
+    return ('Done' in res or 'Copied' in res or 'Sent' in res
+            or res.startswith('相册已'))
+
+
+async def process_one_link(ubot, uc, i, s, lt, d, uid):
+    """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
+    if not uc and lt != 'public':
+        return '用户会话无效或未登录，请先使用 /login。'
+    msg = await get_msg(ubot, uc, i, s, lt)
+    if not msg:
+        return '未找到消息'
+    msgs = [msg]
+    if getattr(msg, 'media_group_id', None):
+        fetch_client = uc if (uc and (lt == 'private' or emp.get(i, False))) else ubot
+        try:
+            group = await fetch_client.get_media_group(i, s)
+            if group:
+                msgs = group
+        except Exception as e:
+            print(f'Media group fetch failed, falling back to single: {e}')
+    if len(msgs) > 1:
+        return await process_album(ubot, uc, msgs, d, lt, uid, i)
+    return await process_msg(ubot, uc, msgs[0], d, lt, uid, i)
+
+
 @X.on_message(filters.command(['batch', 'single']))
 async def process_cmd(c, m):
     uid = m.from_user.id
@@ -653,7 +700,10 @@ async def process_cmd(c, m):
         return
     
     Z[uid] = {'step': 'start' if cmd == 'batch' else 'start_single'}
-    await pro.edit(f'发送 {"起始链接..." if cmd == "batch" else "要处理的链接"}。')
+    if cmd == 'batch':
+        await pro.edit('发送起始链接（连续下载指定数量），或多条链接（每行一条，逐个下载）。')
+    else:
+        await pro.edit('发送要处理的链接。')
 
 @X.on_message(filters.command(['cancel', 'stop']))
 async def cancel_cmd(c, m):
@@ -686,14 +736,66 @@ async def text_handler(c, m):
         return
 
     if s == 'start':
-        L = m.text
-        i, d, lt = E(L)
-        if not i or not d:
-            await m.reply_text('链接格式无效。')
+        mode, payload = parse_link_lines(m.text)
+        if mode == 'invalid':
+            idx, line = payload
+            await m.reply_text(f'第 {idx} 行链接格式无效：{line[:50]}')
             Z.pop(uid, None)
             return
-        Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
-        await m.reply_text('要处理多少条消息？')
+        if mode == 'range':
+            i, d, lt = payload
+            Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
+            await m.reply_text('要处理多少条消息？')
+            return
+
+        links = payload
+        n = len(links)
+        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
+        if n > maxlimit:
+            await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
+            Z.pop(uid, None)
+            return
+
+        pt = await m.reply_text(f'开始批量提取 {n} 条链接...')
+        uc = await get_uclient(uid)
+        ubot = UB.get(uid)
+        if not ubot:
+            await pt.edit('请先使用 /setbot 添加机器人')
+            Z.pop(uid, None)
+            return
+        if is_user_active(uid):
+            await pt.edit('存在正在进行的任务。请先使用 /stop。')
+            Z.pop(uid, None)
+            return
+
+        await add_active_batch(uid, {
+            "total": n,
+            "current": 0,
+            "success": 0,
+            "cancel_requested": False,
+            "progress_message_id": pt.id
+            })
+
+        success = 0
+        try:
+            for j, (ci, di, lti) in enumerate(links):
+                if should_cancel(uid):
+                    await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
+                    break
+                await update_batch_progress(uid, j, success)
+                try:
+                    res = await process_one_link(ubot, uc, ci, di, lti, str(m.chat.id), uid)
+                    if _ok(res):
+                        success += 1
+                except Exception as e:
+                    try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
+                    except: pass
+                await asyncio.sleep(10)
+            if j + 1 == n:
+                await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
+        finally:
+            await remove_active_batch(uid)
+            Z.pop(uid, None)
 
     elif s == 'start_single':
         L = m.text
@@ -714,43 +816,14 @@ async def text_handler(c, m):
             return
         
         uc = await get_uclient(uid)
-        if not uc and lt != 'public':
-            await pt.edit('用户会话无效或未登录，请先使用 /login。')
-            Z.pop(uid, None)
-            return
-            
         if is_user_active(uid):
             await pt.edit('存在正在进行的任务。请先使用 /stop。')
             Z.pop(uid, None)
             return
 
         try:
-            msg = await get_msg(ubot, uc, i, s, lt)
-            if msg:
-                # Album (media group) expansion: t.me links — even with ?single —
-                # often point at one item of a multi-photo/video album. Users expect
-                # the whole album, not one arbitrary item. Fetch the entire group
-                # with the same client that fetched the original message, so file
-                # references stay valid for that client's session.
-                msgs = [msg]
-                if getattr(msg, 'media_group_id', None):
-                    fetch_client = uc if (uc and (lt == 'private' or emp.get(i, False))) else ubot
-                    try:
-                        group = await fetch_client.get_media_group(i, s)
-                        if group:
-                            msgs = group
-                    except Exception as e:
-                        print(f'Media group fetch failed, falling back to single: {e}')
-
-                total = len(msgs)
-                if total > 1:
-                    res = await process_album(ubot, uc, msgs, str(m.chat.id), lt, uid, i)
-                    await pt.edit(res)
-                else:
-                    res = await process_msg(ubot, uc, msgs[0], str(m.chat.id), lt, uid, i)
-                    await pt.edit(f'1/1: {res}')
-            else:
-                await pt.edit('未找到消息')
+            res = await process_one_link(ubot, uc, i, s, lt, str(m.chat.id), uid)
+            await pt.edit(res)
         except Exception as e:
             await pt.edit(f'错误：{str(e)[:50]}')
         finally:
