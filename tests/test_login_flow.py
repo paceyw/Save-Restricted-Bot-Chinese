@@ -135,10 +135,24 @@ def _load_login_module(monkeypatch):
     encrypt.dcs = lambda value: value
     monkeypatch.setitem(sys.modules, "utils.encrypt", encrypt)
 
-    batch = types.ModuleType("plugins.batch")
-    batch.UB = {}
-    batch.UC = {}
-    monkeypatch.setitem(sys.modules, "plugins.batch", batch)
+    fetch = types.ModuleType("plugins.fetch")
+    fetch.user_bots = {}
+    fetch.user_clients = {}
+    fetch.premium_userbot = None
+    fetch._locks = {}
+
+    def _client_lock(user_id):
+        lock = fetch._locks.get(user_id)
+        if lock is None:
+            lock = fetch._locks[user_id] = asyncio.Lock()
+        return lock
+
+    fetch._client_lock = _client_lock
+    monkeypatch.setitem(sys.modules, "plugins.fetch", fetch)
+    tasks = types.ModuleType("plugins.tasks")
+    tasks._ensure_sweeper = lambda: None
+    tasks.register_sweep_hook = lambda _hook: None
+    monkeypatch.setitem(sys.modules, "plugins.tasks", tasks)
 
     custom_filters = types.ModuleType("utils.custom_filters")
     steps = {}
@@ -154,13 +168,14 @@ def _load_login_module(monkeypatch):
     custom_filters.get_user_step = lambda user_id: steps.get(user_id)
     monkeypatch.setitem(sys.modules, "utils.custom_filters", custom_filters)
 
-    spec = importlib.util.spec_from_file_location(
-        "test_login_module",
-        __file__.replace("test_login_flow.py", "../plugins/login.py"),
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    plugins = types.ModuleType("plugins")
+    plugins.__path__ = [
+        str(__import__("pathlib").Path(__file__).resolve().parents[1] / "plugins")
+    ]
+    monkeypatch.setitem(sys.modules, "plugins", plugins)
+    sys.modules.pop("plugins.login", None)
+    import importlib
+    module = importlib.import_module("plugins.login")
     return module, steps
 
 

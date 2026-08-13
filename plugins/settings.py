@@ -27,7 +27,6 @@ MESS = '自定义文件设置...\n\n提示：任务开始执行后修改设置�
 
 active_conversations = {}
 _ACTIVE_CONVERSATION_TTL = 900
-_SETTINGS_LOCKS = {}
 def active_conversation_filter(_, __, message):
     return (
         message.from_user is not None
@@ -38,9 +37,9 @@ active_conversation = filters.create(active_conversation_filter)
 
 
 def _ensure_settings_sweeper():
-    """Start the shared sweeper without importing batch during module load."""
+    """Start the shared sweeper without importing tasks during module load."""
     try:
-        from plugins.batch import _ensure_sweeper
+        from plugins.tasks import _ensure_sweeper
     except Exception:
         return
     try:
@@ -127,32 +126,11 @@ __👉 **注意：** 如果您使用自定义机器人，您的机器人必须�
 
     await query.answer()
 async def _stop_cached_user_client(user_id):
-    try:
-        from plugins.batch import UC, Y
-    except ImportError:
-        try:
-            from plugins.batch import UC
-        except ImportError:
-            return
-        Y = None
-
-    try:
-        from plugins.batch import _client_lock
-    except ImportError:
-        def _client_lock(uid):
-            lock = _SETTINGS_LOCKS.get(uid)
-            if lock is None:
-                lock = _SETTINGS_LOCKS[uid] = asyncio.Lock()
-            return lock
-
+    from plugins.fetch import user_clients, premium_userbot, _client_lock, _UC_EPOCH
     async with _client_lock(user_id):
-        old_client = UC.pop(user_id, None)
-        try:
-            from plugins.batch import _UC_EPOCH
-            _UC_EPOCH.pop(user_id, None)
-        except ImportError:
-            pass
-        if old_client is not None and old_client is not Y:
+        old_client = user_clients.pop(user_id, None)
+        _UC_EPOCH.pop(user_id, None)
+        if old_client is not None and old_client is not premium_userbot:
             try:
                 await old_client.stop()
             except Exception:

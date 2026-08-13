@@ -1,4 +1,5 @@
 import asyncio
+import re as _re
 import importlib.util
 import sys
 import types
@@ -132,8 +133,10 @@ def batch_module(monkeypatch):
     func.screenshot = None
     func.thumbnail = None
     func.get_video_metadata = None
-    func.ensure_audio_track = None
     func.touch_file = lambda *_a, **_k: None
+    func.ensure_audio_track = None
+    func.VIDEO_EXTENSIONS = set()
+    func.AUDIO_EXTENSIONS = set()
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
@@ -168,9 +171,7 @@ def batch_module(monkeypatch):
     func.prune_cred_epochs = lambda _active: None
     func.apply_text_rules = lambda text, _replacements, _delete_words: text
 
-    import re as _re
-
-    def _E(L):
+    def _parse_link(L):
         private_match = _re.match(r'https://t\.me/c/(\d+)/(?:\d+/)?(\d+)', L)
         public_match = _re.match(r'https://t\.me/([^/]+)/(?:\d+/)?(\d+)', L)
         comment_match = _re.search(r'[?&]comment=(\d+)', L)
@@ -181,7 +182,7 @@ def batch_module(monkeypatch):
             return public_match.group(1), int(public_match.group(2)), 'public', comment_id
         return None, None, None, None
 
-    func.E = _E
+    func.parse_link = _parse_link
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     custom_filters = types.ModuleType("utils.custom_filters")
@@ -214,17 +215,70 @@ def batch_module(monkeypatch):
     start.subscribe = subscribe
     monkeypatch.setitem(sys.modules, "plugins.start", start)
 
-    module_name = "test_batch_module"
-    spec = importlib.util.spec_from_file_location(module_name, SRC / "plugins" / "batch.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module, FakeClient
+    for name in ("plugins.fetch", "plugins.tasks", "plugins.deliver", "plugins.batch"):
+        sys.modules.pop(name, None)
+    import importlib
+    fetch_module = importlib.import_module("plugins.fetch")
+    tasks_module = importlib.import_module("plugins.tasks")
+    deliver_module = importlib.import_module("plugins.deliver")
+    batch_module = importlib.import_module("plugins.batch")
+
+    for worker in list(tasks_module.USER_WORKERS.values()):
+        worker.cancel()
+    fetch_module.user_bots.clear()
+    fetch_module.user_clients.clear()
+    fetch_module.fetch_origin.clear()
+    fetch_module._CLIENT_LAST_USED.clear()
+    fetch_module._PEER_CACHE.clear()
+    fetch_module._LINKED_CHAT.clear()
+    fetch_module._UB_EPOCH.clear()
+    fetch_module._UC_EPOCH.clear()
+    fetch_module._UB_UC_LOCKS.clear()
+    deliver_module.progress_state.clear()
+    batch_module.pending_flows.clear()
+    batch_module._Z_TS.clear()
+    tasks_module.TASKS.clear()
+    tasks_module.USER_QUEUES.clear()
+    tasks_module.USER_WORKERS.clear()
+
+    class ModuleBundle:
+        def __init__(self):
+            object.__setattr__(self, "_modules", (
+                fetch_module, tasks_module, deliver_module, batch_module
+            ))
+
+        def _owner(self, name):
+            for candidate in self._modules:
+                if hasattr(candidate, name):
+                    return candidate
+            return deliver_module
+
+        def __getattr__(self, name):
+            return getattr(self._owner(name), name)
+
+        def __setattr__(self, name, value):
+            if name == "_modules":
+                object.__setattr__(self, name, value)
+                return
+            shared = {
+                "get_user_data", "get_user_data_key", "get_ubot", "get_uclient",
+                "get_msg", "resolve_linked_chat", "cred_epoch", "process_msg",
+                "process_merged", "process_album", "process_one_link",
+                "_ok", "_flood_secs",
+            }
+            if name in shared:
+                for candidate in self._modules:
+                    if hasattr(candidate, name):
+                        setattr(candidate, name, value)
+                return
+            setattr(self._owner(name), name, value)
+
+    return ModuleBundle(), FakeClient
 
 
 def test_get_ubot_uses_persistent_workdir_and_saved_token(batch_module):
     module, fake_client = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
 
     async def get_key(uid, key, default=None):
         assert (uid, key) == (42, "bot_token")
@@ -237,12 +291,12 @@ def test_get_ubot_uses_persistent_workdir_and_saved_token(batch_module):
     assert bot is fake_client.instances[-1]
     assert bot.kwargs["bot_token"] == "123456:token-value"
     assert bot.kwargs["workdir"] == "/persistent"
-    assert module.UB[42] is bot
+    assert module.user_bots[42] is bot
 
 
 def test_single_reports_start_failure_as_start_failure_not_missing_token(batch_module):
     module, _ = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
 
     async def get_key(uid, key, default=None):
         return "123456:token-value"
@@ -263,7 +317,7 @@ def test_single_reports_start_failure_as_start_failure_not_missing_token(batch_m
 
 def test_get_msg_public_falls_back_without_emp_keyerror(batch_module):
     module, _ = batch_module
-    module.emp.clear()
+    module.fetch_origin.clear()
 
     class UserClient:
         async def get_messages(self, chat, message_id):
@@ -278,12 +332,12 @@ def test_get_msg_public_falls_back_without_emp_keyerror(batch_module):
     )
 
     assert message is not None
-    assert module.emp[(42, "public_channel")] is False
+    assert module.fetch_origin[(42, "public_channel")] is False
 
 
 def test_get_msg_public_uses_bot_directly_without_user_client(batch_module):
     module, _ = batch_module
-    module.emp.clear()
+    module.fetch_origin.clear()
 
     class BotClient:
         async def get_messages(self, chat, message_id):
@@ -294,11 +348,11 @@ def test_get_msg_public_uses_bot_directly_without_user_client(batch_module):
     )
 
     assert message is not None
-    assert module.emp[(42, "public_channel")] is False
+    assert module.fetch_origin[(42, "public_channel")] is False
 
 def test_get_msg_public_marks_user_source_for_download(batch_module):
     module, _ = batch_module
-    module.emp.clear()
+    module.fetch_origin.clear()
 
     class UserClient:
         async def get_messages(self, chat, message_id):
@@ -309,12 +363,12 @@ def test_get_msg_public_marks_user_source_for_download(batch_module):
     )
 
     assert message is not None
-    assert module.emp[(42, "public_channel")] is True
+    assert module.fetch_origin[(42, "public_channel")] is True
 
 
 def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
     module, _ = batch_module
-    module.emp[(42, "public_channel")] = False
+    module.fetch_origin[(42, "public_channel")] = False
 
     async def get_key(user_id, key, default=None):
         return default
@@ -465,13 +519,13 @@ def _stub_progress_app(module):
 
     module.get_user_data_key = get_key
     module.process_text_with_rules = process_text
-    module.X = FakeX()
+    module.main_bot = FakeX()
     module.LOG_GROUP = 0
 
 
 def test_process_msg_cleans_downloaded_file_on_processing_error(batch_module, tmp_path):
     module, _ = batch_module
-    module.emp[(42, "public_channel")] = True
+    module.fetch_origin[(42, "public_channel")] = True
     _stub_progress_app(module)
     # fixture's plugins.settings.rename_file is None -> the rename step raises,
     # exercising the mid-processing cleanup path.
@@ -502,7 +556,7 @@ def test_process_msg_cleans_downloaded_file_on_processing_error(batch_module, tm
 
 def test_process_msg_sends_sticker_from_downloaded_file(batch_module, tmp_path):
     module, _ = batch_module
-    module.emp[(42, "public_channel")] = True
+    module.fetch_origin[(42, "public_channel")] = True
     _stub_progress_app(module)
     module.thumbnail = lambda d: None
 
@@ -781,7 +835,7 @@ def test_process_merged_oc_replaces_text_only_messages(batch_module):
 
 def test_process_msg_oc_replaces_media_caption(batch_module, tmp_path):
     module, _ = batch_module
-    module.emp[(42, "public_channel")] = True
+    module.fetch_origin[(42, "public_channel")] = True
     _stub_progress_app(module)
     module.thumbnail = lambda d: None
 
@@ -947,7 +1001,7 @@ def test_get_msg_resolves_comment_via_linked_chat(batch_module):
     assert fetched['chat_id'] == -100999
     assert fetched['msg_id'] == 686
     assert result is not None
-    assert module.emp[(42, -100999)] is True
+    assert module.fetch_origin[(42, -100999)] is True
 
 
 def test_get_msg_comment_without_linked_chat_returns_none(batch_module):
@@ -1231,11 +1285,11 @@ def test_dispatch_chain_fails_loudly_on_any_extra_users_read(batch_module):
 
 
 def test_get_uclient_cache_hit_performs_no_db_reads(batch_module):
-    """P1 regression: a warm UC entry short-circuits before get_user_data and
+    """P1 regression: a warm user_clients entry short-circuits before get_user_data and
     before get_ubot — steady-state tasks issue zero extra users queries."""
     module, _ = batch_module
     cached = object()
-    module.UC[42] = cached
+    module.user_clients[42] = cached
     module._UC_EPOCH[42] = 0  # matches fixture cred_epoch == 0
 
     async def fail_read(*_a, **_k):
@@ -1343,7 +1397,7 @@ def test_run_batch_count_forwards_snapshot_to_process_msg(batch_module):
 
 
 def test_get_uclient_miss_reads_user_data_exactly_once(batch_module):
-    """Cold-path contract: UC miss performs exactly one session read
+    """Cold-path contract: user_clients miss performs exactly one session read
     (establishment-class, documented residual), then falls back to the
     custom bot when no session_string exists."""
     module, _ = batch_module
@@ -1438,7 +1492,7 @@ def test_task_chain_performs_exactly_one_real_find_one(batch_module, monkeypatch
     assert task['settings']['caption'] == 'real cap'
     assert 'session_string' not in task['settings']
     # Cold clients were established from the prefetched doc, no re-query.
-    assert 42 in module.UB and 42 in module.UC
+    assert 42 in module.user_bots and 42 in module.user_clients
     # The real process_msg delivered through the snapshot settings.
     assert sent == [(42, 'hello')]
 
@@ -1459,7 +1513,7 @@ def test_get_ubot_uses_matching_prefetch_without_query(batch_module):
 
     assert bot is not None
     assert bot.kwargs.get('bot_token') == 'tok'
-    assert module.UB[42] is bot
+    assert module.user_bots[42] is bot
 
 
 def test_get_ubot_discards_stale_prefetch_and_rereads_under_lock(batch_module):
@@ -1500,7 +1554,7 @@ def test_get_ubot_rotation_during_start_never_caches_stale(batch_module, monkeyp
     )
 
     assert bot is None
-    assert 42 not in module.UB
+    assert 42 not in module.user_bots
 
 
 def test_get_ubot_evicts_cached_client_after_rotation(batch_module):
@@ -1508,7 +1562,7 @@ def test_get_ubot_evicts_cached_client_after_rotation(batch_module):
     the lock and rebuilt from a fresh locked read (addsession/rembot path)."""
     module, FakeClient = batch_module
     stale = FakeClient('user_42')
-    module.UB[42] = stale
+    module.user_bots[42] = stale
     calls = []
 
     async def get_key(uid, key, default=None):
@@ -1526,16 +1580,16 @@ def test_get_ubot_evicts_cached_client_after_rotation(batch_module):
     assert calls == [(42, 'bot_token')]
     assert bot is not stale
     assert bot.kwargs.get('bot_token') == 'fresh-token'
-    assert module.UB[42] is bot
+    assert module.user_bots[42] is bot
 
 
 def test_get_uclient_evicts_cached_session_client_after_rotation(batch_module):
-    """addsession bumps the epoch without stopping UC; the next get_uclient
+    """addsession bumps the epoch without stopping user_clients; the next get_uclient
     with a stale prefetch must evict the old session client and rebuild from
     a freshly read document."""
     module, FakeClient = batch_module
     stale = FakeClient('42_client')
-    module.UC[42] = stale
+    module.user_clients[42] = stale
     reads = []
 
     async def get_data(uid):
@@ -1559,7 +1613,7 @@ def test_get_uclient_evicts_cached_session_client_after_rotation(batch_module):
 
     assert stale.stopped is True
     assert client is not stale
-    assert module.UC[42] is client
+    assert module.user_clients[42] is client
     assert reads == [42]
 
 
@@ -1584,7 +1638,7 @@ def test_get_ubot_prefetched_plaintext_token_survives_self_migration(batch_modul
 
     assert bot is not None
     assert bot.kwargs.get('bot_token') == plaintext
-    assert module.UB[42] is bot
+    assert module.user_bots[42] is bot
 
 
 def test_dispatch_captures_epoch_before_document_read(batch_module):
@@ -1639,4 +1693,4 @@ def test_get_uclient_rotation_during_upd_dlg_never_caches_stale(batch_module, mo
 
     assert client is not None
     assert client.kwargs.get('bot_token') == 'tok'  # fell back to the bot client
-    assert 42 not in module.UC
+    assert 42 not in module.user_clients

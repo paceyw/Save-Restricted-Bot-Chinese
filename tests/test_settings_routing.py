@@ -62,11 +62,12 @@ def _load_settings_module(monkeypatch):
     func.bump_cred_epoch = lambda _uid: None
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
-    spec = importlib.util.spec_from_file_location(
-        "test_settings_module", SRC / "plugins" / "settings.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    plugins = types.ModuleType("plugins")
+    plugins.__path__ = [str(SRC / "plugins")]
+    monkeypatch.setitem(sys.modules, "plugins", plugins)
+    sys.modules.pop("plugins.settings", None)
+    import importlib
+    module = importlib.import_module("plugins.settings")
     return module
 
 

@@ -19,7 +19,15 @@ logger = logging.getLogger(__name__)
 
 PUBLIC_LINK_PATTERN = re.compile(r'^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([^/]+)/(?:\d+/)?(\d+)')
 PRIVATE_LINK_PATTERN = re.compile(r'^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/c/(\d+)/(?:\d+/)?(\d+)')
-VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"}
+# Canonical extension sets (single source for deliver.process_msg). Membership
+# matches the pre-split process_msg local lists exactly: mpeg/mpg are NOT
+# treated as video (they fell through to the plain-document path).
+VIDEO_EXTENSIONS = {
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "3gp", "m4v", "ogv",
+}
+AUDIO_EXTENSIONS = {
+    "mp3", "wav", "flac", "aac", "ogg", "wma", "m4a", "opus", "aiff", "ac3",
+}
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[DB_NAME]
@@ -54,7 +62,7 @@ def hhmmss(seconds):
     return time.strftime('%H:%M:%S', time.gmtime(seconds))
 
 
-def E(L):
+def parse_link(L):
     """Parse a t.me link into (chat_id, msg_id, link_type, comment_id).
 
     comment_id is non-None when the URL contains ?comment=N — that points to a

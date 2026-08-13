@@ -106,11 +106,13 @@ def batch_module(monkeypatch):
     func.thumbnail = None
     func.get_video_metadata = None
     func.ensure_audio_track = None
+    func.VIDEO_EXTENSIONS = set()
+    func.AUDIO_EXTENSIONS = set()
     func.touch_file = lambda *_a, **_k: None
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
-    func.E = lambda value: (None, None, None, None)
+    func.parse_link = lambda value: (None, None, None, None)
     async def get_user_settings(_uid):
         return {}
 
@@ -176,17 +178,23 @@ def batch_module(monkeypatch):
     start.subscribe = subscribe
     monkeypatch.setitem(sys.modules, "plugins.start", start)
 
-    module_name = "test_token_batch_module"
-    spec = importlib.util.spec_from_file_location(module_name, SRC / "plugins" / "batch.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module, FakeClient, saved_tokens
+    for name in ("plugins.fetch", "plugins.tasks", "plugins.deliver", "plugins.batch"):
+        sys.modules.pop(name, None)
+    import importlib
+    importlib.import_module("plugins.tasks")
+    importlib.import_module("plugins.deliver")
+    importlib.import_module("plugins.batch")
+    fetch_module = importlib.import_module("plugins.fetch")
+    fetch_module.user_bots.clear()
+    fetch_module.user_clients.clear()
+    fetch_module.fetch_origin.clear()
+    fetch_module._CLIENT_LAST_USED.clear()
+    return fetch_module, FakeClient, saved_tokens
 
 
 def test_get_ubot_decrypts_stored_token_before_client_creation(batch_module):
     module, fake_client, saved_tokens = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
     encrypted = ecs(" 123456:token-value ")
 
     async def get_key(uid, key, default=None):
@@ -204,7 +212,7 @@ def test_get_ubot_decrypts_stored_token_before_client_creation(batch_module):
 
 def test_get_ubot_migrates_plaintext_token_and_uses_it(batch_module):
     module, fake_client, saved_tokens = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
     plaintext = "123456:token-value-abcdefghijkl"
 
     async def get_key(uid, key, default=None):
@@ -222,7 +230,7 @@ def test_get_ubot_migrates_plaintext_token_and_uses_it(batch_module):
 
 def test_get_ubot_rejects_corrupted_ciphertext_without_migration(batch_module):
     module, fake_client, saved_tokens = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
     encoded = bytearray(base64.b64decode(ecs("123456:token-value-abcdefghijkl")))
     encoded[-1] ^= 1
     corrupted = base64.b64encode(encoded).decode()
@@ -237,7 +245,7 @@ def test_get_ubot_rejects_corrupted_ciphertext_without_migration(batch_module):
 
 def test_get_ubot_uses_plaintext_when_migration_errors(batch_module):
     module, fake_client, saved_tokens = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
     plaintext = "123456:token-value-abcdefghijkl"
 
     async def get_key(uid, key, default=None):
@@ -258,7 +266,7 @@ def test_get_ubot_uses_plaintext_when_migration_errors(batch_module):
 
 def test_get_ubot_reloads_token_after_cas_conflict(batch_module):
     module, fake_client, saved_tokens = batch_module
-    module.UB.clear()
+    module.user_bots.clear()
     token_a = "123456:token-value-abcdefghijkl"
     token_b = "654321:new-token-value-abcdefghijkl"
     reads = iter([token_a, ecs(token_b)])
