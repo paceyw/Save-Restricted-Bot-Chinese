@@ -32,6 +32,11 @@ _LRU_MAXSIZE = 1000
 _PROGRESS_TTL = 3600
 _Z_IDLE_TTL = 1800
 
+# Private-message peer cache: avoid a full get_dialogs preheat on every
+# get_msg call, while retaining the existing preheat chain as stale-cache
+# fallback.
+_PEER_CACHE_TTL = 24 * 3600
+_PEER_CACHE_MAX = 500
 
 class _BoundedLRU(OrderedDict):
     """Ordered mapping with a hard upper bound and access-order refresh."""
@@ -88,10 +93,62 @@ _UB_EPOCH, _UC_EPOCH = {}, {}
 emp = _BoundedLRU(_LRU_MAXSIZE)
 _LINKED_CHAT = _BoundedLRU(_LRU_MAXSIZE)
 _CLIENT_LAST_USED = {}
+_PEER_CACHE: dict[int, dict[str, tuple[str, float]]] = {}
 _Z_TS = {}
 _SWEEPER_TASK = None
 _SWEEP_LOCK = None
 _SWEEP_HOOKS = []
+
+
+def _peer_cache_get(uid, candidate_keys, now):
+    """Return the first live ``(key, form)`` candidate and prune stale keys."""
+    peers = _PEER_CACHE.get(uid)
+    if not peers:
+        return None
+
+    for candidate in candidate_keys:
+        key = str(candidate)
+        entry = peers.get(key)
+        if entry is None:
+            continue
+        form, expiry = entry
+        if expiry <= now:
+            peers.pop(key, None)
+            continue
+        return key, str(form)
+
+    if not peers:
+        _PEER_CACHE.pop(uid, None)
+    return None
+
+
+def _peer_cache_put(uid, keys, form, now):
+    """Store aliases for a successful peer form, enforcing the per-user cap."""
+    peers = _PEER_CACHE.setdefault(uid, {})
+    value = (str(form), now + _PEER_CACHE_TTL)
+    for key in keys:
+        peers[str(key)] = value
+
+    while len(peers) > _PEER_CACHE_MAX:
+        oldest_key = min(peers, key=lambda candidate: peers[candidate][1])
+        peers.pop(oldest_key, None)
+    if not peers:
+        _PEER_CACHE.pop(uid, None)
+
+
+def _peer_cache_drop(uid, key):
+    """Drop a stale peer form and all aliases that point to it."""
+    peers = _PEER_CACHE.get(uid)
+    if not peers:
+        return
+    entry = peers.pop(str(key), None)
+    if entry is not None:
+        stale_form = str(entry[0])
+        for alias, candidate in list(peers.items()):
+            if str(candidate[0]) == stale_form:
+                peers.pop(alias, None)
+    if not peers:
+        _PEER_CACHE.pop(uid, None)
 
 
 def register_sweep_hook(fn):
@@ -308,6 +365,13 @@ async def _sweep_once_impl(now=None):
         if now - timestamp > _PROGRESS_TTL:
             P.pop(message_id, None)
 
+    for uid, peers in list(_PEER_CACHE.items()):
+        for key, entry in list(peers.items()):
+            if entry[1] <= now:
+                peers.pop(key, None)
+        if not peers:
+            _PEER_CACHE.pop(uid, None)
+
     for uid, timestamp in list(_Z_TS.items()):
         if uid not in Z:
             _Z_TS.pop(uid, None)
@@ -354,6 +418,7 @@ async def _sweep_once_impl(now=None):
                 except Exception as exc:
                     logger.warning("Error stopping idle client for %s: %s", uid, exc)
             _CLIENT_LAST_USED.pop(uid, None)
+            _PEER_CACHE.pop(uid, None)
 
             worker = USER_WORKERS.pop(uid, None)
             if worker is not None:
@@ -369,6 +434,7 @@ async def _sweep_once_impl(now=None):
     for uid in list(_CLIENT_LAST_USED):
         if uid not in UB and uid not in UC and not _has_active_task(uid):
             _CLIENT_LAST_USED.pop(uid, None)
+            _PEER_CACHE.pop(uid, None)
 
     for uid, lock in list(_UB_UC_LOCKS.items()):
         if (
@@ -728,24 +794,44 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
             return None
 
         try:
+            i_key = str(i)
+            if i_key.startswith('-100'):
+                chat_id_100 = i_key
+                base_id = i_key[4:]
+                chat_id_dash = f"-{base_id}"
+            elif i_key.isdigit():
+                chat_id_100 = f"-100{i_key}"
+                chat_id_dash = f"-{i_key}"
+            else:
+                chat_id_100 = i_key
+                chat_id_dash = i_key
+
+            cache_hit = _peer_cache_get(
+                uid, (i_key, chat_id_100, chat_id_dash), time.time()
+            )
+            if cache_hit:
+                cache_key, cached_form = cache_hit
+                try:
+                    result = await u.get_messages(cached_form, d)
+                    if result and not getattr(result, "empty", False):
+                        _peer_cache_put(
+                            uid, (i_key,), cached_form, time.time()
+                        )
+                        return result
+                except FloodWait:
+                    raise
+                except Exception:
+                    pass
+                _peer_cache_drop(uid, cache_key)
+
             async for _ in u.get_dialogs(limit=50):
                 pass
 
             # Try with -100 prefix first
-            if str(i).startswith('-100'):
-                chat_id_100 = i
-                base_id = str(i)[4:]
-                chat_id_dash = f"-{base_id}"
-            elif i.isdigit():
-                chat_id_100 = f"-100{i}"
-                chat_id_dash = f"-{i}"
-            else:
-                chat_id_100 = i
-                chat_id_dash = i
-
             try:
                 result = await u.get_messages(chat_id_100, d)
                 if result and not getattr(result, "empty", False):
+                    _peer_cache_put(uid, (i_key,), chat_id_100, time.time())
                     return result
             except FloodWait:
                 raise
@@ -755,6 +841,7 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
             try:
                 result = await u.get_messages(chat_id_dash, d)
                 if result and not getattr(result, "empty", False):
+                    _peer_cache_put(uid, (i_key,), chat_id_dash, time.time())
                     return result
             except FloodWait:
                 raise
@@ -766,6 +853,7 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
                     pass
                 result = await u.get_messages(i, d)
                 if result and not getattr(result, "empty", False):
+                    _peer_cache_put(uid, (i_key,), str(i), time.time())
                     return result
             except FloodWait:
                 raise
