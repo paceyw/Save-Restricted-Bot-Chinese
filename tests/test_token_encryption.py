@@ -114,8 +114,12 @@ def batch_module(monkeypatch):
     async def save_user_bot(user_id, bot_token):
         saved_tokens.append((user_id, bot_token))
 
+    async def migrate_user_bot_token(user_id, bot_token):
+        saved_tokens.append((user_id, bot_token))
+        return True
+
     func.save_user_bot = save_user_bot
-    func.migrate_user_bot_token = save_user_bot
+    func.migrate_user_bot_token = migrate_user_bot_token
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     custom_filters = types.ModuleType("utils.custom_filters")
@@ -203,10 +207,53 @@ def test_get_ubot_rejects_corrupted_ciphertext_without_migration(batch_module):
         return corrupted
 
     module.get_user_data_key = get_key
-
     assert asyncio.run(module.get_ubot(42)) is None
     assert not fake_client.instances
     assert saved_tokens == []
+
+def test_get_ubot_uses_plaintext_when_migration_errors(batch_module):
+    module, fake_client, saved_tokens = batch_module
+    module.UB.clear()
+    plaintext = "123456:token-value-abcdefghijkl"
+
+    async def get_key(uid, key, default=None):
+        return plaintext
+
+    async def migration_error(uid, token):
+        raise RuntimeError("temporary database failure")
+
+    module.get_user_data_key = get_key
+    module.migrate_user_bot_token = migration_error
+
+    bot = asyncio.run(module.get_ubot(42))
+
+    assert bot is fake_client.instances[-1]
+    assert bot.kwargs["bot_token"] == plaintext
+    assert saved_tokens == []
+
+
+def test_get_ubot_reloads_token_after_cas_conflict(batch_module):
+    module, fake_client, saved_tokens = batch_module
+    module.UB.clear()
+    token_a = "123456:token-value-abcdefghijkl"
+    token_b = "654321:new-token-value-abcdefghijkl"
+    reads = iter([token_a, ecs(token_b)])
+
+    async def get_key(uid, key, default=None):
+        return next(reads)
+
+    async def migration_conflict(uid, token):
+        return False
+
+    module.get_user_data_key = get_key
+    module.migrate_user_bot_token = migration_conflict
+
+    bot = asyncio.run(module.get_ubot(42))
+
+    assert bot is fake_client.instances[-1]
+    assert bot.kwargs["bot_token"] == token_b
+    assert saved_tokens == []
+
 
 
 @pytest.fixture

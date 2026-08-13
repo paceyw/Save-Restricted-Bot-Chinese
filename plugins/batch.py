@@ -509,36 +509,66 @@ def _client_lock(uid):
 
 
 async def get_ubot(uid):
-    stored_bt = await get_user_data_key(uid, "bot_token", None)
-    try:
-        bt = dcs(stored_bt)
-    except Exception as e:
-        candidate = stored_bt if isinstance(stored_bt, str) else None
-        if candidate and _PLAINTEXT_BOT_TOKEN_PATTERN.fullmatch(candidate):
-            bt = candidate
-            if migrate_user_bot_token is not None:
-                try:
-                    await migrate_user_bot_token(uid, candidate)
-                except Exception as migration_error:
-                    logger.error(
-                        "Error migrating plaintext bot token for user %s: %s",
-                        uid,
-                        migration_error,
-                    )
-        else:
-            if stored_bt:
-                logger.error("Invalid stored bot token for user %s: %s", uid, e)
-            bt = None
-    if isinstance(bt, str):
-        bt = bt.strip()
-    if not bt:
-        return None
-    if uid in UB:
-        return UB.get(uid)
-
     async with _client_lock(uid):
         if uid in UB:
             return UB.get(uid)
+
+        stored_bt = await get_user_data_key(uid, "bot_token", None)
+        try:
+            bt = dcs(stored_bt)
+        except Exception as e:
+            candidate = stored_bt if isinstance(stored_bt, str) else None
+            if candidate and _PLAINTEXT_BOT_TOKEN_PATTERN.fullmatch(candidate):
+                bt = candidate
+                if migrate_user_bot_token is not None:
+                    try:
+                        migrated = await migrate_user_bot_token(uid, candidate)
+                    except Exception as migration_error:
+                        logger.warning(
+                            "Error migrating plaintext bot token for user %s; "
+                            "using current plaintext token: %s",
+                            uid,
+                            migration_error,
+                        )
+                    else:
+                        if migrated is False:
+                            try:
+                                current_bt = await get_user_data_key(
+                                    uid, "bot_token", None
+                                )
+                            except Exception as current_error:
+                                logger.warning(
+                                    "Error re-reading bot token for user %s; "
+                                    "using current plaintext token: %s",
+                                    uid,
+                                    current_error,
+                                )
+                            else:
+                                if current_bt == candidate:
+                                    logger.warning(
+                                        "Bot token migration race for user %s; "
+                                        "using current plaintext token",
+                                        uid,
+                                    )
+                                else:
+                                    try:
+                                        bt = dcs(current_bt)
+                                    except Exception as current_error:
+                                        logger.error(
+                                            "Invalid current bot token for user %s: %s",
+                                            uid,
+                                            current_error,
+                                        )
+                                        return None
+            else:
+                if stored_bt:
+                    logger.error("Invalid stored bot token for user %s: %s", uid, e)
+                bt = None
+        if isinstance(bt, str):
+            bt = bt.strip()
+        if not bt:
+            return None
+
         bot = None
         try:
             bot = Client(

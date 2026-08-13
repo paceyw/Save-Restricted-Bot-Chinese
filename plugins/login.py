@@ -17,9 +17,16 @@ from utils.func import save_user_session, get_user_data, remove_user_session, sa
 from utils.encrypt import ecs, dcs
 from plugins.batch import UB, UC
 try:
-    from plugins.batch import Y
+    from plugins.batch import Y, _client_lock
 except ImportError:
     Y = None
+    _LOGIN_LOCKS = {}
+
+    def _client_lock(user_id):
+        lock = _LOGIN_LOCKS.get(user_id)
+        if lock is None:
+            lock = _LOGIN_LOCKS[user_id] = asyncio.Lock()
+        return lock
 from utils.custom_filters import login_in_progress, set_user_step, get_user_step
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -210,20 +217,21 @@ async def set_bot_token(C, m):
         return
 
     session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
-    if user_id in UB:
-        try:
-            await UB[user_id].stop()
-            print(f"Stopped old bot for user {user_id}")
-        except Exception as e:
-            print(f"Error stopping old bot for user {user_id}: {e}")
-        finally:
-            UB.pop(user_id, None)
+    async with _client_lock(user_id):
+        if user_id in UB:
+            try:
+                await UB[user_id].stop()
+                print(f"Stopped old bot for user {user_id}")
+            except Exception as e:
+                print(f"Error stopping old bot for user {user_id}: {e}")
+            finally:
+                UB.pop(user_id, None)
 
-    try:
-        if os.path.exists(session_path):
-            os.remove(session_path)
-    except Exception as e:
-        print(f"Error removing bot session for user {user_id}: {e}")
+        try:
+            if os.path.exists(session_path):
+                os.remove(session_path)
+        except Exception as e:
+            print(f"Error removing bot session for user {user_id}: {e}")
 
     await m.reply_text("✅ 机器人令牌保存成功。", quote=True)
 
@@ -231,24 +239,28 @@ async def set_bot_token(C, m):
 @bot.on_message(filters.command("rembot"))
 async def rem_bot_token(C, m):
     user_id = m.from_user.id
-    if user_id in UB:
-        try:
-            await UB[user_id].stop()
-            print(f"Stopped old bot for user {user_id}")
-        except Exception as e:
-            print(f"Error stopping old bot for user {user_id}: {e}")
-        finally:
-            UB.pop(user_id, None)
+    await remove_user_bot(user_id)
 
     session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
-    try:
-        if os.path.exists(session_path):
-            os.remove(session_path)
-    except Exception as e:
-        print(f"Error removing bot session for user {user_id}: {e}")
+    async with _client_lock(user_id):
+        if user_id in UB:
+            try:
+                await UB[user_id].stop()
+                print(f"Stopped old bot for user {user_id}")
+            except Exception as e:
+                print(f"Error stopping old bot for user {user_id}: {e}")
+            finally:
+                UB.pop(user_id, None)
 
-    await remove_user_bot(user_id)
+        try:
+            if os.path.exists(session_path):
+                os.remove(session_path)
+        except Exception as e:
+            print(f"Error removing bot session for user {user_id}: {e}")
+
     await m.reply_text("✅ 机器人令牌已成功移除。", quote=True)
+
+
 
     
 @bot.on_message(login_in_progress & filters.text & filters.private & ~filters.command([
