@@ -59,7 +59,7 @@ def func_module(monkeypatch, tmp_path):
     return module
 
 
-def test_screenshot_writes_to_downloads(func_module, tmp_path, monkeypatch):
+def test_screenshot_writes_to_downloads_and_uses_unique_names(func_module, tmp_path, monkeypatch):
     class FakeProcess:
         async def communicate(self):
             return b"", b""
@@ -71,12 +71,17 @@ def test_screenshot_writes_to_downloads(func_module, tmp_path, monkeypatch):
     monkeypatch.setattr(func_module.asyncio, "create_subprocess_exec", fake_exec)
 
     result = asyncio.run(func_module.screenshot("video.mp4", 10, "123"))
+    result2 = asyncio.run(func_module.screenshot("video.mp4", 10, "123"))
 
     downloads = (tmp_path / "downloads").resolve()
     assert downloads.is_dir()
     assert Path(result).is_absolute()
     assert Path(result).parent == downloads
     assert Path(result).is_file()
+    assert Path(result2).is_file()
+    assert result2 != result
+    assert "_123_" in Path(result).name
+    assert "_123_" in Path(result2).name
 
 
 def test_screenshot_keeps_existing_custom_thumbnail(func_module, tmp_path, monkeypatch):
@@ -114,6 +119,19 @@ def test_cleanup_stale_downloads_removes_old_files_and_keeps_fresh(func_module, 
     assert not old.exists()
     assert not old_nested.exists()
     assert fresh.exists()
+
+
+def test_cleanup_stale_downloads_skips_symlinked_directory(func_module, tmp_path):
+    target = tmp_path / "real-downloads"
+    target.mkdir()
+    old = target / "old.mp4"
+    old.touch()
+    _set_age(old, 120)
+    (tmp_path / "downloads").symlink_to(target, target_is_directory=True)
+
+    asyncio.run(func_module.cleanup_stale_downloads(max_age_min=60))
+
+    assert old.exists()
 
 
 def test_cleanup_stale_downloads_noops_when_directory_is_missing(func_module, tmp_path):
@@ -254,11 +272,15 @@ def test_cleanup_runtime_script_handles_downloads_and_user_thumbnail(tmp_path):
     fresh_media = downloads / "bar.mp4"
     old_temp = downloads / "x.temp"
     old_part = downloads / "y.part123"
+    old_album_thumb = downloads / "album_thumb_42_1700000000_0.jpg"
+    old_unknown = downloads / "orphan.bin"
     old_media.touch()
     fresh_media.touch()
     old_temp.touch()
     old_part.touch()
-    for path in (old_media, old_temp, old_part):
+    old_album_thumb.touch()
+    old_unknown.touch()
+    for path in (old_media, old_temp, old_part, old_album_thumb, old_unknown):
         _set_age(path, 300)
 
     user_thumbnail = runtime / "123456.jpg"
@@ -274,11 +296,13 @@ def test_cleanup_runtime_script_handles_downloads_and_user_thumbnail(tmp_path):
         capture_output=True,
         text=True,
     )
-
     assert result.returncode == 0
+
     assert not old_media.exists()
     assert fresh_media.exists()
     assert not old_temp.exists()
     assert not old_part.exists()
+    assert not old_album_thumb.exists()
+    assert not old_unknown.exists()
     assert user_thumbnail.exists()
     assert not old_root_screenshot.exists()

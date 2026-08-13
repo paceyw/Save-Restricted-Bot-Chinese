@@ -218,7 +218,11 @@ async def screenshot(video: str, duration: int, sender: str) -> str | None:
 
     time_stamp = hhmmss(duration // 2)
     output_file = os.path.abspath(
-        os.path.join(downloads, datetime.now().isoformat("_", "seconds") + ".jpg")
+        os.path.join(
+            downloads,
+            datetime.now().isoformat("_", "seconds")
+            + f"_{sender}_{time.time_ns()}.jpg",
+        )
     )
 
     cmd = [
@@ -248,12 +252,15 @@ async def cleanup_stale_downloads(max_age_min=60):
     from shared_client import _WORKDIR
 
     downloads = os.path.join(_WORKDIR, 'downloads')
+    if os.path.islink(downloads):
+        logger.warning("Skipping stale download cleanup for symlinked directory: %s", downloads)
+        return
     if not os.path.isdir(downloads):
         return
 
     cutoff = time.time() - (max_age_min * 60)
     removed = 0
-    for root, _, filenames in os.walk(downloads):
+    for root, _, filenames in os.walk(downloads, followlinks=False):
         for filename in filenames:
             path = os.path.join(root, filename)
             try:
