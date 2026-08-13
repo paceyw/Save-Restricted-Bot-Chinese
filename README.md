@@ -38,7 +38,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **任务队列** | 批量/合并/单条同步阻塞，FloodWait 等待期间用户完全无法操作 bot | 每用户独立后台 worker 串行执行；任务入队立即返回；`/tasks` 查看进度；`/stop` 取消当前+排队任务；FloodWait 不再阻塞交互 |
 | **速率控制** | 硬编码 `sleep(10)` 等间隔不可调 | 全部间隔通过环境变量配置（`BATCH_INTERVAL`、`MERGE_INTERVAL`、`CHANNEL_INTERVAL`、`UPLOAD_INTERVAL`、`MAX_FLOOD_RETRIES`） |
 
-### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身 / 内存有界化）
+### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身 / 内存有界化 / DB 优化）
 
 | 维度 | 改动 |
 |---|---|
@@ -46,6 +46,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **磁盘自愈** | 截图等产物统一写入 `downloads/`；上传后缩略图 finally 清理；启动时清扫 `downloads/` 超 1 小时残留；容器内每小时自动清理超 4 小时的孤儿文件（含 `.temp` 半成品、相册缩略图） |
 | **依赖瘦身** | 移除死代码 Telethon 栈与 OpenCV（视频元数据改 ffprobe 读取）；全部依赖锁定版本（Werkzeug 2.2.2→2.2.3 修复 CVE-2023-25577） |
 | **内存有界化** | 后台 sweeper（60s 周期）统一治理全部进程内缓存：任务历史完成 10 分钟后清除且每用户上限 20 条；用户 bot/session client 闲置 30 分钟自动断开驱逐（再次使用时透明重建，进行中的任务不受干扰）；消息来源标记与 linked-chat 缓存改 LRU（上限 1000）；进度状态 1 小时超时清理；登录中间态/登录锁/设置对话态均带 TTL 自动过期 |
+| **DB 优化** | 任务开始执行时对 `users` 集合一次 `find_one` 快照全部设置（caption/chat_id/替换词/删除词/重命名标签），随任务贯穿下载-处理-投递全链路，替代原每条消息 3-5 次查询（稳态每任务恰好 1 次查询）；快照只保留声明过的设置键（session 等敏感字段不入任务历史）；注意：任务开始执行后修改的设置对该任务不生效，排队中的任务按开始时快照生效；`users.user_id` 与 `premium_users.user_id` 唯一索引及会员过期 TTL 索引改为启动时一次性创建（存量重复数据导致唯一索引失败时仅告警不阻断启动） |
 
 > ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
 
@@ -187,7 +188,7 @@ docker compose up -d --build
 │   ├── func.py          # MongoDB 集合、文件处理、视频元数据
 │   ├── encrypt.py       # 会话加密（AES-GCM）
 │   └── custom_filters.py# 登录流程过滤器
-├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界）
+├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引）
 └── templates/welcome.html
 ```
 

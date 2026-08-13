@@ -111,6 +111,29 @@ def batch_module(monkeypatch):
     func.process_text_with_rules = None
     func.is_premium_user = None
     func.E = lambda value: (None, None, None, None)
+    async def get_user_settings(_uid):
+        return {}
+
+    func.get_user_settings = get_user_settings
+
+    def filter_settings(doc):
+        result = {
+            "caption": "",
+            "chat_id": None,
+            "replacement_words": {},
+            "delete_words": [],
+            "rename_tag": "",
+            "bot_token": None,
+        }
+        for key in result:
+            if doc and key in doc:
+                result[key] = doc[key]
+        return result
+
+    func.filter_settings = filter_settings
+    func.cred_epoch = lambda _uid: 0
+    func.prune_cred_epochs = lambda _active: None
+    func.apply_text_rules = lambda text, _replacements, _delete_words: text
 
     async def save_user_bot(user_id, bot_token):
         saved_tokens.append((user_id, bot_token))

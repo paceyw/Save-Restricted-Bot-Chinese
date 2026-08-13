@@ -5,6 +5,7 @@
 import asyncio
 import inspect
 from shared_client import app, start_client, userbot
+from utils.func import init_db_indexes
 import importlib
 import os
 import sys
@@ -46,6 +47,7 @@ async def stop_clients():
     await _stop_if_connected(userbot, "stop")
 
 async def main():
+    await init_db_indexes()
     await load_and_run_plugins()
     while True:
         await asyncio.sleep(1)  

@@ -10,7 +10,7 @@ from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMedia
 from pyrogram.errors import UserNotParticipant, FloodWait
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, BATCH_INTERVAL, MERGE_INTERVAL, CHANNEL_INTERVAL, UPLOAD_INTERVAL, MAX_FLOOD_RETRIES
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track, touch_file
-from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
+from utils.func import get_user_data_key, apply_text_rules, is_premium_user, E, filter_settings, cred_epoch, prune_cred_epochs
 try:
     from utils.func import migrate_user_bot_token
 except ImportError:
@@ -80,6 +80,11 @@ class _BoundedLRU(OrderedDict):
 
 Y = None if not STRING else __import__('shared_client').userbot
 Z, P, UB, UC = {}, {}, {}, {}
+# Build-epoch tags: a cached client is only served while its build epoch still
+# matches the current credential epoch (see utils.func._CRED_EPOCH). Any
+# credential mutation invalidates the entry on the next touch, even if the
+# mutation committed while its writer was suspended mid-await.
+_UB_EPOCH, _UC_EPOCH = {}, {}
 emp = _BoundedLRU(_LRU_MAXSIZE)
 _LINKED_CHAT = _BoundedLRU(_LRU_MAXSIZE)
 _CLIENT_LAST_USED = {}
@@ -211,15 +216,26 @@ async def _task_worker(uid):
             queue.task_done()
 
 async def _dispatch_task(uid, task):
-    """Route a task to its execution function based on type."""
+    """Snapshot settings when execution starts, then route the task.
+
+    This find_one is the ONLY users-collection read of the whole task. The
+    full document is forwarded as a call argument — never stored in TASKS, so
+    session_string is not retained in task history — letting client
+    establishment (get_ubot/get_uclient) reuse it instead of re-querying."""
+    # Epoch is captured BEFORE the read it validates: a rotation completing
+    # during the await then yields (old doc, old epoch) — a conservative
+    # mismatch the helpers discard for a fresh read, never stale acceptance.
+    epoch = cred_epoch(uid)
+    doc = await get_user_data(uid) or {}
+    task['settings'] = filter_settings(doc)
     if task['type'] == 'batch_links':
-        await _run_batch_links(uid, task)
+        await _run_batch_links(uid, task, doc, epoch)
     elif task['type'] == 'single':
-        await _run_single(uid, task)
+        await _run_single(uid, task, doc, epoch)
     elif task['type'] == 'merge':
-        await _run_merge(uid, task)
+        await _run_merge(uid, task, doc, epoch)
     elif task['type'] == 'batch_count':
-        await _run_batch_count(uid, task)
+        await _run_batch_count(uid, task, doc, epoch)
 
 def task_should_cancel(task_id):
     t = TASKS.get(task_id)
@@ -326,6 +342,8 @@ async def _sweep_once_impl(now=None):
                 continue
 
             clients = (UB.pop(uid, None), UC.pop(uid, None))
+            _UB_EPOCH.pop(uid, None)
+            _UC_EPOCH.pop(uid, None)
             for client in clients:
                 if client is None or client is Y:
                     continue
@@ -361,6 +379,21 @@ async def _sweep_once_impl(now=None):
         ):
             _UB_UC_LOCKS.pop(uid, None)
 
+    for uid in list(_UB_EPOCH):
+        if uid not in UB:
+            _UB_EPOCH.pop(uid, None)
+    for uid in list(_UC_EPOCH):
+        if uid not in UC:
+            _UC_EPOCH.pop(uid, None)
+
+    # Credential epochs live in utils.func; bound them to users with any live
+    # per-user state (same criteria as the lock cleanup above).
+    prune_cred_epochs(
+        set(UB) | set(UC) | set(USER_QUEUES) | set(USER_WORKERS)
+        | set(_UB_UC_LOCKS)
+        | {task.get('uid') for task in TASKS.values()}
+    )
+
     for hook in list(_SWEEP_HOOKS):
         try:
             await hook()
@@ -382,14 +415,15 @@ async def _sweeper_loop():
 # Each takes (uid, task) and runs to completion. Cancellation is checked via
 # task_should_cancel(task['id']). Progress is reported via task_update().
 
-async def _run_batch_links(uid, task):
+async def _run_batch_links(uid, task, doc, epoch):
     """Execute multi-link batch extraction."""
+    settings = task['settings']
     links = task['links']
     oc = task.get('caption')
     chat_id = task['chat_id']
     n = len(links)
-    ubot = await get_ubot(uid)
-    uc = await get_uclient(uid)
+    ubot = await get_ubot(uid, prefetched=doc, prefetched_epoch=epoch)
+    uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     success = 0
     cancelled = False
     task_update(task['id'], progress_msg=f'批量提取 {n} 条链接...')
@@ -400,7 +434,10 @@ async def _run_batch_links(uid, task):
             break
         task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
         try:
-            res = await process_one_link(ubot, uc, ci, di, lti, chat_id, uid, oc, comment_id)
+            res = await process_one_link(
+                ubot, uc, ci, di, lti, chat_id, uid, oc, comment_id,
+                settings=settings,
+            )
             if _ok(res):
                 success += 1
         except Exception as e:
@@ -412,33 +449,41 @@ async def _run_batch_links(uid, task):
     else:
         task['result'] = f'已取消。成功：{success}/{n}'
 
-async def _run_single(uid, task):
+async def _run_single(uid, task, doc, epoch):
     """Execute single-link extraction."""
+    settings = task['settings']
     ci, di, lt, comment_id = task['link_info']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = await get_ubot(uid)
-    uc = await get_uclient(uid)
+    ubot = await get_ubot(uid, prefetched=doc, prefetched_epoch=epoch)
+    uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     task_update(task['id'], progress_msg='处理中...')
     try:
-        res = await process_one_link(ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id)
+        res = await process_one_link(
+            ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id,
+            settings=settings,
+        )
         task['result'] = res
     except FloodWait as e:
         secs = _flood_secs(e)
         task_update(task['id'], progress_msg=f'Telegram 限流，等待 {int(secs)}s...')
         await asyncio.sleep(secs)
-        res = await process_one_link(ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id)
+        res = await process_one_link(
+            ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id,
+            settings=settings,
+        )
         task['result'] = res
     except Exception as e:
         task['result'] = f'❌ 错误：{str(e)[:100]}'
 
-async def _run_merge(uid, task):
+async def _run_merge(uid, task, doc, epoch):
     """Execute merge extraction and delivery."""
+    settings = task['settings']
     links = task['links']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = await get_ubot(uid)
-    uc = await get_uclient(uid)
+    ubot = await get_ubot(uid, prefetched=doc, prefetched_epoch=epoch)
+    uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     n = len(links)
 
     # Phase 1: batch-fetch comment links grouped by channel
@@ -527,24 +572,31 @@ async def _run_merge(uid, task):
         return
     task_update(task['id'], progress_msg=f'正在合并 {len(all_msgs)} 条消息...')
     try:
-        res = await process_merged(ubot, uc, all_msgs, chat_id, uid, oc)
+        res = await process_merged(
+            ubot, uc, all_msgs, chat_id, uid, oc,
+            settings=settings,
+        )
     except FloodWait as e:
         await asyncio.sleep(_flood_secs(e))
-        res = await process_merged(ubot, uc, all_msgs, chat_id, uid, oc)
+        res = await process_merged(
+            ubot, uc, all_msgs, chat_id, uid, oc,
+            settings=settings,
+        )
     except Exception as e:
         res = f'❌ 合并失败：{str(e)[:100]}'
     task['result'] = res
 
-async def _run_batch_count(uid, task):
+async def _run_batch_count(uid, task, doc, epoch):
     """Execute sequential batch extraction (start link + count)."""
+    settings = task['settings']
     ci = task['cid']
     sid = task['sid']
     lt = task['lt']
     n = task['num']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = await get_ubot(uid)
-    uc = await get_uclient(uid)
+    ubot = await get_ubot(uid, prefetched=doc, prefetched_epoch=epoch)
+    uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     success = 0
     cancelled = False
     task_update(task['id'], progress_msg=f'批量提取 {n} 条...')
@@ -558,7 +610,10 @@ async def _run_batch_count(uid, task):
         try:
             msg = await get_msg(ubot, uc, ci, mid, lt, uid)
             if msg:
-                res = await process_msg(ubot, uc, msg, chat_id, lt, uid, ci, oc)
+                res = await process_msg(
+                    ubot, uc, msg, chat_id, lt, uid, ci, oc,
+                    settings=settings,
+                )
                 if _ok(res):
                     success += 1
         except Exception as e:
@@ -741,7 +796,7 @@ def _client_lock(uid):
     return lock
 
 
-async def get_ubot(uid):
+async def get_ubot(uid, prefetched=None, prefetched_epoch=None):
     _ensure_sweeper()
 
     def finish(value, touch=True):
@@ -750,10 +805,31 @@ async def get_ubot(uid):
         return value
 
     async with _client_lock(uid):
+        now_epoch = cred_epoch(uid)
         if uid in UB:
-            return finish(UB.get(uid))
+            if _UB_EPOCH.get(uid) == now_epoch:
+                return finish(UB.get(uid))
+            # Credentials rotated after this client was built (epoch bumped):
+            # evict under the same lock, then rebuild from fresh data below.
+            stale = UB.pop(uid, None)
+            _UB_EPOCH.pop(uid, None)
+            if stale is not None:
+                try:
+                    await asyncio.wait_for(stale.stop(), timeout=10)
+                except Exception:
+                    pass
 
-        stored_bt = await get_user_data_key(uid, "bot_token", None)
+        # Dispatch-time document reuse keeps the whole task at one find_one —
+        # but only while the credential epoch still matches inside this lock.
+        # A concurrent /setbot, /rembot, login or logout bumps the epoch, and
+        # the stale prefetch is then discarded for a fresh locked read.
+        if prefetched is not None and prefetched_epoch == now_epoch:
+            stored_bt = prefetched.get("bot_token")
+            used_epoch = prefetched_epoch
+        else:
+            # Same capture-before-read rule as dispatch (conservative pairing).
+            used_epoch = now_epoch
+            stored_bt = await get_user_data_key(uid, "bot_token", None)
         try:
             bt = dcs(stored_bt)
         except Exception as e:
@@ -771,11 +847,19 @@ async def get_ubot(uid):
                             migration_error,
                         )
                     else:
+                        if migrated is not False:
+                            # Our own migration bumps the epoch — the data is
+                            # re-synchronized, not externally rotated.
+                            used_epoch = cred_epoch(uid)
                         if migrated is False:
                             try:
+                                # Capture-before-read: pairs with whatever the
+                                # re-read returns, conservatively.
+                                cas_epoch = cred_epoch(uid)
                                 current_bt = await get_user_data_key(
                                     uid, "bot_token", None
                                 )
+                                used_epoch = cas_epoch
                             except Exception as current_error:
                                 logger.warning(
                                     "Error re-reading bot token for user %s; "
@@ -819,7 +903,12 @@ async def get_ubot(uid):
                 workdir=_WORKDIR,
             )
             await bot.start()
+            if used_epoch != cred_epoch(uid):
+                # Rotation landed during the (slow) start — never cache stale.
+                await bot.stop()
+                return finish(None)
             UB[uid] = bot
+            _UB_EPOCH[uid] = used_epoch
             return finish(bot)
         except Exception as e:
             if bot is not None:
@@ -830,7 +919,7 @@ async def get_ubot(uid):
             print(f"Error starting bot for user {uid}: {e}")
             return finish(None)
 
-async def get_uclient(uid):
+async def get_uclient(uid, prefetched=None, prefetched_epoch=None):
     _ensure_sweeper()
 
     def finish(value, touch=True):
@@ -838,9 +927,27 @@ async def get_uclient(uid):
             _CLIENT_LAST_USED[uid] = time.time()
         return value
 
-    ud = await get_user_data(uid)
-    ubot = await get_ubot(uid)
-    if uid in UC:
+    # Cache hit: the build-epoch tag proves the cached client predates no
+    # credential rotation (e.g. /settings addsession bumps the epoch without
+    # stopping UC — a stale tag forces eviction and rebuild below). This is
+    # equivalent to locking mutations: post-commit lookups never serve
+    # pre-commit clients.
+    now_epoch = cred_epoch(uid)
+    if uid in UC and _UC_EPOCH.get(uid) == now_epoch:
+        return finish(UC.get(uid))
+    if prefetched is not None and prefetched_epoch == now_epoch:
+        ud = prefetched or None
+        used_epoch = prefetched_epoch
+    elif prefetched is not None:
+        # Rotation raced the dispatch read: discard the stale prefetch.
+        # Epoch captured before the read (conservative pairing, see dispatch).
+        used_epoch = cred_epoch(uid)
+        ud = await get_user_data(uid)
+    else:
+        used_epoch = cred_epoch(uid)
+        ud = await get_user_data(uid)
+    ubot = await get_ubot(uid, prefetched=prefetched, prefetched_epoch=prefetched_epoch)
+    if uid in UC and _UC_EPOCH.get(uid) == cred_epoch(uid):
         return finish(UC.get(uid))
     if not ud:
         return finish(ubot if ubot else None)
@@ -848,13 +955,36 @@ async def get_uclient(uid):
     if xxx:
         async with _client_lock(uid):
             if uid in UC:
-                return finish(UC.get(uid))
+                if _UC_EPOCH.get(uid) == cred_epoch(uid):
+                    return finish(UC.get(uid))
+                # Possibly built from pre-rotation credentials: evict, rebuild.
+                stale = UC.pop(uid, None)
+                _UC_EPOCH.pop(uid, None)
+                if stale is not None and stale is not Y:
+                    try:
+                        await asyncio.wait_for(stale.stop(), timeout=10)
+                    except Exception:
+                        pass
+            # Same epoch guard as get_ubot: a login/logout racing the task
+            # invalidates the session inside this lock; the fresh read happens
+            # only on actual rotation (rare), never steady-state.
+            if used_epoch != cred_epoch(uid):
+                used_epoch = cred_epoch(uid)
+                ud = await get_user_data(uid)
+                xxx = (ud or {}).get('session_string')
+                if not xxx:
+                    return finish(ubot if ubot else None)
             try:
                 ss = dcs(xxx)
                 gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, workdir=_WORKDIR)
                 await gg.start()
                 await upd_dlg(gg)
+                if used_epoch != cred_epoch(uid):
+                    # Rotation landed during start/upd_dlg — never cache stale.
+                    await gg.stop()
+                    return finish(ubot if ubot else None)
                 UC[uid] = gg
+                _UC_EPOCH[uid] = used_epoch
                 return finish(gg)
             except Exception as e:
                 print(f'User client error: {e}')
@@ -951,7 +1081,7 @@ async def send_direct(c, m, tcid, ft=None, rtmid=None):
         print(f'Direct send error: {error}')
         return False, error
 
-async def resolve_delivery(d):
+async def resolve_delivery(d, settings):
     """Resolve the delivery target for user chat ``d``.
 
     Priority:
@@ -961,7 +1091,7 @@ async def resolve_delivery(d):
 
     Returns (tcid, rtmid, deliver_via_bot).
     """
-    cfg_chat = await get_user_data_key(d, 'chat_id', None)
+    cfg_chat = settings.get('chat_id')
     if cfg_chat is not None:
         cfg_chat = str(cfg_chat).strip()
     tcid = d
@@ -1100,7 +1230,7 @@ async def _download_media_item(u, one, uid, idx, tag, X, did, p_id, st):
         return InputMediaAudio(f, duration=one.audio.duration), files
     return InputMediaDocument(f), files
 
-async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
+async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
     """Forward an album 1:1 — grouping, order, caption and tags preserved.
 
     Fast path: server-side copy_media_group (works for unrestricted chats).
@@ -1108,7 +1238,7 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
     media group (works for restricted content). Progress reports go to the
     user's chat with the main bot, never to the target channel.
     """
-    tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+    tcid, rtmid, deliver_via_bot = await resolve_delivery(d, settings)
     sender = c if deliver_via_bot else (u or c)
     did = int(d)
     p = await X.send_message(did, f'正在处理相册（{len(msgs)} 项）...')
@@ -1119,8 +1249,12 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
         proc_text = oc
     else:
         orig_caption = next((one.caption.markdown for one in msgs if one.caption), '')
-        proc_text = await process_text_with_rules(d, orig_caption)
-    user_cap = await get_user_data_key(d, 'caption', '')
+        proc_text = apply_text_rules(
+            orig_caption,
+            settings.get('replacement_words', {}),
+            settings.get('delete_words', []),
+        )
+    user_cap = settings.get('caption', '')
     ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
     # Fast server-side copy preserves the ORIGINAL caption — skip it whenever
@@ -1219,7 +1353,7 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
     await _safe_cleanup(X.delete_messages(did, p.id))
     return f'✅ 相册已发送（{len(media)} 项）'
 
-async def process_merged(c, u, msgs, d, uid, oc=None):
+async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
     """Merge multiple fetched messages into ONE delivery.
 
     All media (photo/video/audio/document) across every message is re-uploaded
@@ -1229,7 +1363,7 @@ async def process_merged(c, u, msgs, d, uid, oc=None):
     otherwise sent as a standalone message after the album.  When ``oc`` is
     provided it replaces the combined original text entirely.
     """
-    tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+    tcid, rtmid, deliver_via_bot = await resolve_delivery(d, settings)
     sender = c if deliver_via_bot else (u or c)
     did = int(d)
     p = await X.send_message(did, f'正在合并 {len(msgs)} 条消息...')
@@ -1249,8 +1383,12 @@ async def process_merged(c, u, msgs, d, uid, oc=None):
         proc_text = oc
     else:
         combined = '\n\n'.join(tp for tp in text_pieces if tp)
-        proc_text = await process_text_with_rules(d, combined)
-    user_cap = await get_user_data_key(d, 'caption', '')
+        proc_text = apply_text_rules(
+            combined,
+            settings.get('replacement_words', {}),
+            settings.get('delete_words', []),
+        )
+    user_cap = settings.get('caption', '')
     ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
     # No media: send the combined text as one (or chunked) message(s).
@@ -1388,12 +1526,12 @@ def _cleanup_downloaded_thumbnail(th, downloads_dir):
     except Exception:
         pass
 
-async def process_msg(c, u, m, d, lt, uid, i, oc=None):
+async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
     f = None  # downloaded temp file; the finally below guarantees cleanup
     th = None
     downloads_dir = os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
     try:
-        tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+        tcid, rtmid, deliver_via_bot = await resolve_delivery(d, settings)
         did = int(d)
 
         if m.media:
@@ -1401,8 +1539,12 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                 proc_text = oc
             else:
                 orig_text = m.caption.markdown if m.caption else ''
-                proc_text = await process_text_with_rules(d, orig_text)
-            user_cap = await get_user_data_key(d, 'caption', '')
+                proc_text = apply_text_rules(
+                    orig_text,
+                    settings.get('replacement_words', {}),
+                    settings.get('delete_words', []),
+                )
+            user_cap = settings.get('caption', '')
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
             if lt == 'public' and not emp.get((uid, i), False):
@@ -1476,7 +1618,7 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                 (m.audio and m.audio.file_name) or
                 (m.document and m.document.file_name)
             ):
-                f = await rename_file(f, d, p)
+                f = await rename_file(f, d, p, settings)
             
             fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
             th = thumbnail(d)
@@ -1614,18 +1756,26 @@ def _ok(res):
             or 'Done' in res or 'Copied' in res or 'Sent' in res)
 
 
-async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None):
+async def process_one_link(
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+):
     """Fetch and deliver one t.me link (expanding albums), with one FloodWait retry."""
     try:
-        return await _process_one_link(ubot, uc, i, s, lt, d, uid, oc, comment_id)
+        return await _process_one_link(
+            ubot, uc, i, s, lt, d, uid, oc, comment_id, settings=settings
+        )
     except FloodWait as e:
         secs = _flood_secs(e)
         print(f'FloodWait {secs}s on {i}/{s}, waiting and retrying once')
         await asyncio.sleep(secs)
-        return await _process_one_link(ubot, uc, i, s, lt, d, uid, oc, comment_id)
+        return await _process_one_link(
+            ubot, uc, i, s, lt, d, uid, oc, comment_id, settings=settings
+        )
 
 
-async def _process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None):
+async def _process_one_link(
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+):
     """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
     if not uc and lt != 'public':
         return '用户会话无效或未登录，请先使用 /login。'
@@ -1649,8 +1799,12 @@ async def _process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None
         except Exception as e:
             print(f'Media group fetch failed, falling back to single: {e}')
     if len(msgs) > 1:
-        return await process_album(ubot, uc, msgs, d, src_lt, uid, src_chat, oc)
-    return await process_msg(ubot, uc, msgs[0], d, src_lt, uid, src_chat, oc)
+        return await process_album(
+            ubot, uc, msgs, d, src_lt, uid, src_chat, oc, settings=settings
+        )
+    return await process_msg(
+        ubot, uc, msgs[0], d, src_lt, uid, src_chat, oc, settings=settings
+    )
 
 
 @X.on_message(filters.command(['batch', 'single', 'merge']))
