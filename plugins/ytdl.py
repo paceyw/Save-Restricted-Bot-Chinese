@@ -24,7 +24,7 @@ import logging
 import math
 from shared_client import app, _WORKDIR
 from pyrogram import filters
-from utils.func import get_video_metadata, screenshot
+from utils.func import get_video_metadata, screenshot, touch_file
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp 
 import aiofiles
@@ -142,7 +142,7 @@ async def process_audio(message, url, cookies_env_var=None):
                 title=title,
                 performer="Team SPY",
                 progress=progress_bar,
-                progress_args=(UPLOAD_HEADER, prog, time.time())
+                progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
             )
             if prog:
                 await prog.delete()
@@ -332,7 +332,7 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
                 supports_streaming=True,
                 thumb=THUMB if THUMB else None,
                 progress=progress_bar,
-                progress_args=(UPLOAD_HEADER, prog, time.time())
+                progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
             )
             if prog:
                 await prog.delete()
@@ -391,8 +391,11 @@ async def split_and_upload_file(app, sender, file_path, caption):
                     part_caption = f"{caption} \n\n**第 {part_number + 1} 部分：**"
                     await app.send_document(sender, document=part_file, caption=part_caption,
                         progress=progress_bar,
-                        progress_args=(UPLOAD_HEADER, edit, time.time())
+                        progress_args=(UPLOAD_HEADER, edit, time.time(), part_file)
                     )
+                    # The source file outlives every part upload; keep its mtime
+                    # fresh so the sweeper cannot delete it mid-split.
+                    touch_file(file_path)
                 finally:
                     if edit:
                         try:
@@ -438,10 +441,13 @@ async def get_seconds(time_string: str) -> int:
     
     return value * time_units.get(unit, 0)
 
-async def progress_bar(current: int, total: int, ud_type: str, message, start: float):
+async def progress_bar(current: int, total: int, ud_type: str, message, start: float, fp=None):
     """
     Updates the progress bar for an ongoing process.
     """
+    if fp:
+        # Upload heartbeat: keep source mtime fresh against the stale-file sweeper.
+        touch_file(fp)
     now = time.time()
     diff = now - start
     

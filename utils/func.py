@@ -285,6 +285,27 @@ async def cleanup_stale_downloads(max_age_min=60):
     logger.info("Removed %d stale downloads", removed)
 
 
+_touch_last = {}
+
+def touch_file(path, min_interval=5):
+    """Refresh mtime of an in-flight file (throttled per path). The stale-file
+    sweepers delete by mtime (>1h at startup, >4h hourly); a multi-hour upload
+    only reads its source, so without this heartbeat an active upload looks
+    like a corpse and can be deleted mid-send."""
+    if not path:
+        return
+    now = time.time()
+    if now - _touch_last.get(path, 0) < min_interval:
+        return
+    try:
+        os.utime(path, None)
+        _touch_last[path] = now
+    except OSError:
+        pass
+    if len(_touch_last) > 10000:
+        _touch_last.clear()
+
+
 async def ensure_audio_track(file_path):
     """Telegram treats a video without an audio track as an animation; mixed
     into SendMultiMedia that makes the whole album fail with MEDIA_EMPTY.

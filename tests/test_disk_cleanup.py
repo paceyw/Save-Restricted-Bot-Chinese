@@ -11,7 +11,7 @@ import pytest
 
 
 SRC = Path(__file__).resolve().parents[1]
-DOCKER_DIR = SRC.parent / "docker"
+DOCKER_DIR = SRC / "docker"
 
 
 @pytest.fixture
@@ -207,6 +207,7 @@ def batch_module(monkeypatch, tmp_path):
     func.thumbnail = None
     func.get_video_metadata = None
     func.ensure_audio_track = None
+    func.touch_file = lambda *_a, **_k: None
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
@@ -306,3 +307,45 @@ def test_cleanup_runtime_script_handles_downloads_and_user_thumbnail(tmp_path):
     assert not old_unknown.exists()
     assert user_thumbnail.exists()
     assert not old_root_screenshot.exists()
+
+
+def test_touch_file_refreshes_mtime_and_throttles(func_module, tmp_path):
+    target = tmp_path / "big.mp4"
+    target.write_bytes(b"x")
+    _set_age(target, 300)
+    before = os.path.getmtime(target)
+
+    func_module._touch_last.clear()
+    func_module.touch_file(str(target))
+    assert os.path.getmtime(target) > before
+
+    # Throttled: an immediate second call must not refresh again.
+    _set_age(target, 300)
+    aged = os.path.getmtime(target)
+    func_module.touch_file(str(target))
+    assert os.path.getmtime(target) == aged
+
+
+def test_touch_file_tolerates_missing_and_empty(func_module):
+    func_module._touch_last.clear()
+    func_module.touch_file(None)
+    func_module.touch_file("")
+    func_module.touch_file("/nonexistent/dir/x.mp4")
+
+
+def test_prog_heartbeat_touches_upload_source(batch_module, monkeypatch):
+    module = batch_module
+    touched = []
+    monkeypatch.setattr(module, "touch_file", touched.append)
+    module.P.clear()
+
+    class _FakeClient:
+        async def edit_message_text(self, *_args, **_kwargs):
+            return None
+
+    asyncio.run(module.prog(50, 100, _FakeClient(), 1, 999, time.time(), fp="/data/downloads/f.mp4"))
+    assert touched == ["/data/downloads/f.mp4"]
+
+    # fp=None (download path) must not touch anything.
+    asyncio.run(module.prog(50, 100, _FakeClient(), 1, 998, time.time()))
+    assert touched == ["/data/downloads/f.mp4"]

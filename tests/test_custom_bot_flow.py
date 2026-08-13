@@ -121,6 +121,7 @@ def batch_module(monkeypatch):
     func.thumbnail = None
     func.get_video_metadata = None
     func.ensure_audio_track = None
+    func.touch_file = lambda *_a, **_k: None
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None

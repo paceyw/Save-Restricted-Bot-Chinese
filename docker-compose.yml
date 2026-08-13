@@ -1,0 +1,124 @@
+name: save-restricted-content-bot-v3
+
+services:
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${DB_NAME}
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - backend
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --host 127.0.0.1
+          --username "$${MONGO_INITDB_ROOT_USERNAME}"
+          --password "$${MONGO_INITDB_ROOT_PASSWORD}"
+          --authenticationDatabase admin
+          --eval "db.adminCommand({ ping: 1 }).ok" | grep -q '^1$'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mongo-init:
+    image: mongo:8.0
+    restart: "no"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGO_HOST: mongo
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      MONGO_APP_DB: ${DB_NAME}
+    entrypoint:
+      - /bin/bash
+      - /usr/local/bin/mongo-init.sh
+    volumes:
+      - ./docker/mongo-init.sh:/usr/local/bin/mongo-init.sh:ro
+    networks:
+      - backend
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: save-restricted-content-bot-v3:local
+    restart: unless-stopped
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    user: "${BOT_UID}:${BOT_GID}"
+    working_dir: /data
+    environment:
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      BOT_TOKEN: ${BOT_TOKEN}
+      OWNER_ID: ${OWNER_ID}
+      MONGO_DB: ${MONGO_DB}
+      DB_NAME: ${DB_NAME}
+      LOG_GROUP: ${LOG_GROUP}
+      FORCE_SUB: ${FORCE_SUB}
+      STRING: ${STRING}
+      MASTER_KEY: ${MASTER_KEY}
+      IV_KEY: ${IV_KEY}
+      FREEMIUM_LIMIT: ${FREEMIUM_LIMIT}
+      PREMIUM_LIMIT: ${PREMIUM_LIMIT}
+      YT_COOKIES: ${YT_COOKIES}
+      INSTA_COOKIES: ${INSTA_COOKIES}
+      JOIN_LINK: ${JOIN_LINK}
+      ADMIN_CONTACT: ${ADMIN_CONTACT}
+      PLAN_D_S: ${PLAN_D_S}
+      PLAN_D_DU: ${PLAN_D_DU}
+      PLAN_D_U: ${PLAN_D_U}
+      PLAN_D_L: ${PLAN_D_L}
+      PLAN_W_S: ${PLAN_W_S}
+      PLAN_W_DU: ${PLAN_W_DU}
+      PLAN_W_U: ${PLAN_W_U}
+      PLAN_W_L: ${PLAN_W_L}
+      PLAN_M_S: ${PLAN_M_S}
+      PLAN_M_DU: ${PLAN_M_DU}
+      PLAN_M_U: ${PLAN_M_U}
+      PLAN_M_L: ${PLAN_M_L}
+      PORT: 5000
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /data/tmp
+    entrypoint:
+      - /bin/bash
+      - /usr/local/bin/bot-entrypoint.sh
+    volumes:
+      # runtime/ lives next to this repo (sessions, downloads, tmp) — outside
+      # version control but stable across the old/new compose locations.
+      - ../runtime:/data
+      - ./docker/bot-entrypoint.sh:/usr/local/bin/bot-entrypoint.sh:ro
+      - ./docker/cleanup-runtime.sh:/usr/local/bin/cleanup-runtime.sh:ro
+    networks:
+      - backend
+      - egress
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:5000/ >/dev/null || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  mongo_data:
+    name: save-restricted-content-bot-v3_mongo_data
+
+networks:
+  backend:
+    name: save-restricted-content-bot-v3_backend
+    internal: true
+  egress:
+    name: save-restricted-content-bot-v3_egress

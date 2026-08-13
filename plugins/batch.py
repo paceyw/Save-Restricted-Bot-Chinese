@@ -8,7 +8,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant, FloodWait
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, BATCH_INTERVAL, MERGE_INTERVAL, CHANNEL_INTERVAL, UPLOAD_INTERVAL, MAX_FLOOD_RETRIES
-from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track
+from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track, touch_file
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
 try:
     from utils.func import migrate_user_bot_token
@@ -613,8 +613,12 @@ async def get_uclient(uid):
                 return None
     return Y
 
-async def prog(c, t, C, h, m, st):
+async def prog(c, t, C, h, m, st, fp=None):
     global P
+    if fp:
+        # Upload-only heartbeat: keep the source file's mtime fresh so the
+        # hourly stale-downloads sweep never deletes it mid-upload.
+        touch_file(fp)
     p = c / t * 100
     interval = 10 if t >= 100 * 1024 * 1024 else 20 if t >= 50 * 1024 * 1024 else 30 if t >= 10 * 1024 * 1024 else 50
     step = int(p // interval) * interval
@@ -733,6 +737,7 @@ async def resolve_delivery(d):
 
 async def _send_album_item(sender, tcid, im, rtmid):
     """Send one InputMedia item individually (fallback when SendMultiMedia rejects the group)."""
+    touch_file(getattr(im, 'media', None))
     cap = getattr(im, 'caption', None)
     if isinstance(im, InputMediaPhoto):
         return await sender.send_photo(tcid, im.media, caption=cap, reply_to_message_id=rtmid)
@@ -904,6 +909,10 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
         media[0].caption = ft
 
     await X.edit_message_text(did, p.id, f'正在上传相册（{len(media)} 项）...')
+    # send_media_group has no progress hook: refresh mtimes once at upload start
+    # so a long group upload is not mistaken for stale corpses by the sweeper.
+    for ff in files:
+        touch_file(ff)
     upload_error = None
     try:
         await sender.send_media_group(tcid, media, reply_to_message_id=rtmid)
@@ -1061,6 +1070,10 @@ async def process_merged(c, u, msgs, d, uid, oc=None):
     sent_items = 0
     for start in range(0, len(media), 10):
         chunk = media[start:start + 10]
+        # No progress hook on send_media_group — refresh mtimes per chunk so
+        # slow chunked uploads stay above the stale-sweep watermark.
+        for im in chunk:
+            touch_file(getattr(im, 'media', None))
         try:
             await sender.send_media_group(tcid, chunk, reply_to_message_id=rtmid)
             sent_items += len(chunk)
@@ -1237,11 +1250,11 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                                         height=h if mtype == 'video' else None,
                                         width=w if mtype == 'video' else None,
                                         caption=ft if m.caption and mtype not in ['video_note', 'voice'] else None, 
-                                        reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st))
+                                        reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st, f))
                         break
                 else:
                     sent = await Y.send_document(LOG_GROUP, f, thumb=th, caption=ft if m.caption else None,
-                                                reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st))
+                                                reply_to_message_id=rtmid, progress=prog, progress_args=(X, did, p.id, st, f))
                 
                 await sender.copy_message(tcid, LOG_GROUP, sent.id)
                 os.remove(f)
@@ -1262,31 +1275,31 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                     th = await screenshot(f, dur, d)
                     await sender.send_video(tcid, video=f, caption=ft if m.caption else None, 
                                     thumb=th, width=w, height=h, duration=dur, 
-                                    progress=prog, progress_args=(X, did, p.id, st), 
+                                    progress=prog, progress_args=(X, did, p.id, st, f), 
                                     reply_to_message_id=rtmid)
                 elif m.video_note:
                     await sender.send_video_note(tcid, video_note=f, progress=prog, 
-                                        progress_args=(X, did, p.id, st), reply_to_message_id=rtmid)
+                                        progress_args=(X, did, p.id, st, f), reply_to_message_id=rtmid)
                 elif m.voice:
-                    await sender.send_voice(tcid, f, progress=prog, progress_args=(X, did, p.id, st), 
+                    await sender.send_voice(tcid, f, progress=prog, progress_args=(X, did, p.id, st, f), 
                                     reply_to_message_id=rtmid)
                 elif m.sticker:
                     await sender.send_sticker(tcid, f, reply_to_message_id=rtmid)
                 elif m.audio or (m.document and file_ext in audio_extensions):
                     await sender.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(X, did, p.id, st), 
+                                    thumb=th, progress=prog, progress_args=(X, did, p.id, st, f), 
                                     reply_to_message_id=rtmid)
                 elif m.photo:
                     await sender.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
-                                    progress=prog, progress_args=(X, did, p.id, st), 
+                                    progress=prog, progress_args=(X, did, p.id, st, f), 
                                     reply_to_message_id=rtmid)
                 elif m.document:
                     await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(X, did, p.id, st), 
+                                        progress=prog, progress_args=(X, did, p.id, st, f), 
                                         reply_to_message_id=rtmid)
                 else:
                     await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(X, did, p.id, st), 
+                                        progress=prog, progress_args=(X, did, p.id, st, f), 
                                         reply_to_message_id=rtmid)
             except Exception as e:
                 err = str(e)
