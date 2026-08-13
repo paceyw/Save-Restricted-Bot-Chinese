@@ -38,6 +38,16 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **任务队列** | 批量/合并/单条同步阻塞，FloodWait 等待期间用户完全无法操作 bot | 每用户独立后台 worker 串行执行；任务入队立即返回；`/tasks` 查看进度；`/stop` 取消当前+排队任务；FloodWait 不再阻塞交互 |
 | **速率控制** | 硬编码 `sleep(10)` 等间隔不可调 | 全部间隔通过环境变量配置（`BATCH_INTERVAL`、`MERGE_INTERVAL`、`CHANNEL_INTERVAL`、`UPLOAD_INTERVAL`、`MAX_FLOOD_RETRIES`） |
 
+### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身）
+
+| 维度 | 改动 |
+|---|---|
+| **加密加固** | 会话/token 加密改为每条记录随机 salt 的 AES-GCM（`b64(salt+nonce+tag+ct)`），旧格式自动兼容解密；用户自定义 bot token 由明文改为加密落库，读取时自动迁移；篡改/损坏的密文拒绝启动且不清库 |
+| **磁盘自愈** | 截图等产物统一写入 `downloads/`；上传后缩略图 finally 清理；启动时清扫 `downloads/` 超 1 小时残留；容器内每小时自动清理超 4 小时的孤儿文件（含 `.temp` 半成品、相册缩略图） |
+| **依赖瘦身** | 移除死代码 Telethon 栈与 OpenCV（视频元数据改 ffprobe 读取）；全部依赖锁定版本（Werkzeug 2.2.2→2.2.3 修复 CVE-2023-25577） |
+
+> ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
+
 ### 支付/会员入口调整
 
 本 Fork 将所有支付与会员开通入口（`/start`、`/pay`、`/plan`、`/myplan` 非会员分支）统一改为提示：
