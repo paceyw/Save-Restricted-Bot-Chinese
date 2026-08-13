@@ -28,3 +28,5 @@ async def start_client():
         except Exception as e:
             print(f"Hey honey!! check your premium string session, it may be invalid of expire {e}")
             sys.exit(1)
+    from utils.func import cleanup_stale_downloads
+    await cleanup_stale_downloads()
