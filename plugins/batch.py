@@ -404,7 +404,12 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
                     continue
 
                 if xm and not getattr(xm, 'empty', False):
+                    # emp is looked up downstream by numeric chat id
+                    # (msg.chat.id) — record both keys: for public links
+                    # ``i`` is the username, which would never match.
                     emp[(uid, i)] = not fetched_by_bot
+                    if getattr(xm, 'chat', None):
+                        emp[(uid, xm.chat.id)] = not fetched_by_bot
                     print(f'Fetched public message with {label} client')
                     return xm
 
@@ -415,6 +420,7 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
                     xm = await u.get_messages(chat.id, d)
                     if xm and not getattr(xm, 'empty', False):
                         emp[(uid, i)] = True
+                        emp[(uid, chat.id)] = True
                         return xm
                 except FloodWait:
                     raise
@@ -1078,7 +1084,10 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                         '发送失败：目标聊天不可用。请在 /settings 设置正确的 '
                         '-100... 聊天 ID，并将 /setbot 机器人加入该频道且设为管理员。'
                     )
-                return f'发送失败：{error[:80] if error else "未知错误"}'
+                # Stale or cross-client file references (MEDIA_EMPTY) are
+                # recoverable: fall through to download + re-upload instead
+                # of failing the task.
+                print(f'Direct send failed ({error}), falling back to re-upload')
             
             # Sender selection: a custom bot CANNOT message a user who never
             # started it (PEER_ID_INVALID on resolve_peer). When delivering to
@@ -1120,7 +1129,11 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
             # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
             # client workdir. Pass an absolute path under the writable volume.
             download_path = os.path.join(_WORKDIR, 'downloads', c_name)
-            f = await u.download_media(m, file_name=download_path, progress=prog, progress_args=(X, did, p.id, st))
+            # Download with the client that fetched the message: emp False on a
+            # public link means the bot fetched it (user client may be absent
+            # or not a member); otherwise the user client holds access.
+            dl_client = (c or u) if (lt == 'public' and not emp.get((uid, i), False)) else (u or c)
+            f = await dl_client.download_media(m, file_name=download_path, progress=prog, progress_args=(X, did, p.id, st))
             
             if not f:
                 await X.edit_message_text(did, p.id, '失败。')
