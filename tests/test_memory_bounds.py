@@ -114,10 +114,12 @@ def batch_module(monkeypatch):
     func.thumbnail = None
     func.get_video_metadata = None
     func.ensure_audio_track = None
+    func.VIDEO_EXTENSIONS = set()
+    func.AUDIO_EXTENSIONS = set()
     func.touch_file = lambda *_a, **_k: None
     func.process_text_with_rules = None
     func.is_premium_user = None
-    func.E = lambda value: (None, None, None, None)
+    func.parse_link = lambda value: (None, None, None, None)
     async def get_user_settings(_uid):
         return {}
 
@@ -176,12 +178,64 @@ def batch_module(monkeypatch):
     start.subscribe = subscribe
     monkeypatch.setitem(sys.modules, "plugins.start", start)
 
-    module_name = "memory_bounds_batch"
-    spec = importlib.util.spec_from_file_location(module_name, SRC / "plugins" / "batch.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module, FakeClient, func
+    for name in ("plugins.fetch", "plugins.tasks", "plugins.deliver", "plugins.batch"):
+        sys.modules.pop(name, None)
+    import importlib
+    fetch_module = importlib.import_module("plugins.fetch")
+    tasks_module = importlib.import_module("plugins.tasks")
+    deliver_module = importlib.import_module("plugins.deliver")
+    batch_module = importlib.import_module("plugins.batch")
+    for worker in list(tasks_module.USER_WORKERS.values()):
+        worker.cancel()
+    fetch_module.user_bots.clear()
+    fetch_module.user_clients.clear()
+    fetch_module.fetch_origin.clear()
+    fetch_module._CLIENT_LAST_USED.clear()
+    fetch_module._PEER_CACHE.clear()
+    fetch_module._LINKED_CHAT.clear()
+    fetch_module._UB_EPOCH.clear()
+    fetch_module._UC_EPOCH.clear()
+    fetch_module._UB_UC_LOCKS.clear()
+    deliver_module.progress_state.clear()
+    batch_module.pending_flows.clear()
+    batch_module._Z_TS.clear()
+    tasks_module.TASKS.clear()
+    tasks_module.USER_QUEUES.clear()
+    tasks_module.USER_WORKERS.clear()
+
+    class ModuleBundle:
+        def __init__(self):
+            object.__setattr__(self, "_modules", (
+                fetch_module, tasks_module, deliver_module, batch_module
+            ))
+
+        def _owner(self, name):
+            for candidate in self._modules:
+                if hasattr(candidate, name):
+                    return candidate
+            return deliver_module
+
+        def __getattr__(self, name):
+            return getattr(self._owner(name), name)
+
+        def __setattr__(self, name, value):
+            if name == "_modules":
+                object.__setattr__(self, name, value)
+                return
+            shared = {
+                "get_user_data", "get_user_data_key", "get_ubot", "get_uclient",
+                "get_msg", "resolve_linked_chat", "cred_epoch", "process_msg",
+                "process_merged", "process_album", "process_one_link",
+                "_ok", "_flood_secs",
+            }
+            if name in shared:
+                for candidate in self._modules:
+                    if hasattr(candidate, name):
+                        setattr(candidate, name, value)
+                return
+            setattr(self._owner(name), name, value)
+
+    return ModuleBundle(), FakeClient, func
 
 @pytest.fixture
 def login_module(monkeypatch):
@@ -245,12 +299,24 @@ def login_module(monkeypatch):
     encrypt.dcs = lambda value: value
     monkeypatch.setitem(sys.modules, "utils.encrypt", encrypt)
 
-    batch = types.ModuleType("plugins.batch")
-    batch.UB = {}
-    batch.UC = {}
-    batch._hooks = []
-    batch.register_sweep_hook = batch._hooks.append
-    monkeypatch.setitem(sys.modules, "plugins.batch", batch)
+    fetch = types.ModuleType("plugins.fetch")
+    fetch.user_bots = {}
+    fetch.user_clients = {}
+    fetch.premium_userbot = None
+    fetch._LOGIN_LOCKS = {}
+
+    def _client_lock(user_id):
+        lock = fetch._LOGIN_LOCKS.get(user_id)
+        if lock is None:
+            lock = fetch._LOGIN_LOCKS[user_id] = asyncio.Lock()
+        return lock
+
+    fetch._client_lock = _client_lock
+    monkeypatch.setitem(sys.modules, "plugins.fetch", fetch)
+    tasks = types.ModuleType("plugins.tasks")
+    tasks._ensure_sweeper = lambda: None
+    tasks.register_sweep_hook = lambda _hook: None
+    monkeypatch.setitem(sys.modules, "plugins.tasks", tasks)
 
     steps = {}
     custom_filters = types.ModuleType("utils.custom_filters")
@@ -264,17 +330,12 @@ def login_module(monkeypatch):
 
     custom_filters.set_user_step = set_user_step
     custom_filters.get_user_step = lambda user_id: steps.get(user_id)
-    monkeypatch.setitem(sys.modules, "utils.custom_filters", custom_filters)
-    module_name = "memory_bounds_login"
-
-    custom_filters.set_user_step = set_user_step
-    custom_filters.get_user_step = lambda user_id: steps.get(user_id)
     custom_filters.user_steps = steps
-    spec = importlib.util.spec_from_file_location(module_name, SRC / "plugins" / "login.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module, steps, batch, FakeClient
+    monkeypatch.setitem(sys.modules, "utils.custom_filters", custom_filters)
+    import importlib
+    sys.modules.pop("plugins.login", None)
+    module = importlib.import_module("plugins.login")
+    return module, steps, fetch, FakeClient
 
 
 class _StoppedClient:
@@ -291,8 +352,8 @@ def _seed_idle_clients(module, count, now):
         bot = _StoppedClient()
         user_client = _StoppedClient()
         clients.extend((bot, user_client))
-        module.UB[uid] = bot
-        module.UC[uid] = user_client
+        module.user_bots[uid] = bot
+        module.user_clients[uid] = user_client
         module._CLIENT_LAST_USED[uid] = now - 1900
     return clients
 
@@ -304,8 +365,8 @@ def test_sweep_evicts_idle_clients_and_stops_all(batch_module):
 
     asyncio.run(module._sweep_once(now=now))
 
-    assert not module.UB
-    assert not module.UC
+    assert not module.user_bots
+    assert not module.user_clients
     assert not module._CLIENT_LAST_USED
     assert all(client.stop_calls == 1 for client in clients)
 
@@ -314,7 +375,7 @@ def test_evicted_bot_is_rebuilt_on_next_get(batch_module):
     module, fake_client, func = batch_module
     uid = 7
     old = _StoppedClient()
-    module.UB[uid] = old
+    module.user_bots[uid] = old
     now = time.time()
     module._CLIENT_LAST_USED[uid] = now - 1900
 
@@ -326,7 +387,7 @@ def test_evicted_bot_is_rebuilt_on_next_get(batch_module):
     module.get_user_data_key = token
     rebuilt = asyncio.run(module.get_ubot(uid))
     assert rebuilt is not old
-    assert module.UB[uid] is rebuilt
+    assert module.user_bots[uid] is rebuilt
     assert old.stop_calls == 1
     assert fake_client.instances[-1].started
 
@@ -334,22 +395,22 @@ def test_evicted_bot_is_rebuilt_on_next_get(batch_module):
 def test_running_task_prevents_client_eviction(batch_module):
     module, _, _ = batch_module
     uid = 11
-    module.UB[uid] = _StoppedClient()
-    module.UC[uid] = _StoppedClient()
+    module.user_bots[uid] = _StoppedClient()
+    module.user_clients[uid] = _StoppedClient()
     now = time.time()
     module._CLIENT_LAST_USED[uid] = now - 1900
     module.TASKS["running"] = {"uid": uid, "status": "running", "finished_at": None}
 
     asyncio.run(module._sweep_once(now=now))
 
-    assert uid in module.UB and uid in module.UC
+    assert uid in module.user_bots and uid in module.user_clients
 
 
 def test_queued_task_prevents_client_eviction(batch_module):
     module, _, _ = batch_module
     uid = 12
-    module.UB[uid] = _StoppedClient()
-    module.UC[uid] = _StoppedClient()
+    module.user_bots[uid] = _StoppedClient()
+    module.user_clients[uid] = _StoppedClient()
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
     queue = asyncio.Queue()
     queue.put_nowait(object())
@@ -357,13 +418,13 @@ def test_queued_task_prevents_client_eviction(batch_module):
 
     asyncio.run(module._sweep_once(now=time.time()))
 
-    assert uid in module.UB and uid in module.UC
+    assert uid in module.user_bots and uid in module.user_clients
 
 
 def test_eviction_cancels_worker_and_removes_queue(batch_module):
     module, _, _ = batch_module
     uid = 13
-    module.UB[uid] = _StoppedClient()
+    module.user_bots[uid] = _StoppedClient()
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
 
     async def scenario():
@@ -414,26 +475,26 @@ def test_create_task_caps_completed_history_per_user(batch_module):
 def test_bounded_lru_evicts_oldest_and_refreshes_hits(batch_module):
     module, _, _ = batch_module
     for index in range(1000):
-        module.emp[index] = index
-    assert module.emp[0] == 0
-    module.emp[1000] = 1000
+        module.fetch_origin[index] = index
+    assert module.fetch_origin[0] == 0
+    module.fetch_origin[1000] = 1000
 
-    assert len(module.emp) == 1000
-    assert 1 not in module.emp
-    assert 0 in module.emp
-    assert module.emp.get(0) == 0
+    assert len(module.fetch_origin) == 1000
+    assert 1 not in module.fetch_origin
+    assert 0 in module.fetch_origin
+    assert module.fetch_origin.get(0) == 0
 
 
 def test_progress_sweep_expires_old_tuple_only(batch_module):
     module, _, _ = batch_module
     now = time.time()
-    module.P["old"] = (20, now - 3601)
-    module.P["fresh"] = (40, now - 3599)
+    module.progress_state["old"] = (20, now - 3601)
+    module.progress_state["fresh"] = (40, now - 3599)
 
     asyncio.run(module._sweep_once(now=now))
 
-    assert "old" not in module.P
-    assert module.P["fresh"] == (40, now - 3599)
+    assert "old" not in module.progress_state
+    assert module.progress_state["fresh"] == (40, now - 3599)
 
 
 def test_login_sweep_cleans_expired_cache_and_skips_locked(login_module):
@@ -465,8 +526,8 @@ def test_cached_client_access_touches_last_used(batch_module):
     module._ensure_sweeper = lambda: None
     bot = object()
     user_client = object()
-    module.UB[1] = bot
-    module.UC[2] = user_client
+    module.user_bots[1] = bot
+    module.user_clients[2] = user_client
     module._UB_EPOCH[1] = 0  # build-epoch tags match fixture cred_epoch == 0
     module._UC_EPOCH[2] = 0
     module._CLIENT_LAST_USED[1] = 0
@@ -485,7 +546,7 @@ def test_cached_client_access_touches_last_used(batch_module):
 def test_enqueue_and_sweep_race_keeps_queue_consistent(batch_module):
     module, _, _ = batch_module
     uid = 21
-    module.UB[uid] = _StoppedClient()
+    module.user_bots[uid] = _StoppedClient()
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
 
     async def parked_worker(user_id):
@@ -515,8 +576,8 @@ def test_get_uclient_rebuilds_bot_after_eviction(batch_module):
     uid = 22
     old_bot = _StoppedClient()
     old_user_client = _StoppedClient()
-    module.UB[uid] = old_bot
-    module.UC[uid] = old_user_client
+    module.user_bots[uid] = old_bot
+    module.user_clients[uid] = old_user_client
     now = time.time()
     module._CLIENT_LAST_USED[uid] = now - 1900
 
@@ -531,9 +592,9 @@ def test_get_uclient_rebuilds_bot_after_eviction(batch_module):
     asyncio.run(module._sweep_once(now=now))
     rebuilt = asyncio.run(module.get_uclient(uid))
 
-    assert rebuilt is module.UC[uid]
-    assert module.UB[uid] is not old_bot
-    assert module.UC[uid] is not old_user_client
+    assert rebuilt is module.user_clients[uid]
+    assert module.user_bots[uid] is not old_bot
+    assert module.user_clients[uid] is not old_user_client
 
 
 def test_orphan_client_timestamp_is_removed(batch_module):
@@ -559,12 +620,12 @@ def test_orphan_client_lock_is_removed(batch_module):
 def test_pending_flow_ttl_removes_stale_z_entry(batch_module):
     module, _, _ = batch_module
     now = time.time()
-    module.Z[25] = {"step": "start"}
+    module.pending_flows[25] = {"step": "start"}
     module._Z_TS[25] = now - module._Z_IDLE_TTL - 1
 
     asyncio.run(module._sweep_once(now=now))
 
-    assert 25 not in module.Z
+    assert 25 not in module.pending_flows
     assert 25 not in module._Z_TS
 
 
@@ -578,7 +639,7 @@ def test_client_stop_timeout_does_not_block_sweep(batch_module, monkeypatch):
             started.set()
             await asyncio.sleep(3600)
 
-    module.UB[uid] = HungClient()
+    module.user_bots[uid] = HungClient()
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
     original_wait_for = module.asyncio.wait_for
 
@@ -592,7 +653,7 @@ def test_client_stop_timeout_does_not_block_sweep(batch_module, monkeypatch):
         return started.is_set()
 
     assert asyncio.run(scenario())
-    assert uid not in module.UB
+    assert uid not in module.user_bots
 
 
 def test_login_sweep_cleans_stale_user_step(login_module):
@@ -610,17 +671,17 @@ def test_login_sweep_cleans_stale_user_step(login_module):
 def test_login_sweep_cleans_fallback_client_lock(login_module):
     module, _, _, _ = login_module
     uid = 32
-    module._LOGIN_LOCKS[uid] = asyncio.Lock()
+    module.login_locks[uid] = asyncio.Lock()
 
     asyncio.run(module._sweep_login_state())
 
-    assert uid not in module._LOGIN_LOCKS
+    assert uid not in module.login_locks
 
 
 def test_queued_status_also_prevents_client_eviction(batch_module):
     module, _, _ = batch_module
     uid = 40
-    module.UB[uid] = _StoppedClient()
+    module.user_bots[uid] = _StoppedClient()
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
     module.TASKS["queued-active"] = {
         "uid": uid,
@@ -630,7 +691,7 @@ def test_queued_status_also_prevents_client_eviction(batch_module):
 
     asyncio.run(module._sweep_once(now=time.time()))
 
-    assert uid in module.UB
+    assert uid in module.user_bots
 
 
 def test_sweep_prunes_completed_history_to_cap(batch_module):
@@ -710,7 +771,7 @@ def test_concurrent_sweeps_stop_client_once(batch_module):
             await asyncio.sleep(0)
 
     client = Client()
-    module.UB[uid] = client
+    module.user_bots[uid] = client
     module._CLIENT_LAST_USED[uid] = time.time() - 1900
 
     async def scenario():

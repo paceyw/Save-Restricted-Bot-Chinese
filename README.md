@@ -38,7 +38,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **任务队列** | 批量/合并/单条同步阻塞，FloodWait 等待期间用户完全无法操作 bot | 每用户独立后台 worker 串行执行；任务入队立即返回；`/tasks` 查看进度；`/stop` 取消当前+排队任务；FloodWait 不再阻塞交互 |
 | **速率控制** | 硬编码 `sleep(10)` 等间隔不可调 | 全部间隔通过环境变量配置（`BATCH_INTERVAL`、`MERGE_INTERVAL`、`CHANNEL_INTERVAL`、`UPLOAD_INTERVAL`、`MAX_FLOOD_RETRIES`） |
 
-### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身 / 内存有界化 / DB 优化 / 消息获取优化）
+### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身 / 内存有界化 / DB 优化 / 消息获取优化 / batch.py 拆分）
 
 | 维度 | 改动 |
 |---|---|
@@ -48,6 +48,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **内存有界化** | 后台 sweeper（60s 周期）统一治理全部进程内缓存：任务历史完成 10 分钟后清除且每用户上限 20 条；用户 bot/session client 闲置 30 分钟自动断开驱逐（再次使用时透明重建，进行中的任务不受干扰）；消息来源标记与 linked-chat 缓存改 LRU（上限 1000）；进度状态 1 小时超时清理；登录中间态/登录锁/设置对话态均带 TTL 自动过期 |
 | **DB 优化** | 任务开始执行时对 `users` 集合一次 `find_one` 快照全部设置（caption/chat_id/替换词/删除词/重命名标签），随任务贯穿下载-处理-投递全链路，替代原每条消息 3-5 次查询（稳态每任务恰好 1 次查询）；快照只保留声明过的设置键（session 等敏感字段不入任务历史）；注意：任务开始执行后修改的设置对该任务不生效，排队中的任务按开始时快照生效；`users.user_id` 与 `premium_users.user_id` 唯一索引及会员过期 TTL 索引改为启动时一次性创建（存量重复数据导致唯一索引失败时仅告警不阻断启动） |
 | **消息获取优化** | 私聊抓取新增 per-user peer 缓存（输入 chat key → 可访问的 chat_id 形式，TTL 24 小时、每用户上限 500 条）：缓存命中时跳过原每条消息一次的 `get_dialogs` 全量遍历直接取消息（同一私聊批量 10 条 `get_dialogs` 调用 ≤1 次）；缓存失效/过期自动降级原预热兜底链，行为与旧版完全一致；随 sweeper 在 client 驱逐时联动清理 |
+| **代码结构拆分** | 原 2130 行上帝文件 `batch.py` 拆分为 `plugins/fetch.py`（client 缓存/消息获取/peer 缓存）、`plugins/tasks.py`（任务队列/后台 sweeper）、`plugins/deliver.py`（媒体下载与投递）+ 命令层 `batch.py`（297 行）；全局单字母变量改语义名（`UB→user_bots`、`UC→user_clients`、`emp→fetch_origin`、`P→progress_state`、`Z→pending_flows`、`E→parse_link` 等）；相册/合并的逐条发送降级逻辑合一、手写 FloodWait 重试统一收敛到 `with_flood_retry`、视频/音频扩展名列表统一收敛到 `utils.func`；纯移动零功能变更 |
 
 > ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
 
@@ -179,7 +180,10 @@ docker compose up -d --build
 ├── plugins/
 │   ├── start.py         # /start /help /plan /terms /set 菜单
 │   ├── login.py         # 用户登录、会话保存、自定义 Bot 管理
-│   ├── batch.py         # 批量/单条消息提取与上传
+│   ├── batch.py         # /batch /single /merge /cancel /tasks 命令层
+│   ├── fetch.py         # 用户 client 缓存、消息获取、peer/linked-chat 缓存
+│   ├── tasks.py         # 任务队列（TASKS/worker/dispatch）+ 后台状态 sweeper
+│   ├── deliver.py       # 媒体下载、相册/合并投递、FloodWait 重试
 │   ├── ytdl.py          # yt-dlp 音视频下载（Pyrogram 上传）
 │   ├── settings.py      # 用户个性化设置（重命名/标题/缩略图/会话）
 │   ├── premium.py       # /add 会员管理、/start 处理

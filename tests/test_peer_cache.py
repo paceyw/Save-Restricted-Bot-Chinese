@@ -11,8 +11,8 @@ from tests.test_custom_bot_flow import batch_module
 def peer_batch_module(batch_module):
     module, _ = batch_module
     module._PEER_CACHE.clear()
-    module.UB.clear()
-    module.UC.clear()
+    module.user_bots.clear()
+    module.user_clients.clear()
     module._CLIENT_LAST_USED.clear()
     return module
 
@@ -121,7 +121,7 @@ def test_sweeper_evicts_peer_cache_with_client_and_expires_entries(peer_batch_mo
             self.stop_calls += 1
 
     client = Client()
-    module.UB[evicted_uid] = client
+    module.user_bots[evicted_uid] = client
     module._CLIENT_LAST_USED[evicted_uid] = now - module._CLIENT_IDLE_TTL - 1
     module._PEER_CACHE[evicted_uid] = {"123": ("-100123", now + 100)}
     module._PEER_CACHE[expired_uid] = {"456": ("-100456", now - 1)}

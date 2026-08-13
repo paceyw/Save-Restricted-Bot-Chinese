@@ -15,23 +15,8 @@ from config import API_HASH, API_ID
 from shared_client import app as bot, _WORKDIR
 from utils.func import save_user_session, get_user_data, remove_user_session, save_user_bot, remove_user_bot
 from utils.encrypt import ecs, dcs
-from plugins.batch import UB, UC
-try:
-    from plugins.batch import Y, _client_lock
-except ImportError:
-    Y = None
-    _LOGIN_LOCKS = {}
-
-    def _client_lock(user_id):
-        lock = _LOGIN_LOCKS.get(user_id)
-        if lock is None:
-            lock = _LOGIN_LOCKS[user_id] = asyncio.Lock()
-        return lock
-try:
-    from plugins.batch import _ensure_sweeper
-except Exception:
-    def _ensure_sweeper():
-        return None
+from plugins.fetch import user_bots, user_clients, premium_userbot, _client_lock
+from plugins.tasks import _ensure_sweeper
 from utils.custom_filters import login_in_progress, set_user_step, get_user_step
 try:
     from utils.custom_filters import user_steps
@@ -96,8 +81,8 @@ async def _clear_login_state(user_id, temp_client=None):
 
 
 async def _stop_cached_user_client_locked(user_id):
-    old_client = UC.pop(user_id, None)
-    if old_client is not None and old_client is not Y:
+    old_client = user_clients.pop(user_id, None)
+    if old_client is not None and old_client is not premium_userbot:
         try:
             await old_client.stop()
         except Exception as e:
@@ -313,14 +298,14 @@ async def set_bot_token(C, m):
 
     session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
     async with _client_lock(user_id):
-        if user_id in UB:
+        if user_id in user_bots:
             try:
-                await UB[user_id].stop()
+                await user_bots[user_id].stop()
                 print(f"Stopped old bot for user {user_id}")
             except Exception as e:
                 print(f"Error stopping old bot for user {user_id}: {e}")
             finally:
-                UB.pop(user_id, None)
+                user_bots.pop(user_id, None)
 
         try:
             if os.path.exists(session_path):
@@ -338,14 +323,14 @@ async def rem_bot_token(C, m):
 
     session_path = os.path.join(_WORKDIR, f"user_{user_id}.session")
     async with _client_lock(user_id):
-        if user_id in UB:
+        if user_id in user_bots:
             try:
-                await UB[user_id].stop()
+                await user_bots[user_id].stop()
                 print(f"Stopped old bot for user {user_id}")
             except Exception as e:
                 print(f"Error stopping old bot for user {user_id}: {e}")
             finally:
-                UB.pop(user_id, None)
+                user_bots.pop(user_id, None)
 
         try:
             if os.path.exists(session_path):
@@ -655,7 +640,7 @@ async def logout_command(client, message):
             pass
 
 try:
-    from plugins.batch import register_sweep_hook
+    from plugins.tasks import register_sweep_hook
     register_sweep_hook(_sweep_login_state)
 except Exception:
     pass

@@ -207,11 +207,13 @@ def batch_module(monkeypatch, tmp_path):
     func.thumbnail = None
     func.get_video_metadata = None
     func.ensure_audio_track = None
+    func.VIDEO_EXTENSIONS = set()
+    func.AUDIO_EXTENSIONS = set()
     func.touch_file = lambda *_a, **_k: None
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
-    func.E = None
+    func.parse_link = None
     async def get_user_settings(_uid):
         return {}
 
@@ -264,12 +266,15 @@ def batch_module(monkeypatch, tmp_path):
     start.subscribe = subscribe
     monkeypatch.setitem(sys.modules, "plugins.start", start)
 
-    module_name = "phase1_disk_batch"
-    spec = importlib.util.spec_from_file_location(module_name, SRC / "plugins" / "batch.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module
+    for name in ("plugins.fetch", "plugins.tasks", "plugins.deliver", "plugins.batch"):
+        sys.modules.pop(name, None)
+    import importlib
+    importlib.import_module("plugins.fetch")
+    importlib.import_module("plugins.tasks")
+    deliver_module = importlib.import_module("plugins.deliver")
+    importlib.import_module("plugins.batch")
+    deliver_module.progress_state.clear()
+    return deliver_module
 
 
 def test_process_msg_thumbnail_cleanup_preserves_user_thumbnail(batch_module, tmp_path):
@@ -360,7 +365,7 @@ def test_prog_heartbeat_touches_upload_source(batch_module, monkeypatch):
     module = batch_module
     touched = []
     monkeypatch.setattr(module, "touch_file", touched.append)
-    module.P.clear()
+    module.progress_state.clear()
 
     class _FakeClient:
         async def edit_message_text(self, *_args, **_kwargs):
