@@ -4,10 +4,12 @@
 
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton as IK, InlineKeyboardMarkup as IKM
+import asyncio
 import re
 import os
 import string
 import random
+import time
 from shared_client import app, _WORKDIR
 from utils.func import get_user_data_key, save_user_data
 try:
@@ -24,6 +26,8 @@ SET_PIC = 'settings.jpg'
 MESS = '自定义文件设置...'
 
 active_conversations = {}
+_ACTIVE_CONVERSATION_TTL = 900
+_SETTINGS_LOCKS = {}
 def active_conversation_filter(_, __, message):
     return (
         message.from_user is not None
@@ -31,6 +35,18 @@ def active_conversation_filter(_, __, message):
     )
 
 active_conversation = filters.create(active_conversation_filter)
+
+
+def _ensure_settings_sweeper():
+    """Start the shared sweeper without importing batch during module load."""
+    try:
+        from plugins.batch import _ensure_sweeper
+    except Exception:
+        return
+    try:
+        _ensure_sweeper()
+    except Exception:
+        pass
 
 
 
@@ -52,6 +68,7 @@ def settings_menu():
 
 @app.on_message(filters.command("settings"))
 async def settings_command(client, message):
+    _ensure_settings_sweeper()
     user_id = message.from_user.id
     await app.send_message(message.chat.id, MESS, reply_markup=settings_menu())
 
@@ -109,8 +126,6 @@ __👉 **注意：** 如果您使用自定义机器人，您的机器人必须�
         await _do_remthumb(user_id, query)
 
     await query.answer()
-
-
 async def _stop_cached_user_client(user_id):
     try:
         from plugins.batch import UC, Y
@@ -121,12 +136,22 @@ async def _stop_cached_user_client(user_id):
             return
         Y = None
 
-    old_client = UC.pop(user_id, None)
-    if old_client is not None and old_client is not Y:
-        try:
-            await old_client.stop()
-        except Exception:
-            pass
+    try:
+        from plugins.batch import _client_lock
+    except ImportError:
+        def _client_lock(uid):
+            lock = _SETTINGS_LOCKS.get(uid)
+            if lock is None:
+                lock = _SETTINGS_LOCKS[uid] = asyncio.Lock()
+            return lock
+
+    async with _client_lock(user_id):
+        old_client = UC.pop(user_id, None)
+        if old_client is not None and old_client is not Y:
+            try:
+                await old_client.stop()
+            except Exception:
+                pass
 
 
 async def _do_logout(user_id, query):
@@ -172,11 +197,16 @@ async def _do_remthumb(user_id, query):
 
 
 async def start_conversation(query, user_id, conv_type, prompt_message):
+    _ensure_settings_sweeper()
     if user_id in active_conversations:
         await query.message.reply_text('上一次对话已取消，开始新的对话。')
 
     msg = await query.message.reply_text(f'{prompt_message}\n\n（发送 /cancel 取消此操作）')
-    active_conversations[user_id] = {'type': conv_type, 'message_id': msg.id}
+    active_conversations[user_id] = {
+        'type': conv_type,
+        'message_id': msg.id,
+        'ts': time.time(),
+    }
 
 
 @app.on_message(filters.command("cancel") & filters.private)
@@ -199,6 +229,7 @@ async def handle_conversation_input(client, message):
     if message.text and message.text.startswith('/'):
         return
 
+    active_conversations[user_id]['ts'] = time.time()
     conv_type = active_conversations[user_id]['type']
 
     handlers = {
@@ -335,17 +366,23 @@ async def rename_file(file, sender, edit):
         else:
             original_file_name = str(file)
             file_extension = 'mp4'
-        
+
         for word in delete_words:
             original_file_name = original_file_name.replace(word, '')
-        
         for word, replace_word in replacements.items():
             original_file_name = original_file_name.replace(word, replace_word)
-        
         new_file_name = f'{original_file_name} {custom_rename_tag}.{file_extension}'
-        
         os.rename(file, new_file_name)
         return new_file_name
     except Exception as e:
         print(f"Rename error: {e}")
         return file
+
+async def _sweep_active_conversations():
+    now = time.time()
+    for user_id, state in list(active_conversations.items()):
+        if now - state.get('ts', now) > _ACTIVE_CONVERSATION_TTL:
+            active_conversations.pop(user_id, None)
+
+
+

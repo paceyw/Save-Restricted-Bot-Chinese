@@ -4,6 +4,7 @@
 
 import os, re, time, asyncio, json, asyncio 
 import logging
+from collections import OrderedDict
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant, FloodWait
@@ -23,9 +24,87 @@ from typing import Dict, Any, Optional
 logger = logging.getLogger(__name__)
 _PLAINTEXT_BOT_TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 
+_TASK_RESULT_TTL = 600
+_MAX_TASKS_PER_USER = 20
+_CLIENT_IDLE_TTL = 1800
+_SWEEP_INTERVAL = 60
+_LRU_MAXSIZE = 1000
+_PROGRESS_TTL = 3600
+_Z_IDLE_TTL = 1800
+
+
+class _BoundedLRU(OrderedDict):
+    """Ordered mapping with a hard upper bound and access-order refresh."""
+
+    def __init__(self, maxsize):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def update(self, *args, **kwargs):
+        if len(args) > 1:
+            raise TypeError(f'update expected at most 1 argument, got {len(args)}')
+        if args:
+            other = args[0]
+            if hasattr(other, 'keys'):
+                for key in other:
+                    self[key] = other[key]
+            else:
+                for key, value in other:
+                    self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
 
 Y = None if not STRING else __import__('shared_client').userbot
-Z, P, UB, UC, emp, _LINKED_CHAT = {}, {}, {}, {}, {}, {}
+Z, P, UB, UC = {}, {}, {}, {}
+emp = _BoundedLRU(_LRU_MAXSIZE)
+_LINKED_CHAT = _BoundedLRU(_LRU_MAXSIZE)
+_CLIENT_LAST_USED = {}
+_Z_TS = {}
+_SWEEPER_TASK = None
+_SWEEP_LOCK = None
+_SWEEP_HOOKS = []
+
+
+def register_sweep_hook(fn):
+    """Register an async callback invoked by the periodic state sweeper."""
+    if fn not in _SWEEP_HOOKS:
+        _SWEEP_HOOKS.append(fn)
+
+
+def _ensure_sweeper():
+    global _SWEEPER_TASK
+    if _SWEEPER_TASK is not None and not _SWEEPER_TASK.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _SWEEPER_TASK = loop.create_task(_sweeper_loop())
+
 
 # ─── Task queue system ─────────────────────────────────────────────────────────
 # Per-user serial task queue: multiple tasks queue up, each runs in a
@@ -41,6 +120,34 @@ _MAX_QUEUE = 3        # max queued tasks per user
 # fixed directory file_name problems
 def sanitize(filename):
     return re.sub(r'[<>:"/\\|?*\']', '_', filename).strip(" .")[:255]
+
+
+def _prune_task_history(uid):
+    user_tasks = [
+        (task_id, candidate) for task_id, candidate in TASKS.items()
+        if candidate.get('uid') == uid
+    ]
+    excess = len(user_tasks) - _MAX_TASKS_PER_USER
+    if excess <= 0:
+        return
+    completed = sorted(
+        (
+            (task_id, candidate) for task_id, candidate in user_tasks
+            if candidate.get('status') in ('done', 'failed', 'cancelled')
+        ),
+        key=lambda item: item[1].get('created_at', 0),
+    )
+    for task_id, _ in completed[:excess]:
+        TASKS.pop(task_id, None)
+
+
+def _has_active_task(uid):
+    return any(
+        task.get('uid') == uid and task.get('status') in ('queued', 'running')
+        for task in TASKS.values()
+    )
+
+
 
 def create_task(uid, task_type, total, **params):
     """Create a task descriptor and register it in TASKS."""
@@ -63,14 +170,23 @@ def create_task(uid, task_type, total, **params):
     }
     task.update(params)
     TASKS[tid] = task
+    _prune_task_history(uid)
     return task
 
 async def enqueue_task(uid, task):
     """Enqueue a task for a user, starting the worker if needed."""
-    if uid not in USER_QUEUES:
-        USER_QUEUES[uid] = asyncio.Queue()
-        USER_WORKERS[uid] = asyncio.create_task(_task_worker(uid))
-    await USER_QUEUES[uid].put(task)
+    _ensure_sweeper()
+    async with _client_lock(uid):
+        queue = USER_QUEUES.get(uid)
+        if queue is not None and queue.qsize() >= _MAX_QUEUE:
+            TASKS.pop(task.get('id'), None)
+            return False
+        if queue is None:
+            queue = USER_QUEUES[uid] = asyncio.Queue()
+            USER_WORKERS[uid] = asyncio.create_task(_task_worker(uid))
+        await queue.put(task)
+        return True
+
 
 async def _task_worker(uid):
     """Per-user persistent worker: processes tasks serially."""
@@ -91,6 +207,7 @@ async def _task_worker(uid):
             print(f'Task {task["id"]} failed: {e}')
         finally:
             task['finished_at'] = time.time()
+            _prune_task_history(uid)
             queue.task_done()
 
 async def _dispatch_task(uid, task):
@@ -145,6 +262,122 @@ def has_running_task(uid):
 
 
 
+
+async def _sweep_once(now=None):
+    global _SWEEP_LOCK
+    if _SWEEP_LOCK is None:
+        _SWEEP_LOCK = asyncio.Lock()
+    async with _SWEEP_LOCK:
+        await _sweep_once_impl(now)
+
+
+async def _sweep_once_impl(now=None):
+    """Run one bounded-state cleanup pass."""
+    if now is None:
+        now = time.time()
+
+    for task_id, task in list(TASKS.items()):
+        finished_at = task.get('finished_at')
+        if finished_at is not None and now - finished_at > _TASK_RESULT_TTL:
+            TASKS.pop(task_id, None)
+    for uid in {task.get('uid') for task in TASKS.values()}:
+        if uid is not None:
+            _prune_task_history(uid)
+
+    for message_id, state in list(P.items()):
+        try:
+            timestamp = state[1]
+        except (IndexError, TypeError):
+            continue
+        if now - timestamp > _PROGRESS_TTL:
+            P.pop(message_id, None)
+
+    for uid, timestamp in list(_Z_TS.items()):
+        if uid not in Z:
+            _Z_TS.pop(uid, None)
+        elif now - timestamp > _Z_IDLE_TTL:
+            Z.pop(uid, None)
+            _Z_TS.pop(uid, None)
+    for uid in Z:
+        _Z_TS.setdefault(uid, now)
+
+    for uid in set(UB) | set(UC) | set(USER_QUEUES) | set(USER_WORKERS):
+        has_clients = uid in UB or uid in UC
+        if has_clients:
+            last_used = _CLIENT_LAST_USED.get(uid)
+            if last_used is None:
+                _CLIENT_LAST_USED[uid] = now
+                continue
+            if now - last_used <= _CLIENT_IDLE_TTL:
+                continue
+        if _has_active_task(uid) or get_queue_size(uid) > 0:
+            continue
+
+        async with _client_lock(uid):
+            has_clients = uid in UB or uid in UC
+            if has_clients:
+                last_used = _CLIENT_LAST_USED.get(uid)
+                if last_used is None:
+                    _CLIENT_LAST_USED[uid] = now
+                    continue
+                if now - last_used <= _CLIENT_IDLE_TTL:
+                    continue
+            if _has_active_task(uid) or get_queue_size(uid) > 0:
+                continue
+
+            clients = (UB.pop(uid, None), UC.pop(uid, None))
+            for client in clients:
+                if client is None or client is Y:
+                    continue
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning("Timed out stopping idle client for %s", uid)
+                except Exception as exc:
+                    logger.warning("Error stopping idle client for %s: %s", uid, exc)
+            _CLIENT_LAST_USED.pop(uid, None)
+
+            worker = USER_WORKERS.pop(uid, None)
+            if worker is not None:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning("Error stopping idle worker for %s: %s", uid, exc)
+            USER_QUEUES.pop(uid, None)
+
+    for uid in list(_CLIENT_LAST_USED):
+        if uid not in UB and uid not in UC and not _has_active_task(uid):
+            _CLIENT_LAST_USED.pop(uid, None)
+
+    for uid, lock in list(_UB_UC_LOCKS.items()):
+        if (
+            uid not in UB
+            and uid not in UC
+            and not lock.locked()
+            and not _has_active_task(uid)
+        ):
+            _UB_UC_LOCKS.pop(uid, None)
+
+    for hook in list(_SWEEP_HOOKS):
+        try:
+            await hook()
+        except Exception as exc:
+            logger.warning("Sweep hook failed: %s", exc)
+
+
+async def _sweeper_loop():
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL)
+        try:
+            await _sweep_once()
+        except Exception as exc:
+            logger.warning("State sweep failed: %s", exc)
+
+
+
 # ─── Task execution functions ───────────────────────────────────────────────────
 # Each takes (uid, task) and runs to completion. Cancellation is checked via
 # task_should_cancel(task['id']). Progress is reported via task_update().
@@ -155,7 +388,7 @@ async def _run_batch_links(uid, task):
     oc = task.get('caption')
     chat_id = task['chat_id']
     n = len(links)
-    ubot = UB.get(uid)
+    ubot = await get_ubot(uid)
     uc = await get_uclient(uid)
     success = 0
     cancelled = False
@@ -184,7 +417,7 @@ async def _run_single(uid, task):
     ci, di, lt, comment_id = task['link_info']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = UB.get(uid)
+    ubot = await get_ubot(uid)
     uc = await get_uclient(uid)
     task_update(task['id'], progress_msg='处理中...')
     try:
@@ -204,7 +437,7 @@ async def _run_merge(uid, task):
     links = task['links']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = UB.get(uid)
+    ubot = await get_ubot(uid)
     uc = await get_uclient(uid)
     n = len(links)
 
@@ -310,7 +543,7 @@ async def _run_batch_count(uid, task):
     n = task['num']
     oc = task.get('caption')
     chat_id = task['chat_id']
-    ubot = UB.get(uid)
+    ubot = await get_ubot(uid)
     uc = await get_uclient(uid)
     success = 0
     cancelled = False
@@ -509,9 +742,16 @@ def _client_lock(uid):
 
 
 async def get_ubot(uid):
+    _ensure_sweeper()
+
+    def finish(value, touch=True):
+        if touch and value is not None:
+            _CLIENT_LAST_USED[uid] = time.time()
+        return value
+
     async with _client_lock(uid):
         if uid in UB:
-            return UB.get(uid)
+            return finish(UB.get(uid))
 
         stored_bt = await get_user_data_key(uid, "bot_token", None)
         try:
@@ -559,7 +799,7 @@ async def get_ubot(uid):
                                             uid,
                                             current_error,
                                         )
-                                        return None
+                                        return finish(None)
             else:
                 if stored_bt:
                     logger.error("Invalid stored bot token for user %s: %s", uid, e)
@@ -567,7 +807,7 @@ async def get_ubot(uid):
         if isinstance(bt, str):
             bt = bt.strip()
         if not bt:
-            return None
+            return finish(None)
 
         bot = None
         try:
@@ -580,7 +820,7 @@ async def get_ubot(uid):
             )
             await bot.start()
             UB[uid] = bot
-            return bot
+            return finish(bot)
         except Exception as e:
             if bot is not None:
                 try:
@@ -588,30 +828,38 @@ async def get_ubot(uid):
                 except Exception:
                     pass
             print(f"Error starting bot for user {uid}: {e}")
-            return None
+            return finish(None)
 
 async def get_uclient(uid):
+    _ensure_sweeper()
+
+    def finish(value, touch=True):
+        if touch and value is not None:
+            _CLIENT_LAST_USED[uid] = time.time()
+        return value
+
     ud = await get_user_data(uid)
-    ubot = UB.get(uid)
-    cl = UC.get(uid)
-    if cl: return cl
-    if not ud: return ubot if ubot else None
+    ubot = await get_ubot(uid)
+    if uid in UC:
+        return finish(UC.get(uid))
+    if not ud:
+        return finish(ubot if ubot else None)
     xxx = ud.get('session_string')
     if xxx:
         async with _client_lock(uid):
             if uid in UC:
-                return UC.get(uid)
+                return finish(UC.get(uid))
             try:
                 ss = dcs(xxx)
                 gg = Client(f'{uid}_client', api_id=API_ID, api_hash=API_HASH, device_model="v3saver", session_string=ss, workdir=_WORKDIR)
                 await gg.start()
                 await upd_dlg(gg)
                 UC[uid] = gg
-                return gg
+                return finish(gg)
             except Exception as e:
                 print(f'User client error: {e}')
-                return None
-    return Y
+                return finish(None)
+    return finish(Y, touch=False)
 
 async def prog(c, t, C, h, m, st, fp=None):
     global P
@@ -622,8 +870,10 @@ async def prog(c, t, C, h, m, st, fp=None):
     p = c / t * 100
     interval = 10 if t >= 100 * 1024 * 1024 else 20 if t >= 50 * 1024 * 1024 else 30 if t >= 10 * 1024 * 1024 else 50
     step = int(p // interval) * interval
-    if m not in P or P[m] != step or p >= 100:
-        P[m] = step
+    previous = P.get(m)
+    previous_step = previous[0] if isinstance(previous, tuple) else previous
+    if m not in P or previous_step != step or p >= 100:
+        P[m] = (step, time.time())
         c_mb = c / (1024 * 1024)
         t_mb = t / (1024 * 1024)
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
@@ -631,6 +881,7 @@ async def prog(c, t, C, h, m, st, fp=None):
         eta = time.strftime('%M:%S', time.gmtime((t - c) / (speed * 1024 * 1024))) if speed > 0 else '00:00'
         await C.edit_message_text(h, m, f"__**Pyro 处理器...**__\n\n{bar}\n\n⚡**__已完成__**：{c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__完成度__**：{p:.2f}%\n🚀 **__速度__**：{speed:.2f} MB/s\n⏳ **__预计剩余时间__**：{eta}\n\n**__由 Team SPY 提供支持__**")
         if p >= 100: P.pop(m, None)
+
 
 async def send_direct(c, m, tcid, ft=None, rtmid=None):
     try:
@@ -1439,6 +1690,7 @@ async def process_cmd(c, m):
     # be swallowed into the caption.
     oc = ' '.join(m.command[1:]).strip() or None
     Z[uid] = {'step': {'batch': 'start', 'single': 'start_single', 'merge': 'start_merge'}[cmd], 'oc': oc}
+    _Z_TS[uid] = time.time()
     oc_note = f'\n📝 自定义说明（替换原文字）：{oc}' if oc else ''
     if cmd == 'batch':
         await pro.edit(f'发送起始链接（连续下载指定数量），或多条链接（每行一条，逐个下载）。{oc_note}')
@@ -1494,6 +1746,7 @@ async def tasks_cmd(c, m):
 async def text_handler(c, m):
     uid = m.from_user.id
     if uid not in Z: return
+    _Z_TS[uid] = time.time()
     s = Z[uid].get('step')
     oc = Z[uid].get('oc')
     x = await get_ubot(uid)
@@ -1532,13 +1785,16 @@ async def text_handler(c, m):
             await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
             Z.pop(uid, None)
             return
-        ubot = UB.get(uid)
+        ubot = await get_ubot(uid)
         if not ubot:
             await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
         task = create_task(uid, 'batch_links', n, links=links, caption=oc, chat_id=str(m.chat.id))
-        await enqueue_task(uid, task)
+        if not await enqueue_task(uid, task):
+            await m.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            Z.pop(uid, None)
+            return
         qpos = get_queue_size(uid)
         await m.reply_text(f'📦 批量提取任务已加入队列（{n} 条链接）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
         Z.pop(uid, None)
@@ -1550,13 +1806,16 @@ async def text_handler(c, m):
             await m.reply_text('链接格式无效。')
             Z.pop(uid, None)
             return
-        ubot = UB.get(uid)
+        ubot = await get_ubot(uid)
         if not ubot:
             await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
         task = create_task(uid, 'single', 1, link_info=(i, d, lt, comment_id), caption=oc, chat_id=str(m.chat.id))
-        await enqueue_task(uid, task)
+        if not await enqueue_task(uid, task):
+            await m.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            Z.pop(uid, None)
+            return
         qpos = get_queue_size(uid)
         await m.reply_text(f'📦 单条提取任务已加入队列。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
         Z.pop(uid, None)
@@ -1575,13 +1834,16 @@ async def text_handler(c, m):
             await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
             Z.pop(uid, None)
             return
-        ubot = UB.get(uid)
+        ubot = await get_ubot(uid)
         if not ubot:
             await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
         task = create_task(uid, 'merge', n, links=links, caption=oc, chat_id=str(m.chat.id))
-        await enqueue_task(uid, task)
+        if not await enqueue_task(uid, task):
+            await m.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            Z.pop(uid, None)
+            return
         qpos = get_queue_size(uid)
         await m.reply_text(f'📦 合并任务已加入队列（{n} 条链接）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
         Z.pop(uid, None)
@@ -1602,16 +1864,25 @@ async def text_handler(c, m):
         cid = Z[uid]['cid']
         sid = Z[uid]['sid']
         lt = Z[uid]['lt']
-        ubot = UB.get(uid)
+        ubot = await get_ubot(uid)
         if not ubot:
             await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
         task = create_task(uid, 'batch_count', count, cid=cid, sid=sid, lt=lt, num=count, caption=oc, chat_id=str(m.chat.id))
-        await enqueue_task(uid, task)
+        if not await enqueue_task(uid, task):
+            await m.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            Z.pop(uid, None)
+            return
         qpos = get_queue_size(uid)
         await m.reply_text(f'📦 批量提取任务已加入队列（{count} 条）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
         Z.pop(uid, None)
 
 
 
+
+try:
+    from plugins.settings import _sweep_active_conversations
+    register_sweep_hook(_sweep_active_conversations)
+except Exception:
+    pass
