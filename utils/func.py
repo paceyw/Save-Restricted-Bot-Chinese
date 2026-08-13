@@ -2,11 +2,10 @@
 # Licensed under the GNU General Public License v3.0.  
 # See LICENSE file in the repository root for full license text.
 
-import concurrent.futures
 import time
 import os
 import re
-import cv2
+import json
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -274,38 +273,31 @@ async def ensure_audio_track(file_path):
 
 async def get_video_metadata(file_path):
     default_values = {'width': 1, 'height': 1, 'duration': 1}
-    loop = asyncio.get_event_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    
     try:
-        def _extract_metadata():
-            try:
-                vcap = cv2.VideoCapture(file_path)
-                if not vcap.isOpened():
-                    return default_values
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-show_entries", "format=duration",
+            "-of", "json", file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"ffprobe exited with {process.returncode}: {detail}")
 
-                width = round(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = round(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = vcap.get(cv2.CAP_PROP_FPS)
-                frame_count = vcap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-                if fps <= 0:
-                    return default_values
-
-                duration = round(frame_count / fps)
-                if duration <= 0:
-                    return default_values
-
-                vcap.release()
-                return {'width': width, 'height': height, 'duration': duration}
-            except Exception as e:
-                logger.error(f"Error in video_metadata: {e}")
-                return default_values
-        
-        return await loop.run_in_executor(executor, _extract_metadata)
-        
+        output = stdout.decode() if isinstance(stdout, bytes) else stdout
+        metadata = json.loads(output)
+        stream = metadata["streams"][0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        duration = int(round(float(metadata["format"]["duration"])))
+        if duration <= 0:
+            raise ValueError("video duration must be positive")
+        return {'width': width, 'height': height, 'duration': duration}
     except Exception as e:
-        logger.error(f"Error in get_video_metadata: {e}")
+        logger.error(f"Error in video_metadata for {file_path}: {e}")
         return default_values
 
 

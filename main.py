@@ -4,7 +4,7 @@
 
 import asyncio
 import inspect
-from shared_client import app, client, start_client, userbot
+from shared_client import app, start_client, userbot
 import importlib
 import os
 import sys
@@ -44,7 +44,6 @@ async def _stop_if_connected(instance, method_name):
 async def stop_clients():
     await _stop_if_connected(app, "stop")
     await _stop_if_connected(userbot, "stop")
-    await _stop_if_connected(client, "disconnect")
 
 async def main():
     await load_and_run_plugins()
