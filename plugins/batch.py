@@ -9,6 +9,10 @@ from pyrogram.errors import UserNotParticipant, FloodWait
 from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, BATCH_INTERVAL, MERGE_INTERVAL, CHANNEL_INTERVAL, UPLOAD_INTERVAL, MAX_FLOOD_RETRIES
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
+try:
+    from utils.func import save_user_bot
+except ImportError:
+    save_user_bot = None
 from shared_client import app as X, _WORKDIR
 from plugins.settings import rename_file
 from plugins.start import subscribe as sub
@@ -503,6 +507,11 @@ def _client_lock(uid):
 
 async def get_ubot(uid):
     bt = await get_user_data_key(uid, "bot_token", None)
+    try:
+        bt = dcs(bt)
+    except Exception:
+        if save_user_bot is not None and bt is not None:
+            await save_user_bot(uid, bt)
     if isinstance(bt, str):
         bt = bt.strip()
     if not bt:

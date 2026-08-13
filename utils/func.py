@@ -12,6 +12,7 @@ import asyncio
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import MONGO_DB as MONGO_URI, DB_NAME
+from utils.encrypt import ecs
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,10 +157,11 @@ async def remove_user_session(user_id):
 
 async def save_user_bot(user_id, bot_token):
     try:
+        encrypted_bot_token = ecs(bot_token)
         await users_collection.update_one(
             {"user_id": user_id},
             {"$set": {
-                "bot_token": bot_token,
+                "bot_token": encrypted_bot_token,
                 "updated_at": datetime.now()
             }},
             upsert=True
