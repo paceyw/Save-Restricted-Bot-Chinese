@@ -48,6 +48,8 @@ async def set(_, message):
         BotCommand("start", "🚀 启动机器人"),
         BotCommand("batch", "🫠 批量提取"),
         BotCommand("single", "🔖 单条提取"),
+        BotCommand("merge", "🧩 合并多条链接为一条消息/相册"),
+        BotCommand("tasks", "📋 查看任务队列状态和进度"),
         BotCommand("login", "🔑 登录机器人"),
         BotCommand("setbot", "🧸 添加处理文件的机器人"),
         BotCommand("rembot", "🤨 移除您的自定义机器人"),
