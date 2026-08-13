@@ -45,17 +45,26 @@ def hhmmss(seconds):
 
 
 def E(L):
+    """Parse a t.me link into (chat_id, msg_id, link_type, comment_id).
+
+    comment_id is non-None when the URL contains ?comment=N — that points to a
+    reply in the channel's discussion group, NOT the channel post itself.
+    Callers resolve it via the linked discussion chat at fetch time.
+    """
     if not isinstance(L, str):
-        return None, None, None
+        return None, None, None, None
     private_match = re.match(r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/c/(\d+)/(?:\d+/)?(\d+)', L)
     public_match = re.match(r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([^/]+)/(?:\d+/)?(\d+)', L)
-    
+
+    comment_match = re.search(r'[?&]comment=(\d+)', L)
+    comment_id = int(comment_match.group(1)) if comment_match else None
+
     if private_match:
-        return f'-100{private_match.group(1)}', int(private_match.group(2)), 'private'
+        return f'-100{private_match.group(1)}', int(private_match.group(2)), 'private', comment_id
     elif public_match:
-        return public_match.group(1), int(public_match.group(2)), 'public'
-    
-    return None, None, None
+        return public_match.group(1), int(public_match.group(2)), 'public', comment_id
+
+    return None, None, None, None
 
 
 def get_display_name(user):

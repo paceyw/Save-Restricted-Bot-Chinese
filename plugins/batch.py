@@ -6,7 +6,7 @@ import os, re, time, asyncio, json, asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant, FloodWait
-from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT
+from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, BATCH_INTERVAL, MERGE_INTERVAL, CHANNEL_INTERVAL, UPLOAD_INTERVAL, MAX_FLOOD_RETRIES
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
 from shared_client import app as X, _WORKDIR
@@ -18,73 +18,317 @@ from typing import Dict, Any, Optional
 
 
 Y = None if not STRING else __import__('shared_client').userbot
-Z, P, UB, UC, emp = {}, {}, {}, {}, {}
+Z, P, UB, UC, emp, _LINKED_CHAT = {}, {}, {}, {}, {}, {}
 
-ACTIVE_USERS = {}
-ACTIVE_USERS_FILE = "active_users.json"
+# ─── Task queue system ─────────────────────────────────────────────────────────
+# Per-user serial task queue: multiple tasks queue up, each runs in a
+# background worker. Users can /tasks to check status, /stop to cancel.
+# FloodWait inside a task no longer blocks the user's ability to interact.
 
-# fixed directory file_name problems 
+TASKS = {}            # task_id -> task dict
+_TASK_SEQ = 0         # monotonic counter for unique task IDs
+USER_QUEUES = {}      # uid -> asyncio.Queue
+USER_WORKERS = {}     # uid -> asyncio.Task (persistent worker coroutine)
+_MAX_QUEUE = 3        # max queued tasks per user
+
+# fixed directory file_name problems
 def sanitize(filename):
     return re.sub(r'[<>:"/\\|?*\']', '_', filename).strip(" .")[:255]
 
-def load_active_users():
-    # Runtime batch state is meaningless across restarts: the worker
-    # coroutines no longer exist, so restoring it would lock users out of
-    # /batch forever with no way to clear it. Drop the stale file instead.
-    try:
-        if os.path.exists(ACTIVE_USERS_FILE):
-            os.remove(ACTIVE_USERS_FILE)
-    except Exception:
-        pass
-    return {}
+def create_task(uid, task_type, total, **params):
+    """Create a task descriptor and register it in TASKS."""
+    global _TASK_SEQ
+    _TASK_SEQ += 1
+    tid = f'task_{uid}_{int(time.time())}_{_TASK_SEQ}'
+    task = {
+        'id': tid,
+        'uid': uid,
+        'type': task_type,         # 'batch_links' | 'single' | 'merge' | 'batch_count'
+        'status': 'queued',        # 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+        'total': total,
+        'current': 0,
+        'success': 0,
+        'cancel_requested': False,
+        'created_at': time.time(),
+        'finished_at': None,
+        'result': '',
+        'progress_msg': '',
+    }
+    task.update(params)
+    TASKS[tid] = task
+    return task
 
-async def save_active_users_to_file():
+async def enqueue_task(uid, task):
+    """Enqueue a task for a user, starting the worker if needed."""
+    if uid not in USER_QUEUES:
+        USER_QUEUES[uid] = asyncio.Queue()
+        USER_WORKERS[uid] = asyncio.create_task(_task_worker(uid))
+    await USER_QUEUES[uid].put(task)
+
+async def _task_worker(uid):
+    """Per-user persistent worker: processes tasks serially."""
+    queue = USER_QUEUES[uid]
+    while True:
+        task = await queue.get()
+        task['status'] = 'running'
+        try:
+            await _dispatch_task(uid, task)
+            if task['status'] == 'running':
+                task['status'] = 'done'
+        except asyncio.CancelledError:
+            task['status'] = 'cancelled'
+            raise
+        except Exception as e:
+            task['status'] = 'failed'
+            task['result'] = f'❌ 任务失败：{str(e)[:100]}'
+            print(f'Task {task["id"]} failed: {e}')
+        finally:
+            task['finished_at'] = time.time()
+            queue.task_done()
+
+async def _dispatch_task(uid, task):
+    """Route a task to its execution function based on type."""
+    if task['type'] == 'batch_links':
+        await _run_batch_links(uid, task)
+    elif task['type'] == 'single':
+        await _run_single(uid, task)
+    elif task['type'] == 'merge':
+        await _run_merge(uid, task)
+    elif task['type'] == 'batch_count':
+        await _run_batch_count(uid, task)
+
+def task_should_cancel(task_id):
+    t = TASKS.get(task_id)
+    return t is not None and t.get('cancel_requested', False)
+
+def task_update(task_id, current=None, success=None, progress_msg=None):
+    t = TASKS.get(task_id)
+    if t is None:
+        return
+    if current is not None:
+        t['current'] = current
+    if success is not None:
+        t['success'] = success
+    if progress_msg is not None:
+        t['progress_msg'] = progress_msg
+
+def request_cancel_tasks(uid):
+    """Cancel all queued/running tasks for a user. Returns count."""
+    count = 0
+    for t in TASKS.values():
+        if t['uid'] == uid and t['status'] in ('queued', 'running'):
+            t['cancel_requested'] = True
+            count += 1
+    return count
+
+def get_user_tasks(uid):
+    """Return all tasks for a user, newest first."""
+    return sorted(
+        [t for t in TASKS.values() if t['uid'] == uid],
+        key=lambda t: t['created_at'], reverse=True
+    )
+
+def get_queue_size(uid):
+    q = USER_QUEUES.get(uid)
+    return q.qsize() if q else 0
+
+def has_running_task(uid):
+    """True if the user has a task currently executing (not just queued)."""
+    return any(t['uid'] == uid and t['status'] == 'running' for t in TASKS.values())
+
+
+
+# ─── Task execution functions ───────────────────────────────────────────────────
+# Each takes (uid, task) and runs to completion. Cancellation is checked via
+# task_should_cancel(task['id']). Progress is reported via task_update().
+
+async def _run_batch_links(uid, task):
+    """Execute multi-link batch extraction."""
+    links = task['links']
+    oc = task.get('caption')
+    chat_id = task['chat_id']
+    n = len(links)
+    ubot = UB.get(uid)
+    uc = await get_uclient(uid)
+    success = 0
+    cancelled = False
+    task_update(task['id'], progress_msg=f'批量提取 {n} 条链接...')
+    for j, (ci, di, lti, comment_id) in enumerate(links):
+        if task_should_cancel(task['id']):
+            cancelled = True
+            task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
+            break
+        task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
+        try:
+            res = await process_one_link(ubot, uc, ci, di, lti, chat_id, uid, oc, comment_id)
+            if _ok(res):
+                success += 1
+        except Exception as e:
+            print(f'Batch link {j+1}/{n} error: {e}')
+        await asyncio.sleep(BATCH_INTERVAL)
+    if not cancelled:
+        task_update(task['id'], current=n, success=success)
+        task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
+    else:
+        task['result'] = f'已取消。成功：{success}/{n}'
+
+async def _run_single(uid, task):
+    """Execute single-link extraction."""
+    ci, di, lt, comment_id = task['link_info']
+    oc = task.get('caption')
+    chat_id = task['chat_id']
+    ubot = UB.get(uid)
+    uc = await get_uclient(uid)
+    task_update(task['id'], progress_msg='处理中...')
     try:
-        with open(ACTIVE_USERS_FILE, 'w') as f:
-            json.dump(ACTIVE_USERS, f)
+        res = await process_one_link(ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id)
+        task['result'] = res
+    except FloodWait as e:
+        secs = _flood_secs(e)
+        task_update(task['id'], progress_msg=f'Telegram 限流，等待 {int(secs)}s...')
+        await asyncio.sleep(secs)
+        res = await process_one_link(ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id)
+        task['result'] = res
     except Exception as e:
-        print(f"Error saving active users: {e}")
+        task['result'] = f'❌ 错误：{str(e)[:100]}'
 
-async def add_active_batch(user_id: int, batch_info: Dict[str, Any]):
-    # Atomic check-and-set (no await between check and set): callers must
-    # treat a False return as "another task is already running".
-    key = str(user_id)
-    if key in ACTIVE_USERS:
-        return False
-    ACTIVE_USERS[key] = batch_info
-    await save_active_users_to_file()
-    return True
+async def _run_merge(uid, task):
+    """Execute merge extraction and delivery."""
+    links = task['links']
+    oc = task.get('caption')
+    chat_id = task['chat_id']
+    ubot = UB.get(uid)
+    uc = await get_uclient(uid)
+    n = len(links)
 
-def is_user_active(user_id: int) -> bool:
-    return str(user_id) in ACTIVE_USERS
+    # Phase 1: batch-fetch comment links grouped by channel
+    comment_groups = {}
+    for ci, di, lti, comment_id in links:
+        if comment_id:
+            comment_groups.setdefault(ci, []).append(comment_id)
+    batch_msgs = {}
+    if comment_groups:
+        batch_fetch_client = uc or ubot
+        for channel, cids in comment_groups.items():
+            try:
+                linked = await resolve_linked_chat(batch_fetch_client, channel)
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                linked = await resolve_linked_chat(batch_fetch_client, channel)
+            if not linked:
+                continue
+            try:
+                results = await batch_fetch_client.get_messages(linked.id, cids)
+                if not isinstance(results, list):
+                    results = [results]
+                for msg in results:
+                    if msg and not getattr(msg, 'empty', False):
+                        batch_msgs[msg.id] = msg
+                emp[(uid, linked.id)] = True
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                try:
+                    results = await batch_fetch_client.get_messages(linked.id, cids)
+                    if not isinstance(results, list):
+                        results = [results]
+                    for msg in results:
+                        if msg and not getattr(msg, 'empty', False):
+                            batch_msgs[msg.id] = msg
+                    emp[(uid, linked.id)] = True
+                except Exception as e2:
+                    print(f'Retry batch fetch failed for {channel}: {e2}')
+            except Exception as e:
+                print(f'Batch comment fetch failed for {channel}: {e}')
+            await asyncio.sleep(CHANNEL_INTERVAL)
 
-async def update_batch_progress(user_id: int, current: int, success: int):
-    if str(user_id) in ACTIVE_USERS:
-        ACTIVE_USERS[str(user_id)]["current"] = current
-        ACTIVE_USERS[str(user_id)]["success"] = success
-        await save_active_users_to_file()
+    # Phase 2: assemble messages in original link order
+    all_msgs = []
+    for j, (ci, di, lti, comment_id) in enumerate(links):
+        if task_should_cancel(task['id']):
+            task['result'] = f'已取消（{j}/{n}）'
+            return
+        task_update(task['id'], current=j, progress_msg=f'正在获取 {j+1}/{n}...')
+        if comment_id:
+            msg = batch_msgs.get(comment_id)
+        else:
+            if not uc and lti != 'public':
+                continue
+            try:
+                msg = await get_msg(ubot, uc, ci, di, lti, uid)
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                try:
+                    msg = await get_msg(ubot, uc, ci, di, lti, uid)
+                except Exception:
+                    msg = None
+        if not msg:
+            continue
+        if getattr(msg, 'media_group_id', None):
+            src_chat = msg.chat.id if getattr(msg, 'chat', None) else ci
+            src_lt = 'private' if comment_id else lti
+            fetch_client = uc if (uc and (src_lt == 'private' or emp.get((uid, src_chat), False))) else ubot
+            try:
+                group = await fetch_client.get_media_group(src_chat, msg.id)
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                try:
+                    group = await fetch_client.get_media_group(src_chat, msg.id)
+                except Exception:
+                    group = None
+            except Exception:
+                group = None
+            all_msgs.extend(group or [msg])
+        else:
+            all_msgs.append(msg)
+        await asyncio.sleep(MERGE_INTERVAL)
 
-async def request_batch_cancel(user_id: int):
-    if str(user_id) in ACTIVE_USERS:
-        ACTIVE_USERS[str(user_id)]["cancel_requested"] = True
-        await save_active_users_to_file()
-        return True
-    return False
+    if not all_msgs:
+        task['result'] = '❌ 合并失败：未获取到任何消息。'
+        return
+    task_update(task['id'], progress_msg=f'正在合并 {len(all_msgs)} 条消息...')
+    try:
+        res = await process_merged(ubot, uc, all_msgs, chat_id, uid, oc)
+    except FloodWait as e:
+        await asyncio.sleep(_flood_secs(e))
+        res = await process_merged(ubot, uc, all_msgs, chat_id, uid, oc)
+    except Exception as e:
+        res = f'❌ 合并失败：{str(e)[:100]}'
+    task['result'] = res
 
-def should_cancel(user_id: int) -> bool:
-    user_str = str(user_id)
-    return user_str in ACTIVE_USERS and ACTIVE_USERS[user_str].get("cancel_requested", False)
-
-async def remove_active_batch(user_id: int):
-    if str(user_id) in ACTIVE_USERS:
-        del ACTIVE_USERS[str(user_id)]
-        await save_active_users_to_file()
-
-def get_batch_info(user_id: int) -> Optional[Dict[str, Any]]:
-    return ACTIVE_USERS.get(str(user_id))
-
-ACTIVE_USERS = load_active_users()
-
+async def _run_batch_count(uid, task):
+    """Execute sequential batch extraction (start link + count)."""
+    ci = task['cid']
+    sid = task['sid']
+    lt = task['lt']
+    n = task['num']
+    oc = task.get('caption')
+    chat_id = task['chat_id']
+    ubot = UB.get(uid)
+    uc = await get_uclient(uid)
+    success = 0
+    cancelled = False
+    task_update(task['id'], progress_msg=f'批量提取 {n} 条...')
+    for j in range(n):
+        if task_should_cancel(task['id']):
+            cancelled = True
+            task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
+            break
+        task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
+        mid = int(sid) + j
+        try:
+            msg = await get_msg(ubot, uc, ci, mid, lt, uid)
+            if msg:
+                res = await process_msg(ubot, uc, msg, chat_id, lt, uid, ci, oc)
+                if _ok(res):
+                    success += 1
+        except Exception as e:
+            print(f'Count batch {j+1}/{n} error: {e}')
+        await asyncio.sleep(BATCH_INTERVAL)
+    if not cancelled:
+        task_update(task['id'], current=n, success=success)
+        task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
+    else:
+        task['result'] = f'已取消。成功：{success}/{n}'
 async def upd_dlg(c):
     try:
         async for _ in c.get_dialogs(limit=100): pass
@@ -94,10 +338,55 @@ async def upd_dlg(c):
         return False
 
 # fixed the old group of 2021-2022 extraction 🌝 (buy krne ka fayda nhi ab old group) ✅ 
-async def get_msg(c, u, i, d, lt, uid):
+async def resolve_linked_chat(client, channel):
+    """Resolve a channel's linked discussion group Chat, cached per channel.
+
+    ``get_chat`` triggers a cross-DC auth-key round-trip. Calling it per-link
+    (common when merging multiple comment links from one channel) causes
+    FLOOD_WAIT on the auth subsystem. The cache ensures one resolution per
+    channel, process-wide.
+    """
+    if channel in _LINKED_CHAT:
+        return _LINKED_CHAT[channel]
+    try:
+        chat = await client.get_chat(channel)
+        linked = getattr(chat, 'linked_chat', None)
+    except FloodWait:
+        raise
+    except Exception as e:
+        print(f'Failed to resolve linked chat for {channel}: {e}')
+        linked = None
+    _LINKED_CHAT[channel] = linked
+    return linked
+
+
+async def get_msg(c, u, i, d, lt, uid, comment_id=None):
     # emp is keyed per (uid, channel): concurrent users fetching the same
     # channel must not overwrite each other's source-client marker.
     try:
+        if comment_id:
+            # Comment link (?comment=N): the message lives in the channel's
+            # linked discussion group, NOT the channel itself. Resolve it,
+            # then fetch the comment message from there.
+            fetch_client = u or c
+            if not fetch_client:
+                return None
+            linked = await resolve_linked_chat(fetch_client, i)
+            if not linked:
+                print(f'Channel {i} has no linked discussion group')
+                return None
+            try:
+                xm = await fetch_client.get_messages(linked.id, comment_id)
+            except FloodWait:
+                raise
+            except Exception as e:
+                print(f'Failed to fetch comment {comment_id} from discussion group: {e}')
+                return None
+            if xm and not getattr(xm, 'empty', False):
+                emp[(uid, linked.id)] = True
+                return xm
+            return None
+
         if lt == 'public':
             clients = []
             if u:
@@ -401,6 +690,27 @@ def _flood_secs(e):
     return getattr(e, 'value', getattr(e, 'x', 10))
 
 
+async def with_flood_retry(coro_fn, context='', max_retries=None):
+    """Call ``coro_fn()`` (a zero-arg async factory), retrying on FloodWait.
+
+    Waits the server-requested seconds, then retries. After MAX_FLOOD_RETRIES
+    attempts the FloodWait re-raises so the caller can handle or surface it.
+    """
+    retries = max_retries if max_retries is not None else MAX_FLOOD_RETRIES
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await coro_fn()
+        except FloodWait as e:
+            last_exc = e
+            secs = _flood_secs(e)
+            if attempt < retries - 1:
+                print(f'FloodWait {secs}s on {context} (attempt {attempt + 1}/{retries}), waiting')
+                await asyncio.sleep(secs)
+            else:
+                print(f'FloodWait {secs}s on {context}: retries exhausted')
+    raise last_exc
+
 async def _safe_cleanup(coro):
     """Post-delivery cleanup must never propagate (esp. FloodWait): a raised
     error here would make the caller retry an already-delivered send and
@@ -411,7 +721,68 @@ async def _safe_cleanup(coro):
         print(f'cleanup failed (delivery already done): {e}')
 
 
-async def process_album(c, u, msgs, d, lt, uid, i):
+async def _download_media_item(u, one, uid, idx, tag, X, did, p_id, st):
+    """Download one message's media and wrap it as an InputMedia for grouping.
+
+    Returns (input_media, [local_files_to_cleanup]); (None, []) when the
+    message has no usable media or its download fails. ``tag`` ('album'/
+    'merge') namespaces temp filenames so concurrent flows never collide.
+    Shared by process_album and process_merged.
+    """
+    if not (one.photo or one.video or one.document or one.audio):
+        return None, []
+    # SendMultiMedia validates uploads by file extension (PHOTO_EXT_INVALID
+    # otherwise), so the temp name must carry one.
+    if one.photo:
+        ext = '.jpg'
+    elif one.video:
+        ext = os.path.splitext(one.video.file_name or '')[1] or '.mp4'
+    elif one.audio:
+        ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
+    else:
+        ext = os.path.splitext(one.document.file_name or '')[1]
+    f = await u.download_media(
+        one,
+        file_name=os.path.join(_WORKDIR, 'downloads', f'{tag}_{uid}_{int(time.time())}_{idx}{ext}'),
+        progress=prog, progress_args=(X, did, p_id, st),
+    )
+    if not f:
+        print(f'{tag} item {idx + 1} download failed, skipping')
+        return None, []
+    files = [f]
+    if one.video:
+        # Videos without an audio track are treated as animations by Telegram;
+        # mixed into SendMultiMedia they fail the whole group (MEDIA_EMPTY).
+        f = await ensure_audio_track(f)
+        files = [f]
+        # Keep the source channel's thumbnail; without one Telegram shows the
+        # first frame, which is often black.
+        thumb_path = None
+        if one.video.thumbs:
+            try:
+                thumb_path = await u.download_media(
+                    one.video.thumbs[-1].file_id,
+                    file_name=os.path.join(
+                        _WORKDIR, 'downloads',
+                        f'{tag}_thumb_{uid}_{int(time.time())}_{idx}.jpg',
+                    ),
+                )
+            except Exception as e:
+                print(f'Thumb download failed for {tag} item {idx + 1}: {e}')
+        if thumb_path:
+            files.append(thumb_path)
+        return InputMediaVideo(
+            f, duration=one.video.duration,
+            width=one.video.width, height=one.video.height,
+            thumb=thumb_path,
+        ), files
+    if one.photo:
+        return InputMediaPhoto(f), files
+    if one.audio:
+        return InputMediaAudio(f, duration=one.audio.duration), files
+    return InputMediaDocument(f), files
+
+async def process_album(c, u, msgs, d, lt, uid, i, oc=None):
     """Forward an album 1:1 — grouping, order, caption and tags preserved.
 
     Fast path: server-side copy_media_group (works for unrestricted chats).
@@ -424,8 +795,13 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     did = int(d)
     p = await X.send_message(did, f'正在处理相册（{len(msgs)} 项）...')
 
-    orig_caption = next((one.caption.markdown for one in msgs if one.caption), '')
-    proc_text = await process_text_with_rules(d, orig_caption)
+    # ``oc`` (override caption) replaces the original text entirely; the
+    # /settings default caption (user_cap) is still appended below.
+    if oc is not None:
+        proc_text = oc
+    else:
+        orig_caption = next((one.caption.markdown for one in msgs if one.caption), '')
+        proc_text = await process_text_with_rules(d, orig_caption)
     user_cap = await get_user_data_key(d, 'caption', '')
     ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
@@ -444,61 +820,12 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     files = []
     try:
         for idx, one in enumerate(msgs):
-            if not (one.photo or one.video or one.document or one.audio):
-                continue
             await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
-            # Telegram's SendMultiMedia validates uploads by file extension
-            # (PHOTO_EXT_INVALID otherwise), so the temp name must carry one.
-            if one.photo:
-                ext = '.jpg'
-            elif one.video:
-                ext = os.path.splitext(one.video.file_name or '')[1] or '.mp4'
-            elif one.audio:
-                ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
-            else:
-                ext = os.path.splitext(one.document.file_name or '')[1]
-            f = await u.download_media(
-                one,
-                file_name=os.path.join(_WORKDIR, 'downloads', f'album_{uid}_{int(time.time())}_{idx}{ext}'),
-                progress=prog, progress_args=(X, did, p.id, st),
-            )
-            if not f:
-                print(f'Album item {idx + 1} download failed, skipping')
+            im, ifiles = await _download_media_item(u, one, uid, idx, 'album', X, did, p.id, st)
+            if im is None:
                 continue
-            if one.video:
-                # Videos without an audio track are treated as animations by
-                # Telegram; mixed into SendMultiMedia they fail the whole album
-                # with MEDIA_EMPTY. Remux a silent track before uploading.
-                f = await ensure_audio_track(f)
-            files.append(f)
-            if one.photo:
-                media.append(InputMediaPhoto(f))
-            elif one.video:
-                # Keep the source channel's thumbnail; without one Telegram shows
-                # the first frame, which is often black.
-                thumb_path = None
-                if one.video.thumbs:
-                    try:
-                        thumb_path = await u.download_media(
-                            one.video.thumbs[-1].file_id,
-                            file_name=os.path.join(
-                                _WORKDIR, 'downloads',
-                                f'album_thumb_{uid}_{int(time.time())}_{idx}.jpg',
-                            ),
-                        )
-                    except Exception as e:
-                        print(f'Thumb download failed for album item {idx + 1}: {e}')
-                if thumb_path:
-                    files.append(thumb_path)
-                media.append(InputMediaVideo(
-                    f, duration=one.video.duration,
-                    width=one.video.width, height=one.video.height,
-                    thumb=thumb_path,
-                ))
-            elif one.audio:
-                media.append(InputMediaAudio(f, duration=one.audio.duration))
-            else:
-                media.append(InputMediaDocument(f))
+            media.append(im)
+            files.extend(ifiles)
     except Exception:
         # A failed download/progress step must not leak already-downloaded
         # files. FloodWait propagates too — the retry re-downloads cleanly.
@@ -550,7 +877,7 @@ async def process_album(c, u, msgs, d, lt, uid, i):
                     print(f'Per-item send failed after flood wait: {e2}')
             except Exception as e2:
                 print(f'Per-item send failed: {e2}')
-            await asyncio.sleep(2)
+            await asyncio.sleep(UPLOAD_INTERVAL)
         for f in files:
             if os.path.exists(f):
                 os.remove(f)
@@ -570,16 +897,174 @@ async def process_album(c, u, msgs, d, lt, uid, i):
     await _safe_cleanup(X.delete_messages(did, p.id))
     return f'✅ 相册已发送（{len(media)} 项）'
 
+async def process_merged(c, u, msgs, d, uid, oc=None):
+    """Merge multiple fetched messages into ONE delivery.
 
-async def process_msg(c, u, m, d, lt, uid, i):
+    All media (photo/video/audio/document) across every message is re-uploaded
+    as a single album — chunked into groups of <= 10 (Telegram's media-group
+    limit). All text (standalone text messages + media captions) is combined
+    into one block: used as the album caption when it fits (<= 1024 chars),
+    otherwise sent as a standalone message after the album.  When ``oc`` is
+    provided it replaces the combined original text entirely.
+    """
+    tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
+    sender = c if deliver_via_bot else (u or c)
+    did = int(d)
+    p = await X.send_message(did, f'正在合并 {len(msgs)} 条消息...')
+
+    # Partition into media items and text pieces; media captions count as text.
+    media_msgs = []
+    text_pieces = []
+    for one in msgs:
+        if one.media and (one.photo or one.video or one.document or one.audio):
+            media_msgs.append(one)
+            if one.caption:
+                text_pieces.append(one.caption.markdown)
+        elif one.text:
+            text_pieces.append(one.text.markdown)
+
+    if oc is not None:
+        proc_text = oc
+    else:
+        combined = '\n\n'.join(tp for tp in text_pieces if tp)
+        proc_text = await process_text_with_rules(d, combined)
+    user_cap = await get_user_data_key(d, 'caption', '')
+    ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
+
+    # No media: send the combined text as one (or chunked) message(s).
+    if not media_msgs:
+        if not ft:
+            await X.edit_message_text(did, p.id, '没有可合并的内容。')
+            return '❌ 没有可合并的内容'
+        for i in range(0, len(ft), 4096):
+            await sender.send_message(tcid, text=ft[i:i + 4096], reply_to_message_id=rtmid)
+        await _safe_cleanup(X.delete_messages(did, p.id))
+        return '✅ 文字已合并发送'
+
+    # Download every media item.
+    st = time.time()
+    media = []
+    files = []
+    try:
+        for idx, one in enumerate(media_msgs):
+            await X.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(media_msgs)}...')
+            try:
+                im, ifiles = await _download_media_item(u, one, uid, idx, 'merge', X, did, p.id, st)
+            except FloodWait as e:
+                secs = _flood_secs(e)
+                print(f'FloodWait {secs}s downloading merge item {idx + 1}, waiting')
+                await X.edit_message_text(did, p.id, f'Telegram 限流，等待 {secs}s 后重试...')
+                await asyncio.sleep(secs)
+                try:
+                    im, ifiles = await _download_media_item(u, one, uid, idx, 'merge', X, did, p.id, st)
+                except Exception as e2:
+                    print(f'Retry download failed for merge item {idx + 1}: {e2}')
+                    im = None
+                    ifiles = []
+            if im is None:
+                continue
+            media.append(im)
+            files.extend(ifiles)
+    except Exception:
+        for ff in files:
+            if os.path.exists(ff):
+                os.remove(ff)
+        raise
+    if not media:
+        await X.edit_message_text(did, p.id, '媒体下载全部失败')
+        return '❌ 媒体下载全部失败'
+
+    # Caption distribution: when oc is set and media needs >1 chunk, each
+    # chunk's album carries the SAME text plus a (n/N) progress marker so the
+    # recipient knows which part is which. Without oc, the original behavior
+    # is preserved (caption only on the first item, or standalone if >1024).
+    num_chunks = (len(media) + 9) // 10
+    standalone_text = None
+    if ft:
+        if oc is not None and num_chunks > 1:
+            marker_tmpl = '\n\n({}/{})'
+            for ci in range(num_chunks):
+                chunk_start = ci * 10
+                chunk_media = media[chunk_start:chunk_start + 10]
+                marker = marker_tmpl.format(ci + 1, num_chunks)
+                # Leave room for the marker within Telegram's 1024-char cap.
+                max_cap = 1024 - len(marker)
+                chunk_media[0].caption = ft[:max_cap] + marker
+        elif len(ft) <= 1024:
+            media[0].caption = ft
+        else:
+            standalone_text = ft
+
+    await X.edit_message_text(did, p.id, f'正在上传（{len(media)} 项）...')
+    sent_items = 0
+    for start in range(0, len(media), 10):
+        chunk = media[start:start + 10]
+        try:
+            await sender.send_media_group(tcid, chunk, reply_to_message_id=rtmid)
+            sent_items += len(chunk)
+            continue
+        except TypeError as e:
+            if 'keyword-only argument' in str(e):
+                # pyrofork parse bug: the RPC already succeeded — the album is
+                # already delivered, only response parsing failed.
+                sent_items += len(chunk)
+                continue
+            print(f'send_media_group failed on chunk {start}: {e}')
+        except FloodWait as e:
+            await asyncio.sleep(_flood_secs(e))
+            try:
+                await sender.send_media_group(tcid, chunk, reply_to_message_id=rtmid)
+                sent_items += len(chunk)
+                continue
+            except Exception as e2:
+                print(f'Retry send_media_group failed on chunk {start}: {e2}')
+        except Exception as e:
+            print(f'send_media_group failed on chunk {start} ({e}), falling back to per-item')
+        # Per-item fallback for whatever the group attempt above could not send.
+        for im in chunk:
+            try:
+                await _send_album_item(sender, tcid, im, rtmid)
+                sent_items += 1
+            except FloodWait as e:
+                await asyncio.sleep(_flood_secs(e))
+                try:
+                    await _send_album_item(sender, tcid, im, rtmid)
+                    sent_items += 1
+                except Exception as e2:
+                    print(f'Per-item send failed after flood wait: {e2}')
+            except Exception as e2:
+                print(f'Per-item send failed: {e2}')
+            await asyncio.sleep(UPLOAD_INTERVAL)
+
+    for ff in files:
+        if os.path.exists(ff):
+            os.remove(ff)
+
+    if standalone_text:
+        try:
+            await sender.send_message(tcid, text=standalone_text, reply_to_message_id=rtmid)
+        except Exception as e:
+            print(f'Standalone text send failed: {e}')
+
+    if sent_items:
+        await _safe_cleanup(X.delete_messages(did, p.id))
+        return f'✅ 已合并发送（{sent_items} 项媒体）'
+    await X.edit_message_text(did, p.id, '合并上传失败')
+    return '❌ 合并上传失败'
+
+
+async def process_msg(c, u, m, d, lt, uid, i, oc=None):
     f = None  # downloaded temp file; the finally below guarantees cleanup
     try:
         tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
         did = int(d)
 
         if m.media:
-            orig_text = m.caption.markdown if m.caption else ''
-            proc_text = await process_text_with_rules(d, orig_text)
+            if oc is not None:
+                proc_text = oc
+            else:
+                orig_text = m.caption.markdown if m.caption else ''
+                proc_text = await process_text_with_rules(d, orig_text)
             user_cap = await get_user_data_key(d, 'caption', '')
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
             
@@ -743,7 +1228,7 @@ async def process_msg(c, u, m, d, lt, uid, i):
             
         elif m.text:
             sender = c if deliver_via_bot else (u or c)
-            await sender.send_message(tcid, text=m.text.markdown, reply_to_message_id=rtmid)
+            await sender.send_message(tcid, text=oc if oc is not None else m.text.markdown, reply_to_message_id=rtmid)
             return 'Sent.'
     except Exception as e:
         return f'Error: {str(e)[:50]}'
@@ -759,17 +1244,17 @@ async def process_msg(c, u, m, d, lt, uid, i):
 def parse_link_lines(text):
     """Parse /batch input.
 
-    One non-empty line  -> ('range', (cid, sid, lt))   # start link + count flow
-    Multiple lines      -> ('multi', [(cid, sid, lt), ...])
+    One non-empty line  -> ('range', (cid, sid, lt, comment_id))
+    Multiple lines      -> ('multi', [(cid, sid, lt, comment_id), ...])
     Any unparsable line -> ('invalid', (line_no, line_text))
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     parsed = []
     for idx, ln in enumerate(lines, 1):
-        ci, di, lti = E(ln)
+        ci, di, lti, comment_id = E(ln)
         if not ci or not di:
             return 'invalid', (idx, ln)
-        parsed.append((ci, di, lti))
+        parsed.append((ci, di, lti, comment_id))
     if not parsed:
         return 'invalid', (1, text.strip()[:50])
     if len(parsed) == 1:
@@ -784,29 +1269,34 @@ def _ok(res):
             or 'Done' in res or 'Copied' in res or 'Sent' in res)
 
 
-async def process_one_link(ubot, uc, i, s, lt, d, uid):
+async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None):
     """Fetch and deliver one t.me link (expanding albums), with one FloodWait retry."""
     try:
-        return await _process_one_link(ubot, uc, i, s, lt, d, uid)
+        return await _process_one_link(ubot, uc, i, s, lt, d, uid, oc, comment_id)
     except FloodWait as e:
         secs = _flood_secs(e)
         print(f'FloodWait {secs}s on {i}/{s}, waiting and retrying once')
         await asyncio.sleep(secs)
-        return await _process_one_link(ubot, uc, i, s, lt, d, uid)
+        return await _process_one_link(ubot, uc, i, s, lt, d, uid, oc, comment_id)
 
 
-async def _process_one_link(ubot, uc, i, s, lt, d, uid):
+async def _process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None):
     """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
     if not uc and lt != 'public':
         return '用户会话无效或未登录，请先使用 /login。'
-    msg = await get_msg(ubot, uc, i, s, lt, uid)
+    msg = await get_msg(ubot, uc, i, s, lt, uid, comment_id)
     if not msg:
         return '未找到消息'
     msgs = [msg]
+    # Comment links resolve to a discussion-group message whose chat differs
+    # from the URL's channel. Use the message's own chat for media-group
+    # expansion so we fetch the right group.
+    src_chat = msg.chat.id if getattr(msg, 'chat', None) else i
+    src_lt = 'private' if comment_id else lt
     if getattr(msg, 'media_group_id', None):
-        fetch_client = uc if (uc and (lt == 'private' or emp.get((uid, i), False))) else ubot
+        fetch_client = uc if (uc and (src_lt == 'private' or emp.get((uid, src_chat), False))) else ubot
         try:
-            group = await fetch_client.get_media_group(i, s)
+            group = await fetch_client.get_media_group(src_chat, msg.id)
             if group:
                 msgs = group
         except FloodWait:
@@ -814,11 +1304,11 @@ async def _process_one_link(ubot, uc, i, s, lt, d, uid):
         except Exception as e:
             print(f'Media group fetch failed, falling back to single: {e}')
     if len(msgs) > 1:
-        return await process_album(ubot, uc, msgs, d, lt, uid, i)
-    return await process_msg(ubot, uc, msgs[0], d, lt, uid, i)
+        return await process_album(ubot, uc, msgs, d, src_lt, uid, src_chat, oc)
+    return await process_msg(ubot, uc, msgs[0], d, src_lt, uid, src_chat, oc)
 
 
-@X.on_message(filters.command(['batch', 'single']))
+@X.on_message(filters.command(['batch', 'single', 'merge']))
 async def process_cmd(c, m):
     uid = m.from_user.id
     cmd = m.command[0]
@@ -830,8 +1320,9 @@ async def process_cmd(c, m):
     if await sub(c, m) == 1: return
     pro = await m.reply_text('正在进行检查，请稍候...')
 
-    if is_user_active(uid):
-        await pro.edit('您有一个正在进行的任务。使用 /stop 取消。')
+    qsize = get_queue_size(uid)
+    if qsize >= _MAX_QUEUE:
+        await pro.edit(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
         return
 
     bot_token = await get_user_data_key(uid, "bot_token", None)
@@ -846,33 +1337,71 @@ async def process_cmd(c, m):
             await pro.edit('请先使用 /setbot 添加您的机器人')
         return
     
-    Z[uid] = {'step': 'start' if cmd == 'batch' else 'start_single'}
+    # Custom caption: text after the command name on the FIRST line only
+    # (e.g. "/merge my title"). m.command holds the parsed first-line tokens;
+    # using it (not m.text) avoids two problems: (1) m.text on bot messages
+    # is a Text object without .split, and (2) anything after a newline in
+    # the command message (e.g. an accidentally pasted link) would otherwise
+    # be swallowed into the caption.
+    oc = ' '.join(m.command[1:]).strip() or None
+    Z[uid] = {'step': {'batch': 'start', 'single': 'start_single', 'merge': 'start_merge'}[cmd], 'oc': oc}
+    oc_note = f'\n📝 自定义说明（替换原文字）：{oc}' if oc else ''
     if cmd == 'batch':
-        await pro.edit('发送起始链接（连续下载指定数量），或多条链接（每行一条，逐个下载）。')
+        await pro.edit(f'发送起始链接（连续下载指定数量），或多条链接（每行一条，逐个下载）。{oc_note}')
+    elif cmd == 'merge':
+        await pro.edit(f'发送要合并的链接（每行一条）。所有内容将合并为一条消息发送（多媒体合并为相册，文字合并到一起）。{oc_note}')
     else:
-        await pro.edit('发送要处理的链接。')
+        await pro.edit(f'发送要处理的链接。{oc_note}')
 
 @X.on_message(filters.command(['cancel', 'stop']))
 async def cancel_cmd(c, m):
     uid = m.from_user.id
-    if is_user_active(uid):
-        if await request_batch_cancel(uid):
-            await m.reply_text('已请求取消。当前批量提取将在本次下载完成后停止。')
-        else:
-            await m.reply_text('请求取消失败，请重试。')
+    cancelled = request_cancel_tasks(uid)
+    had_state = Z.pop(uid, None) is not None
+    if cancelled:
+        await m.reply_text(f'已请求取消 {cancelled} 个任务。进行中的将在当前步骤完成后停止。')
+    elif had_state:
+        await m.reply_text('已取消。')
     else:
-        # Also drop any pending input state (start/count prompts) — otherwise
-        # the next plain text message would resurrect the abandoned flow.
-        had_state = Z.pop(uid, None) is not None
-        await m.reply_text('已取消。' if had_state else '未找到正在进行的批量提取。')
+        await m.reply_text('没有正在进行的任务。')
+
+@X.on_message(filters.command('tasks'))
+async def tasks_cmd(c, m):
+    uid = m.from_user.id
+    user_tasks = get_user_tasks(uid)
+    if not user_tasks:
+        await m.reply_text('📋 没有任务记录。')
+        return
+    # Show last 5 tasks
+    lines = ['📋 **任务列表**（最近 5 个）\n']
+    status_icons = {
+        'queued': '⏳', 'running': '🔄', 'done': '✅',
+        'failed': '❌', 'cancelled': '🚫',
+    }
+    for t in user_tasks[:5]:
+        icon = status_icons.get(t['status'], '❓')
+        elapsed = ''
+        if t['finished_at']:
+            elapsed = f' · 用时 {int(t["finished_at"] - t["created_at"])}s'
+        elif t['status'] == 'running':
+            elapsed = f' · 已运行 {int(time.time() - t["created_at"])}s'
+        progress = f'{t["current"]}/{t["total"]}'
+        if t['progress_msg']:
+            progress += f' · {t["progress_msg"]}'
+        lines.append(f'{icon} **{t["type"]}** {progress}{elapsed}')
+        if t['result']:
+            lines.append(f'   └ {t["result"][:80]}')
+    lines.append(f'\n队列：{get_queue_size(uid)} 个等待')
+    await m.reply_text('\n'.join(lines))
 
 @X.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
-    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
+    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot', 'merge', 'tasks']))
 async def text_handler(c, m):
     uid = m.from_user.id
     if uid not in Z: return
     s = Z[uid].get('step')
+    oc = Z[uid].get('oc')
     x = await get_ubot(uid)
     if not x:
         Z.pop(uid, None)
@@ -893,7 +1422,7 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
         if mode == 'range':
-            i, d, lt = payload
+            i, d, lt, _comment = payload
             Z[uid].update({'step': 'count', 'cid': i, 'sid': d, 'lt': lt})
             try:
                 await m.reply_text('要处理多少条消息？')
@@ -909,172 +1438,86 @@ async def text_handler(c, m):
             await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
             Z.pop(uid, None)
             return
-
-        try:
-            pt = await m.reply_text(f'开始批量提取 {n} 条链接...')
-        except Exception:
-            Z.pop(uid, None)
-            raise
-        uc = await get_uclient(uid)
         ubot = UB.get(uid)
         if not ubot:
-            await pt.edit('请先使用 /setbot 添加机器人')
+            await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
-        if is_user_active(uid):
-            await pt.edit('存在正在进行的任务。请先使用 /stop。')
-            Z.pop(uid, None)
-            return
-
-        if not await add_active_batch(uid, {
-            "total": n,
-            "current": 0,
-            "success": 0,
-            "cancel_requested": False,
-            "progress_message_id": pt.id
-            }):
-            await pt.edit('存在正在进行的任务。请先使用 /stop。')
-            Z.pop(uid, None)
-            return
-
-        success = 0
-        cancelled = False
-        try:
-            for j, (ci, di, lti) in enumerate(links):
-                if should_cancel(uid):
-                    cancelled = True
-                    await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
-                    break
-                await update_batch_progress(uid, j, success)
-                try:
-                    res = await process_one_link(ubot, uc, ci, di, lti, str(m.chat.id), uid)
-                    if _ok(res):
-                        success += 1
-                except Exception as e:
-                    try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
-                    except: pass
-                await asyncio.sleep(10)
-            if not cancelled and j + 1 == n:
-                await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
-        finally:
-            await remove_active_batch(uid)
-            Z.pop(uid, None)
+        task = create_task(uid, 'batch_links', n, links=links, caption=oc, chat_id=str(m.chat.id))
+        await enqueue_task(uid, task)
+        qpos = get_queue_size(uid)
+        await m.reply_text(f'📦 批量提取任务已加入队列（{n} 条链接）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
+        Z.pop(uid, None)
 
     elif s == 'start_single':
         L = m.text
-        i, d, lt = E(L)
+        i, d, lt, comment_id = E(L)
         if not i or not d:
             await m.reply_text('链接格式无效。')
             Z.pop(uid, None)
             return
-
-        Z[uid].update({'step': 'process_single', 'cid': i, 'sid': d, 'lt': lt})
-        i, s, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['lt']
-        pt = await m.reply_text('处理中...')
-        
         ubot = UB.get(uid)
         if not ubot:
-            await pt.edit('请先使用 /setbot 添加机器人')
+            await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
-        
-        uc = await get_uclient(uid)
-        if is_user_active(uid):
-            await pt.edit('存在正在进行的任务。请先使用 /stop。')
-            Z.pop(uid, None)
-            return
+        task = create_task(uid, 'single', 1, link_info=(i, d, lt, comment_id), caption=oc, chat_id=str(m.chat.id))
+        await enqueue_task(uid, task)
+        qpos = get_queue_size(uid)
+        await m.reply_text(f'📦 单条提取任务已加入队列。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
+        Z.pop(uid, None)
 
-        try:
-            res = await process_one_link(ubot, uc, i, s, lt, str(m.chat.id), uid)
-            await pt.edit(res)
-        except Exception as e:
-            await pt.edit(f'错误：{str(e)[:50]}')
-        finally:
+    elif s == 'start_merge':
+        mode, payload = parse_link_lines(m.text)
+        if mode == 'invalid':
+            idx, line = payload
+            await m.reply_text(f'第 {idx} 行链接格式无效：{line[:50]}')
             Z.pop(uid, None)
+            return
+        links = [payload] if mode == 'range' else payload
+        n = len(links)
+        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREMIUM_LIMIT
+        if n > maxlimit:
+            await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
+            Z.pop(uid, None)
+            return
+        ubot = UB.get(uid)
+        if not ubot:
+            await m.reply_text('请先使用 /setbot 添加机器人')
+            Z.pop(uid, None)
+            return
+        task = create_task(uid, 'merge', n, links=links, caption=oc, chat_id=str(m.chat.id))
+        await enqueue_task(uid, task)
+        qpos = get_queue_size(uid)
+        await m.reply_text(f'📦 合并任务已加入队列（{n} 条链接）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
+        Z.pop(uid, None)
+
 
     elif s == 'count':
         if not m.text.isdigit():
             await m.reply_text('请输入有效数字。')
             return
-
         count = int(m.text)
         if count < 1:
             await m.reply_text('数量至少为 1。')
             return
-        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
-
+        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREMIUM_LIMIT
         if count > maxlimit:
             await m.reply_text(f'最大限制为 {maxlimit}。')
             return
-
-        Z[uid].update({'step': 'process', 'did': str(m.chat.id), 'num': count})
-        i, s, n, lt = Z[uid]['cid'], Z[uid]['sid'], Z[uid]['num'], Z[uid]['lt']
-        success = 0
-
-        try:
-            pt = await m.reply_text('正在进行批量提取...')
-        except Exception:
-            Z.pop(uid, None)
-            raise
-        uc = await get_uclient(uid)
+        cid = Z[uid]['cid']
+        sid = Z[uid]['sid']
+        lt = Z[uid]['lt']
         ubot = UB.get(uid)
-
-        # UC is only needed for private links; public links work with the
-        # custom bot alone (same rule as the multi-link flow).
-        if not ubot or (lt != 'public' and not uc):
-            await pt.edit('客户端配置缺失' if not ubot else '用户会话无效或未登录，请先使用 /login。')
+        if not ubot:
+            await m.reply_text('请先使用 /setbot 添加机器人')
             Z.pop(uid, None)
             return
-            
-        if is_user_active(uid):
-            await pt.edit('存在正在进行的任务')
-            Z.pop(uid, None)
-            return
-        
-        if not await add_active_batch(uid, {
-            "total": n,
-            "current": 0,
-            "success": 0,
-            "cancel_requested": False,
-            "progress_message_id": pt.id
-            }):
-            await pt.edit('存在正在进行的任务。请先使用 /stop。')
-            Z.pop(uid, None)
-            return
-        
-        cancelled = False
-        try:
-            for j in range(n):
-
-                if should_cancel(uid):
-                    cancelled = True
-                    await pt.edit(f'已在 {j}/{n} 处取消。成功：{success}')
-                    break
-
-                await update_batch_progress(uid, j, success)
-
-                mid = int(s) + j
-
-                try:
-                    msg = await get_msg(ubot, uc, i, mid, lt, uid)
-                    if msg:
-                        res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                        if _ok(res):
-                            success += 1
-                    else:
-                        pass
-                except Exception as e:
-                    try: await pt.edit(f'{j+1}/{n}：错误 - {str(e)[:30]}')
-                    except: pass
-
-                await asyncio.sleep(10)
-
-            if not cancelled and j + 1 == n:
-                await m.reply_text(f'批量提取完成 ✅ 成功：{success}/{n}')
-        
-        finally:
-            await remove_active_batch(uid)
-            Z.pop(uid, None)
+        task = create_task(uid, 'batch_count', count, cid=cid, sid=sid, lt=lt, num=count, caption=oc, chat_id=str(m.chat.id))
+        await enqueue_task(uid, task)
+        qpos = get_queue_size(uid)
+        await m.reply_text(f'📦 批量提取任务已加入队列（{count} 条）。\n位置：{"执行中" if qpos <= 1 else f"队列第 {qpos-1} 位"}\n使用 /tasks 查看进度。')
+        Z.pop(uid, None)
 
 
 

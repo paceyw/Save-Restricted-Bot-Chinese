@@ -54,6 +54,14 @@ INSTA_COOKIES = os.getenv("INSTA_COOKIES", INST_COOKIES)
 FREEMIUM_LIMIT = int(os.getenv("FREEMIUM_LIMIT", "0"))
 PREMIUM_LIMIT  = int(os.getenv("PREMIUM_LIMIT", "500"))
 
+# ─── RATE CONTROL (anti-flood) ──────────────────────────────────────────────────
+# Inter-request delays (seconds). Conservative defaults prevent auth FLOOD_WAIT.
+BATCH_INTERVAL   = float(os.getenv("BATCH_INTERVAL", "10"))   # batch/count: between links
+MERGE_INTERVAL   = float(os.getenv("MERGE_INTERVAL", "5"))    # merge: between links
+CHANNEL_INTERVAL = float(os.getenv("CHANNEL_INTERVAL", "5"))  # merge: between channels
+UPLOAD_INTERVAL  = float(os.getenv("UPLOAD_INTERVAL", "2"))   # after each media upload
+MAX_FLOOD_RETRIES = int(os.getenv("MAX_FLOOD_RETRIES", "3"))  # FloodWait retry attempts
+
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
