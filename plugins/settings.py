@@ -11,7 +11,7 @@ import string
 import random
 import time
 from shared_client import app, _WORKDIR
-from utils.func import get_user_data_key, save_user_data
+from utils.func import get_user_data_key, save_user_data, bump_cred_epoch
 try:
     from utils.encrypt import ecs, dcs
 except ImportError:
@@ -23,7 +23,7 @@ VIDEO_EXTENSIONS = {
     'mpeg', 'mpg', '3gp'
 }
 SET_PIC = 'settings.jpg'
-MESS = '自定义文件设置...'
+MESS = '自定义文件设置...\n\n提示：任务开始执行后修改设置，对进行中的任务不生效。'
 
 active_conversations = {}
 _ACTIVE_CONVERSATION_TTL = 900
@@ -147,6 +147,11 @@ async def _stop_cached_user_client(user_id):
 
     async with _client_lock(user_id):
         old_client = UC.pop(user_id, None)
+        try:
+            from plugins.batch import _UC_EPOCH
+            _UC_EPOCH.pop(user_id, None)
+        except ImportError:
+            pass
         if old_client is not None and old_client is not Y:
             try:
                 await old_client.stop()
@@ -160,6 +165,7 @@ async def _do_logout(user_id, query):
         {'user_id': user_id},
         {'$unset': {'session_string': ''}}
     )
+    bump_cred_epoch(user_id)
     await _stop_cached_user_client(user_id)
     if result.modified_count > 0:
         await query.message.reply_text('已成功退出登录并删除会话。')
@@ -344,11 +350,11 @@ def generate_random_name(length=7):
     return ''.join(random.choice(characters) for _ in range(length))
 
 
-async def rename_file(file, sender, edit):
+async def rename_file(file, sender, edit, settings):
     try:
-        delete_words = await get_user_data_key(sender, 'delete_words', [])
-        custom_rename_tag = await get_user_data_key(sender, 'rename_tag', '')
-        replacements = await get_user_data_key(sender, 'replacement_words', {})
+        delete_words = settings.get('delete_words', [])
+        custom_rename_tag = settings.get('rename_tag', '')
+        replacements = settings.get('replacement_words', {})
         
         last_dot_index = str(file).rfind('.')
         if last_dot_index != -1 and last_dot_index != 0:

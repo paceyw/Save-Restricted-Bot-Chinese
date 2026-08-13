@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -58,6 +59,17 @@ class _FakeMessage:
         self.replies.append(reply)
         return reply
 
+def _settings(**overrides):
+    result = {
+        "caption": "",
+        "chat_id": None,
+        "replacement_words": {},
+        "delete_words": [],
+        "rename_tag": "",
+        "bot_token": None,
+    }
+    result.update(overrides)
+    return result
 
 @pytest.fixture
 def batch_module(monkeypatch):
@@ -125,6 +137,36 @@ def batch_module(monkeypatch):
     func.get_user_data_key = None
     func.process_text_with_rules = None
     func.is_premium_user = None
+    async def get_user_settings(_uid):
+        return {
+            "caption": "",
+            "chat_id": None,
+            "replacement_words": {},
+            "delete_words": [],
+            "rename_tag": "",
+            "bot_token": None,
+        }
+
+    func.get_user_settings = get_user_settings
+
+    def filter_settings(doc):
+        result = {
+            "caption": "",
+            "chat_id": None,
+            "replacement_words": {},
+            "delete_words": [],
+            "rename_tag": "",
+            "bot_token": None,
+        }
+        for key in result:
+            if doc and key in doc:
+                result[key] = doc[key]
+        return result
+
+    func.filter_settings = filter_settings
+    func.cred_epoch = lambda _uid: 0
+    func.prune_cred_epochs = lambda _active: None
+    func.apply_text_rules = lambda text, _replacements, _delete_words: text
 
     import re as _re
 
@@ -307,6 +349,7 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
             "public",
             42,
             "public_channel",
+            settings=_settings(),
         )
     )
 
@@ -323,7 +366,7 @@ def test_resolve_delivery_prefers_settings_chat_id(batch_module):
     module.get_user_data_key = get_key
     module.LOG_GROUP = -100999
 
-    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42"))
+    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42", _settings(chat_id="-100111")))
 
     assert tcid == -100111
     assert rtmid is None
@@ -339,7 +382,7 @@ def test_resolve_delivery_falls_back_to_log_group(batch_module):
     module.get_user_data_key = get_key
     module.LOG_GROUP = -100999
 
-    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42"))
+    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42", _settings()))
 
     assert tcid == -100999
     assert via_bot is True
@@ -354,7 +397,7 @@ def test_resolve_delivery_defaults_to_user_chat(batch_module):
     module.get_user_data_key = get_key
     module.LOG_GROUP = 0
 
-    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42"))
+    tcid, rtmid, via_bot = asyncio.run(module.resolve_delivery("42", _settings()))
 
     assert tcid == 42
     assert isinstance(tcid, int)
@@ -447,7 +490,10 @@ def test_process_msg_cleans_downloaded_file_on_processing_error(batch_module, tm
     )
 
     result = asyncio.run(
-        module.process_msg(UserClient(), UserClient(), message, "42", "public", 42, "public_channel")
+        module.process_msg(
+            UserClient(), UserClient(), message, "42", "public", 42,
+            "public_channel", settings=_settings()
+        )
     )
 
     assert result.startswith("Error:")
@@ -478,7 +524,10 @@ def test_process_msg_sends_sticker_from_downloaded_file(batch_module, tmp_path):
     )
 
     result = asyncio.run(
-        module.process_msg(UserClient(), UserClient(), message, "42", "public", 42, "public_channel")
+        module.process_msg(
+            UserClient(), UserClient(), message, "42", "public", 42,
+            "public_channel", settings=_settings()
+        )
     )
 
     assert result == "Done."
@@ -567,7 +616,7 @@ def test_process_merged_combines_text_only(batch_module):
             sent.append(text)
 
     msgs = [_text_msg('Hello'), _text_msg('World')]
-    result = asyncio.run(module.process_merged(Client(), Client(), msgs, "42", 42))
+    result = asyncio.run(module.process_merged(Client(), Client(), msgs, "42", 42, settings=_settings()))
 
     assert result == '✅ 文字已合并发送'
     assert sent == ['Hello\n\nWorld']
@@ -585,7 +634,7 @@ def test_process_merged_no_content(batch_module):
         media=None, photo=None, video=None, audio=None, document=None,
         text=None, caption=None,
     )
-    result = asyncio.run(module.process_merged(Client(), Client(), [msg], "42", 42))
+    result = asyncio.run(module.process_merged(Client(), Client(), [msg], "42", 42, settings=_settings()))
     assert result == '❌ 没有可合并的内容'
 
 
@@ -597,7 +646,7 @@ def test_process_merged_builds_album_with_combined_caption(batch_module, tmp_pat
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg('Pic 1'), _photo_msg('Pic 2')]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     assert len(client.groups) == 1
@@ -615,7 +664,7 @@ def test_process_merged_chunks_over_ten_media(batch_module, tmp_path):
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg() for _ in range(12)]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     # 12 items split into groups of 10 + 2 (Telegram media-group limit).
@@ -630,7 +679,7 @@ def test_process_merged_oc_chunks_each_get_caption_with_marker(batch_module, tmp
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg() for _ in range(12)]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, oc='我的合集'))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, oc='我的合集', settings=_settings()))
 
     assert result.startswith('✅')
     assert [len(g) for g in client.groups] == [10, 2]
@@ -650,7 +699,7 @@ def test_process_merged_no_oc_single_chunk_no_marker(batch_module, tmp_path):
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg('Cap A'), _photo_msg('Cap B')]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     assert client.groups[0][0].caption == 'Cap A\n\nCap B'
@@ -668,7 +717,7 @@ def test_process_merged_long_text_sent_as_standalone(batch_module, tmp_path):
     client = _MergeClient(tmp_path)
     long_caption = 'A' * 1100
     msgs = [_photo_msg(long_caption)]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     # Caption too long for an album (>1024) → sent separately, not on the item.
@@ -684,7 +733,7 @@ def test_process_merged_mixed_text_and_media(batch_module, tmp_path):
 
     client = _MergeClient(tmp_path)
     msgs = [_text_msg('Intro'), _photo_msg('Photo caption')]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     assert len(client.groups) == 1
@@ -704,7 +753,7 @@ def test_process_merged_oc_replaces_original_text(batch_module, tmp_path):
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg('Original caption A'), _photo_msg('Original caption B')]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, oc='My title'))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, oc='My title', settings=_settings()))
 
     assert result.startswith('✅')
     # oc replaces the combined original captions entirely.
@@ -724,7 +773,7 @@ def test_process_merged_oc_replaces_text_only_messages(batch_module):
 
     msgs = [_text_msg('Original 1'), _text_msg('Original 2')]
     # oc replaces the merged original text.
-    result = asyncio.run(module.process_merged(Client(), Client(), msgs, "42", 42, oc='Custom'))
+    result = asyncio.run(module.process_merged(Client(), Client(), msgs, "42", 42, oc='Custom', settings=_settings()))
 
     assert result == '✅ 文字已合并发送'
     assert sent == ['Custom']
@@ -754,7 +803,10 @@ def test_process_msg_oc_replaces_media_caption(batch_module, tmp_path):
         audio=None, document=None, photo=types.SimpleNamespace(file_id="p"),
     )
     result = asyncio.run(
-        module.process_msg(UserClient(), UserClient(), message, "42", "public", 42, "public_channel", oc='Override')
+        module.process_msg(
+            UserClient(), UserClient(), message, "42", "public", 42,
+            "public_channel", oc='Override', settings=_settings()
+        )
     )
 
     assert result == "Done."
@@ -776,7 +828,10 @@ def test_process_msg_oc_replaces_text_message(batch_module):
         caption=None,
     )
     result = asyncio.run(
-        module.process_msg(Client(), Client(), message, "42", "public", 42, "public_channel", oc='Replaced')
+        module.process_msg(
+            Client(), Client(), message, "42", "public", 42,
+            "public_channel", oc='Replaced', settings=_settings()
+        )
     )
 
     assert result == "Sent."
@@ -792,7 +847,7 @@ def test_process_merged_oc_none_preserves_original_text(batch_module, tmp_path):
 
     client = _MergeClient(tmp_path)
     msgs = [_photo_msg('Keep me')]
-    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42))
+    result = asyncio.run(module.process_merged(client, client, msgs, "42", 42, settings=_settings()))
 
     assert result.startswith('✅')
     assert client.groups[0][0].caption == 'Keep me'
@@ -824,7 +879,10 @@ def test_process_album_oc_replaces_caption(batch_module, tmp_path):
 
     client = FakeClient()
     result = asyncio.run(
-        module.process_album(client, client, msgs, "42", "private", 42, "chan", oc='Album override')
+        module.process_album(
+            client, client, msgs, "42", "private", 42, "chan",
+            oc='Album override', settings=_settings()
+        )
     )
 
     assert result.startswith('✅')
@@ -1070,3 +1128,515 @@ def test_task_worker_processes_queued_tasks(batch_module):
         assert t['finished_at'] is not None
 
     asyncio.run(_test())
+
+def test_dispatch_snapshots_settings_once_for_single_message_chain(batch_module):
+    module, _ = batch_module
+    module.LOG_GROUP = 0
+    snapshots = []
+    sent = []
+
+    async def get_data(uid):
+        snapshots.append(uid)
+        return {'caption': 'snapshot caption'}
+
+    class Client:
+        async def send_message(self, tcid, text=None, reply_to_message_id=None):
+            sent.append((tcid, text))
+
+    client = Client()
+    module.get_user_data = get_data
+    module.get_ubot = lambda _uid, **_k: asyncio.sleep(0, result=client)
+    module.get_uclient = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    message = types.SimpleNamespace(
+        media=None,
+        text=types.SimpleNamespace(markdown='hello'),
+        caption=None,
+    )
+
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+        return await module.process_msg(
+            ubot, uc, message, d, lt, uid, i, oc, settings=settings
+        )
+
+    module.process_one_link = process_one_link
+    task = module.create_task(
+        42,
+        'single',
+        1,
+        link_info=('public_channel', 7, 'public', None),
+        caption=None,
+        chat_id='42',
+    )
+
+    asyncio.run(module._dispatch_task(42, task))
+
+    assert snapshots == [42]
+    assert task['settings']['caption'] == 'snapshot caption'
+    assert sent == [(42, 'hello')]
+
+
+# ─── Phase 4 adversarial-review regression tests ─────────────────────────────
+
+
+def test_dispatch_chain_fails_loudly_on_any_extra_users_read(batch_module):
+    """P1 regression: the task chain must not touch user-data accessors beyond
+    the single dispatch-time snapshot. Any stray get_user_data/get_user_data_key
+    call raises instead of being silently mocked away."""
+    module, _ = batch_module
+    module.LOG_GROUP = 0
+    reads = []
+    sent = []
+
+    async def get_data(uid):
+        # The dispatch-time document fetch is the ONE allowed users read.
+        reads.append(uid)
+        return None
+
+    async def fail_users_read(*_a, **_k):
+        raise AssertionError("unexpected users-collection read in task chain")
+
+    class Client:
+        async def send_message(self, tcid, text=None, reply_to_message_id=None):
+            sent.append((tcid, text))
+
+    module.get_user_data = get_data
+    module.get_user_data_key = fail_users_read
+    module.get_ubot = lambda _uid, **_k: asyncio.sleep(0, result=Client())
+    module.get_uclient = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    message = types.SimpleNamespace(
+        media=None,
+        text=types.SimpleNamespace(markdown='hello'),
+        caption=None,
+    )
+
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+        return await module.process_msg(
+            ubot, uc, message, d, lt, uid, i, oc, settings=settings
+        )
+
+    module.process_one_link = process_one_link
+    task = module.create_task(
+        42,
+        'single',
+        1,
+        link_info=('public_channel', 7, 'public', None),
+        caption=None,
+        chat_id='42',
+    )
+
+    asyncio.run(module._dispatch_task(42, task))
+
+    assert reads == [42]
+    assert sent == [(42, 'hello')]
+
+
+def test_get_uclient_cache_hit_performs_no_db_reads(batch_module):
+    """P1 regression: a warm UC entry short-circuits before get_user_data and
+    before get_ubot — steady-state tasks issue zero extra users queries."""
+    module, _ = batch_module
+    cached = object()
+    module.UC[42] = cached
+    module._UC_EPOCH[42] = 0  # matches fixture cred_epoch == 0
+
+    async def fail_read(*_a, **_k):
+        raise AssertionError("users read on warm get_uclient path")
+
+    module.get_user_data = fail_read
+    module.get_user_data_key = fail_read
+    module.get_ubot = fail_read
+
+    assert asyncio.run(module.get_uclient(42)) is cached
+
+
+def test_process_msg_builds_caption_from_snapshot_rules(batch_module, monkeypatch):
+    """The media path must apply the snapshot's replacement/delete words and
+    append the snapshot caption — wired through the PRODUCTION apply_text_rules
+    (loaded from utils/func.py), not a test double."""
+    module, _ = batch_module
+    module.LOG_GROUP = 0
+    sent = []
+
+    # Load the real utils.func to exercise production rule semantics. The
+    # batch_module fixture already stubbed config/utils.encrypt; func.py
+    # additionally needs config.MONGO_DB/DB_NAME, encrypt.ecs and motor.
+    monkeypatch.setattr(sys.modules['config'], 'MONGO_DB', 'mongodb://unused', raising=False)
+    monkeypatch.setattr(sys.modules['config'], 'DB_NAME', 'test', raising=False)
+    monkeypatch.setattr(sys.modules['utils.encrypt'], 'ecs', lambda value: value, raising=False)
+    motor = types.ModuleType('motor')
+    motor_asyncio = types.ModuleType('motor.motor_asyncio')
+
+    class FakeMotorClient:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def __getitem__(self, _name):
+            return self
+
+        def __getattr__(self, _name):
+            return self
+
+    motor_asyncio.AsyncIOMotorClient = FakeMotorClient
+    motor.motor_asyncio = motor_asyncio
+    monkeypatch.setitem(sys.modules, 'motor', motor)
+    monkeypatch.setitem(sys.modules, 'motor.motor_asyncio', motor_asyncio)
+    spec = importlib.util.spec_from_file_location('real_func_for_rules', SRC / 'utils' / 'func.py')
+    real_func = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real_func)
+    module.apply_text_rules = real_func.apply_text_rules
+
+    class Client:
+        async def send_photo(self, tcid, file_id, caption=None, reply_to_message_id=None):
+            sent.append((tcid, caption))
+
+    message = types.SimpleNamespace(
+        media=types.SimpleNamespace(),
+        photo=types.SimpleNamespace(file_id='photo-file'),
+        video=None, video_note=None, voice=None, sticker=None,
+        audio=None, document=None,
+        caption=types.SimpleNamespace(markdown='alpha beta'),
+        text=None,
+    )
+    settings = _settings(
+        caption='snap cap',
+        replacement_words={'alpha': 'A'},
+        delete_words=['beta'],
+    )
+
+    result = asyncio.run(
+        module.process_msg(
+            Client(), Client(), message, '42', 'public', 42, 'chan', None,
+            settings=settings,
+        )
+    )
+
+    assert result == 'Sent directly.'
+    # Production semantics: substring replace ('alpha'->'A'), then whole-word
+    # delete removes 'beta' and re-joins -> 'A' (no stray whitespace).
+    assert sent == [(42, 'A\n\nsnap cap')]
+
+
+def test_run_batch_count_forwards_snapshot_to_process_msg(batch_module):
+    """Runner coverage: _run_batch_count threads the dispatch snapshot through
+    every iteration (batch_links/single covered elsewhere)."""
+    module, _ = batch_module
+    seen = []
+
+    module.get_ubot = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    module.get_uclient = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    module.get_msg = lambda *_a: asyncio.sleep(0, result=object())
+
+    async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
+        seen.append(settings)
+        return 'Done.'
+
+    module.process_msg = process_msg
+    task = module.create_task(
+        42, 'batch_count', 2, cid='chan', sid=5, lt='public', num=2,
+        caption=None, chat_id='42',
+    )
+    task['settings'] = _settings(caption='fwd')
+
+    asyncio.run(module._run_batch_count(42, task, {}, 0))
+
+    assert len(seen) == 2
+    assert all(s['caption'] == 'fwd' for s in seen)
+
+
+def test_get_uclient_miss_reads_user_data_exactly_once(batch_module):
+    """Cold-path contract: UC miss performs exactly one session read
+    (establishment-class, documented residual), then falls back to the
+    custom bot when no session_string exists."""
+    module, _ = batch_module
+    calls = []
+
+    async def get_user_data(uid):
+        calls.append(uid)
+        return None
+
+    module.get_user_data = get_user_data
+    module.get_ubot = lambda _uid, **_k: asyncio.sleep(0, result='bot')
+
+    result = asyncio.run(module.get_uclient(42))
+
+    assert result == 'bot'
+    assert calls == [42]
+
+
+def test_task_chain_performs_exactly_one_real_find_one(batch_module, monkeypatch):
+    """Acceptance: a full dispatched task — including COLD client establishment
+    through the prefetched document — performs exactly one real
+    users_collection.find_one (real func accessors, counted collection)."""
+    module, _ = batch_module
+    module.LOG_GROUP = 0
+
+    monkeypatch.setattr(sys.modules['config'], 'MONGO_DB', 'mongodb://unused', raising=False)
+    monkeypatch.setattr(sys.modules['config'], 'DB_NAME', 'test', raising=False)
+    monkeypatch.setattr(sys.modules['utils.encrypt'], 'ecs', lambda value: value, raising=False)
+    motor = types.ModuleType('motor')
+    motor_asyncio = types.ModuleType('motor.motor_asyncio')
+
+    class FakeMotorClient:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def __getitem__(self, _name):
+            return self
+
+        def __getattr__(self, _name):
+            return self
+
+    motor_asyncio.AsyncIOMotorClient = FakeMotorClient
+    motor.motor_asyncio = motor_asyncio
+    monkeypatch.setitem(sys.modules, 'motor', motor)
+    monkeypatch.setitem(sys.modules, 'motor.motor_asyncio', motor_asyncio)
+    spec = importlib.util.spec_from_file_location('real_func_for_count', SRC / 'utils' / 'func.py')
+    real_func = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real_func)
+
+    find_one = AsyncMock(return_value={
+        'user_id': 42,
+        'caption': 'real cap',
+        'session_string': 'enc-session',
+        'bot_token': 'enc-token',
+    })
+    real_func.users_collection = types.SimpleNamespace(find_one=find_one)
+    module.get_user_data = real_func.get_user_data
+    module.filter_settings = real_func.filter_settings
+    # Real get_ubot/get_uclient run against the prefetched doc; fixture
+    # pyrogram.Client is a fake whose start() never touches the network, and
+    # encrypt.dcs is the identity stub. The chain continues through the REAL
+    # process_msg (only the network fetch get_msg is bypassed).
+    sent = []
+
+    class DeliveryClient:
+        async def send_message(self, tcid, text=None, reply_to_message_id=None):
+            sent.append((tcid, text))
+
+    message = types.SimpleNamespace(
+        media=None,
+        text=types.SimpleNamespace(markdown='hello'),
+        caption=None,
+    )
+
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+        return await module.process_msg(
+            DeliveryClient(), DeliveryClient(), message, d, lt, uid, i, oc,
+            settings=settings,
+        )
+
+    module.process_one_link = process_one_link
+
+    task = module.create_task(
+        42, 'single', 1, link_info=('public_channel', 7, 'public', None),
+        caption=None, chat_id='42',
+    )
+
+    asyncio.run(module._dispatch_task(42, task))
+
+    assert find_one.await_count == 1
+    assert find_one.await_args_list[0].args == ({'user_id': 42},)
+    assert task['settings']['caption'] == 'real cap'
+    assert 'session_string' not in task['settings']
+    # Cold clients were established from the prefetched doc, no re-query.
+    assert 42 in module.UB and 42 in module.UC
+    # The real process_msg delivered through the snapshot settings.
+    assert sent == [(42, 'hello')]
+
+
+def test_get_ubot_uses_matching_prefetch_without_query(batch_module):
+    """Epoch-matched prefetch: zero users queries, client built from doc."""
+    module, FakeClient = batch_module
+
+    async def fail_read(*_a, **_k):
+        raise AssertionError("users read despite matching epoch")
+
+    module.get_user_data_key = fail_read
+    module.cred_epoch = lambda _uid: 5
+
+    bot = asyncio.run(
+        module.get_ubot(42, prefetched={'bot_token': 'tok'}, prefetched_epoch=5)
+    )
+
+    assert bot is not None
+    assert bot.kwargs.get('bot_token') == 'tok'
+    assert module.UB[42] is bot
+
+
+def test_get_ubot_discards_stale_prefetch_and_rereads_under_lock(batch_module):
+    """Rotation race: /setbot-/rembot bump the epoch after dispatch; the stale
+    prefetched token must be discarded for a fresh locked read."""
+    module, FakeClient = batch_module
+    calls = []
+
+    async def get_key(uid, key, default=None):
+        calls.append((uid, key))
+        return 'fresh-token'
+
+    module.get_user_data_key = get_key
+    module.cred_epoch = lambda _uid: 1  # rotation happened after dispatch read
+
+    bot = asyncio.run(
+        module.get_ubot(42, prefetched={'bot_token': 'old-token'}, prefetched_epoch=0)
+    )
+
+    assert calls == [(42, 'bot_token')]
+    assert bot.kwargs.get('bot_token') == 'fresh-token'
+
+
+def test_get_ubot_rotation_during_start_never_caches_stale(batch_module, monkeypatch):
+    """TOCTOU regression: a credential rotation landing while Client.start()
+    is in flight must discard the freshly started client, never cache it."""
+    module, FakeClient = batch_module
+    state = {'epoch': 0}
+    module.cred_epoch = lambda _uid: state['epoch']
+
+    async def rotating_start(self):
+        state['epoch'] = 1  # /rembot lands mid-start
+
+    monkeypatch.setattr(FakeClient, 'start', rotating_start)
+
+    bot = asyncio.run(
+        module.get_ubot(42, prefetched={'bot_token': 'tok'}, prefetched_epoch=0)
+    )
+
+    assert bot is None
+    assert 42 not in module.UB
+
+
+def test_get_ubot_evicts_cached_client_after_rotation(batch_module):
+    """Cache-hit epoch check: a client built before rotation is evicted under
+    the lock and rebuilt from a fresh locked read (addsession/rembot path)."""
+    module, FakeClient = batch_module
+    stale = FakeClient('user_42')
+    module.UB[42] = stale
+    calls = []
+
+    async def get_key(uid, key, default=None):
+        calls.append((uid, key))
+        return 'fresh-token'
+
+    module.get_user_data_key = get_key
+    module.cred_epoch = lambda _uid: 7
+
+    bot = asyncio.run(
+        module.get_ubot(42, prefetched={'bot_token': 'old-token'}, prefetched_epoch=3)
+    )
+
+    assert stale.stopped is True
+    assert calls == [(42, 'bot_token')]
+    assert bot is not stale
+    assert bot.kwargs.get('bot_token') == 'fresh-token'
+    assert module.UB[42] is bot
+
+
+def test_get_uclient_evicts_cached_session_client_after_rotation(batch_module):
+    """addsession bumps the epoch without stopping UC; the next get_uclient
+    with a stale prefetch must evict the old session client and rebuild from
+    a freshly read document."""
+    module, FakeClient = batch_module
+    stale = FakeClient('42_client')
+    module.UC[42] = stale
+    reads = []
+
+    async def get_data(uid):
+        reads.append(uid)
+        return {'session_string': 'new-session'}
+
+    async def no_token(uid, key, default=None):
+        return None
+
+    module.get_user_data = get_data
+    module.get_user_data_key = no_token
+    module.cred_epoch = lambda _uid: 2
+
+    client = asyncio.run(
+        module.get_uclient(
+            42,
+            prefetched={'session_string': 'old-session', 'bot_token': None},
+            prefetched_epoch=1,
+        )
+    )
+
+    assert stale.stopped is True
+    assert client is not stale
+    assert module.UC[42] is client
+    assert reads == [42]
+
+
+def test_get_ubot_prefetched_plaintext_token_survives_self_migration(batch_module):
+    """A prefetched legacy PLAINTEXT token migrates itself; the migration's own
+    epoch bump must not trip the post-start guard (data re-synchronized)."""
+    module, FakeClient = batch_module
+    state = {'epoch': 5}
+    module.cred_epoch = lambda _uid: state['epoch']
+    module.dcs = lambda _v: (_ for _ in ()).throw(ValueError('not ciphertext'))
+
+    async def migrate(uid, plaintext):
+        state['epoch'] += 1  # real migrate_user_bot_token bumps on success
+        return True
+
+    module.migrate_user_bot_token = migrate
+    plaintext = '123456789:ABCDEFGHIJklmnopqrstuvwxyz0123456789'
+
+    bot = asyncio.run(
+        module.get_ubot(42, prefetched={'bot_token': plaintext}, prefetched_epoch=5)
+    )
+
+    assert bot is not None
+    assert bot.kwargs.get('bot_token') == plaintext
+    assert module.UB[42] is bot
+
+
+def test_dispatch_captures_epoch_before_document_read(batch_module):
+    """Pairing invariant: epoch is taken BEFORE the doc read, so a rotation
+    completing mid-read yields a conservative mismatch, never stale acceptance."""
+    module, _ = batch_module
+    order = []
+
+    def epoch(_uid):
+        order.append('epoch')
+        return 0
+
+    async def get_data(uid):
+        order.append('read')
+        return None
+
+    module.cred_epoch = epoch
+    module.get_user_data = get_data
+    module.get_ubot = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    module.get_uclient = lambda _uid, **_k: asyncio.sleep(0, result=None)
+    module.process_one_link = lambda *_a, **_k: asyncio.sleep(0, result='Done.')
+
+    task = module.create_task(
+        42, 'single', 1, link_info=('ch', 7, 'public', None),
+        caption=None, chat_id='42',
+    )
+    asyncio.run(module._dispatch_task(42, task))
+
+    assert order == ['epoch', 'read']
+
+
+def test_get_uclient_rotation_during_upd_dlg_never_caches_stale(batch_module, monkeypatch):
+    """The final epoch re-check sits between upd_dlg and the cache insert;
+    a rotation during upd_dlg discards the client (bot fallback)."""
+    module, FakeClient = batch_module
+    state = {'epoch': 3}
+    module.cred_epoch = lambda _uid: state['epoch']
+
+    async def rotating_upd_dlg(_client):
+        state['epoch'] = 4  # login/logout lands during dialog warm-up
+        return True
+
+    monkeypatch.setattr(module, 'upd_dlg', rotating_upd_dlg)
+
+    client = asyncio.run(
+        module.get_uclient(
+            42,
+            prefetched={'session_string': 'sess', 'bot_token': 'tok'},
+            prefetched_epoch=3,
+        )
+    )
+
+    assert client is not None
+    assert client.kwargs.get('bot_token') == 'tok'  # fell back to the bot client
+    assert 42 not in module.UC

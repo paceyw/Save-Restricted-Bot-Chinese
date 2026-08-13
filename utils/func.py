@@ -8,6 +8,7 @@ import re
 import json
 import logging
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import MONGO_DB as MONGO_URI, DB_NAME
@@ -26,6 +27,15 @@ users_collection = db["users"]
 premium_users_collection = db["premium_users"]
 statistics_collection = db["statistics"]
 codedb = db["redeem_code"]
+SETTINGS_DEFAULTS = {
+    "caption": "",
+    "chat_id": None,
+    "replacement_words": {},
+    "delete_words": [],
+    "rename_tag": "",
+    "bot_token": None,
+}
+
 
 
 def is_private_link(link):
@@ -106,6 +116,10 @@ async def save_user_data(user_id, key, value):
         {"$set": {key: value}},
         upsert=True
     )
+    # Generic setter must not bypass the credential epoch: callers such as
+    # plugins.settings.handle_addsession write session_string through here.
+    if key in ("session_string", "bot_token"):
+        bump_cred_epoch(user_id)
    # print(users_collection)
 
 
@@ -113,6 +127,51 @@ async def get_user_data_key(user_id, key, default=None):
     user_data = await users_collection.find_one({"user_id": int(user_id)})
   #  print(f"Fetching key '{key}' for user {user_id}: {user_data}")
     return user_data.get(key, default) if user_data else default
+def filter_settings(user_data) -> dict:
+    """Build a settings snapshot from a users document (or None).
+
+    Copies only declared settings keys: the raw document also carries
+    session_string (encrypted), _id and bookkeeping fields that must not be
+    retained in the per-task snapshot (TASKS history)."""
+    settings = deepcopy(SETTINGS_DEFAULTS)
+    if user_data:
+        for key in SETTINGS_DEFAULTS:
+            if key in user_data:
+                settings[key] = user_data[key]
+    return settings
+
+
+async def get_user_settings(uid) -> dict:
+    """Load one user's settings document and merge it with safe defaults."""
+    user_data = await users_collection.find_one({"user_id": int(uid)})
+    return filter_settings(user_data)
+
+
+
+# Per-user credential generation: bumped by every credential mutation below.
+# Dispatch-time prefetched documents carry the epoch at read time; client
+# establishment re-reads under _client_lock when the epoch moved, so a
+# concurrent /setbot, /rembot, login or logout can never revive stale
+# credentials while steady-state tasks still perform exactly one find_one.
+_CRED_EPOCH = {}
+
+
+def cred_epoch(user_id) -> int:
+    return _CRED_EPOCH.get(int(user_id), 0)
+
+
+def bump_cred_epoch(user_id):
+    _CRED_EPOCH[int(user_id)] = _CRED_EPOCH.get(int(user_id), 0) + 1
+
+
+def prune_cred_epochs(active_uids):
+    """Drop epoch entries for users with no live clients/queues/tasks.
+
+    Invoked by the batch sweeper; keeps _CRED_EPOCH bounded by the number of
+    users with in-flight state rather than by lifetime credential mutations."""
+    for uid in list(_CRED_EPOCH):
+        if uid not in active_uids:
+            _CRED_EPOCH.pop(uid, None)
 
 
 async def get_user_data(user_id):
@@ -135,6 +194,7 @@ async def save_user_session(user_id, session_string):
             upsert=True
         )
         logger.info(f"Saved session for user {user_id}")
+        bump_cred_epoch(user_id)
         return True
     except Exception as e:
         logger.error(f"Error saving session for user {user_id}: {e}")
@@ -148,6 +208,7 @@ async def remove_user_session(user_id):
             {"$unset": {"session_string": ""}}
         )
         logger.info(f"Removed session for user {user_id}")
+        bump_cred_epoch(user_id)
         return True
     except Exception as e:
         logger.error(f"Error removing session for user {user_id}: {e}")
@@ -166,6 +227,7 @@ async def save_user_bot(user_id, bot_token):
             upsert=True
         )
         logger.info(f"Saved bot token for user {user_id}")
+        bump_cred_epoch(user_id)
         return True
     except Exception as e:
         logger.error(f"Error saving bot token for user {user_id}: {e}")
@@ -181,7 +243,10 @@ async def migrate_user_bot_token(user_id, expected_plaintext):
             "updated_at": datetime.now()
         }}
     )
-    return result.matched_count > 0
+    if result.matched_count > 0:
+        bump_cred_epoch(user_id)
+        return True
+    return False
 
 
 async def remove_user_bot(user_id):
@@ -191,30 +256,45 @@ async def remove_user_bot(user_id):
             {"$unset": {"bot_token": ""}}
         )
         logger.info(f"Removed bot token for user {user_id}")
+        bump_cred_epoch(user_id)
         return True
     except Exception as e:
         logger.error(f"Error removing bot token for user {user_id}: {e}")
         return False
 
 
-async def process_text_with_rules(user_id, text):
+def apply_text_rules(text, replacements, delete_words) -> str:
+    """Apply replacement and deletion rules without accessing the database."""
     if not text:
         return ""
-    
+
     try:
-        replacements = await get_user_data_key(user_id, "replacement_words", {})
-        delete_words = await get_user_data_key(user_id, "delete_words", [])
-        
         processed_text = text
         for word, replacement in replacements.items():
             processed_text = processed_text.replace(word, replacement)
-        
+
         if delete_words:
             words = processed_text.split()
-            filtered_words = [w for w in words if w not in delete_words]
+            filtered_words = [word for word in words if word not in delete_words]
             processed_text = " ".join(filtered_words)
-        
+
         return processed_text
+    except Exception as e:
+        logger.error(f"Error processing text with rules: {e}")
+        return text
+
+
+async def process_text_with_rules(user_id, text):
+    if not text:
+        return ""
+
+    try:
+        settings = await get_user_settings(user_id)
+        return apply_text_rules(
+            text,
+            settings.get("replacement_words", {}),
+            settings.get("delete_words", []),
+        )
     except Exception as e:
         logger.error(f"Error processing text with rules: {e}")
         return text
@@ -369,6 +449,31 @@ async def get_video_metadata(file_path):
         return default_values
 
 
+async def init_db_indexes():
+    """Create the indexes required by the users and premium-users collections.
+
+    Index creation is intentionally best effort: deployments may already
+    contain duplicate user records, which makes a unique index fail.  Each
+    index is attempted independently so one failure cannot prevent the
+    remaining indexes from being created or crash application startup.
+    """
+    try:
+        await users_collection.create_index("user_id", unique=True)
+    except Exception as e:
+        logger.warning("Failed to create users user_id index: %s", e)
+
+    try:
+        await premium_users_collection.create_index("user_id", unique=True)
+    except Exception as e:
+        logger.warning("Failed to create premium_users user_id index: %s", e)
+
+    try:
+        await premium_users_collection.create_index("expireAt", expireAfterSeconds=0)
+    except Exception as e:
+        logger.warning("Failed to create premium_users expireAt TTL index: %s", e)
+
+
+
 async def add_premium_user(user_id, duration_value, duration_unit):
     try:
         now = datetime.now()
@@ -402,7 +507,6 @@ async def add_premium_user(user_id, duration_value, duration_unit):
             upsert=True
         )
         
-        await premium_users_collection.create_index("expireAt", expireAfterSeconds=0)
         
         return True, expiry_date
     except Exception as e:

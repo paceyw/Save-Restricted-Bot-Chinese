@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -58,6 +59,7 @@ def _load_settings_module(monkeypatch):
     func = types.ModuleType("utils.func")
     func.get_user_data_key = None
     func.save_user_data = None
+    func.bump_cred_epoch = lambda _uid: None
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     spec = importlib.util.spec_from_file_location(
@@ -86,3 +88,20 @@ def test_active_conversation_filter_only_claims_active_user(monkeypatch):
     assert module.active_conversation_filter(
         None, None, types.SimpleNamespace(from_user=None)
     ) is False
+
+def test_rename_file_uses_snapshot_settings(monkeypatch, tmp_path):
+    module = _load_settings_module(monkeypatch)
+    source = tmp_path / "oldfoo.mp4"
+    source.write_bytes(b"data")
+    renamed = []
+    monkeypatch.setattr(module.os, "rename", lambda old, new: renamed.append((old, new)))
+
+    settings = {
+        "delete_words": ["old"],
+        "rename_tag": "TAG",
+        "replacement_words": {"foo": "bar"},
+    }
+    result = asyncio.run(module.rename_file(str(source), 42, None, settings))
+
+    assert result.endswith("/bar TAG.mp4")
+    assert renamed == [(str(source), result)]
