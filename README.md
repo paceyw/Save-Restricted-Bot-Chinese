@@ -157,7 +157,7 @@ docker compose up -d --build
 
 ```
 ├── main.py              # 启动入口：加载共享客户端 + 动态加载 plugins/
-├── shared_client.py     # Telethon（API-only）+ Pyrogram（收消息）客户端
+├── shared_client.py     # Pyrogram（主 Bot + 可选用户账号）客户端
 ├── config.py            # 从环境变量读取配置；PAY_NOTICE 统一提示文案
 ├── app.py               # Flask 健康检查页（端口 5000）
 ├── plugins/
@@ -179,11 +179,11 @@ docker compose up -d --build
 
 ### 架构说明
 
-机器人同时使用两个 Telegram 库：
-- **Pyrogram**（`app`）：**唯一接收消息的客户端**，所有命令处理器都注册在此。
-- **Telethon**（`client`）：降级为 **API-only** 客户端（不接收消息），仅供少数 API 调用使用。
+机器人运行时统一使用 Pyrogram：
+- **Pyrogram**（`app`）：主 Bot 客户端，**唯一注册命令处理器并接收 Bot 消息**。
+- **Pyrogram**（`userbot`）：配置 `STRING` 时启动的用户账号客户端，用于访问和转发受限内容。
 
-由于同一个 `BOT_TOKEN` 只能由一个 session 接收推送，`shared_client.py` 选择让 Pyrogram 独占 update loop。**这是为什么所有命令必须注册在 Pyrogram 上**——原版的部分命令错误注册在 Telethon 上，正是它们失效的根因。
+`shared_client.py` 负责按顺序启动主 Bot 与可选用户账号；所有命令处理器都注册在 `app` 上，避免多个客户端争用主 Bot 的更新流。
 
 ---
 
