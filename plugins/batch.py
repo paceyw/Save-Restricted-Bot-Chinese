@@ -1059,8 +1059,19 @@ async def process_merged(c, u, msgs, d, uid, oc=None):
     return '❌ 合并上传失败'
 
 
+def _cleanup_downloaded_thumbnail(th, downloads_dir):
+    if not th:
+        return
+    try:
+        if os.path.dirname(os.path.abspath(th)) == downloads_dir and os.path.exists(th):
+            os.remove(th)
+    except Exception:
+        pass
+
 async def process_msg(c, u, m, d, lt, uid, i, oc=None):
     f = None  # downloaded temp file; the finally below guarantees cleanup
+    th = None
+    downloads_dir = os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
     try:
         tcid, rtmid, deliver_via_bot = await resolve_delivery(d)
         did = int(d)
@@ -1253,6 +1264,7 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None):
                 os.remove(f)
             except Exception:
                 pass
+        _cleanup_downloaded_thumbnail(th, downloads_dir)
         
 def parse_link_lines(text):
     """Parse /batch input.

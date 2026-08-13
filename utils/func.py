@@ -212,8 +212,14 @@ async def screenshot(video: str, duration: int, sender: str) -> str | None:
     if os.path.exists(existing_screenshot):
         return existing_screenshot
 
+    from shared_client import _WORKDIR
+    downloads = os.path.join(_WORKDIR, 'downloads')
+    os.makedirs(downloads, exist_ok=True)
+
     time_stamp = hhmmss(duration // 2)
-    output_file = datetime.now().isoformat("_", "seconds") + ".jpg"
+    output_file = os.path.abspath(
+        os.path.join(downloads, datetime.now().isoformat("_", "seconds") + ".jpg")
+    )
 
     cmd = [
         "ffmpeg",
@@ -237,6 +243,26 @@ async def screenshot(video: str, duration: int, sender: str) -> str | None:
     else:
         print(f"FFmpeg Error: {stderr.decode().strip()}")
         return None
+
+async def cleanup_stale_downloads(max_age_min=60):
+    from shared_client import _WORKDIR
+
+    downloads = os.path.join(_WORKDIR, 'downloads')
+    if not os.path.isdir(downloads):
+        return
+
+    cutoff = time.time() - (max_age_min * 60)
+    removed = 0
+    for root, _, filenames in os.walk(downloads):
+        for filename in filenames:
+            path = os.path.join(root, filename)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except Exception:
+                pass
+    logger.info("Removed %d stale downloads", removed)
 
 
 async def ensure_audio_track(file_path):

@@ -40,4 +40,6 @@ async def start_client():
         await client.disconnect()
         await client.connect()
         print("SpyLib started (API-only, no update loop)...")
+    from utils.func import cleanup_stale_downloads
+    await cleanup_stale_downloads()
     return client, app, userbot
