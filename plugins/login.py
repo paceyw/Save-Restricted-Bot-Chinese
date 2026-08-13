@@ -27,7 +27,16 @@ except ImportError:
         if lock is None:
             lock = _LOGIN_LOCKS[user_id] = asyncio.Lock()
         return lock
+try:
+    from plugins.batch import _ensure_sweeper
+except Exception:
+    def _ensure_sweeper():
+        return None
 from utils.custom_filters import login_in_progress, set_user_step, get_user_step
+try:
+    from utils.custom_filters import user_steps
+except ImportError:
+    user_steps = None
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 model = "v3saver Team SPY"
@@ -42,6 +51,7 @@ login_locks = {}
 
 
 def _get_login_lock(user_id):
+    _ensure_sweeper()
     lock = login_locks.get(user_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -85,13 +95,18 @@ async def _clear_login_state(user_id, temp_client=None):
     _set_login_step(user_id, None)
 
 
-async def _stop_cached_user_client(user_id):
+async def _stop_cached_user_client_locked(user_id):
     old_client = UC.pop(user_id, None)
     if old_client is not None and old_client is not Y:
         try:
             await old_client.stop()
         except Exception as e:
             logger.warning(f'Error stopping cached user client for {user_id}: {e}')
+
+
+async def _stop_cached_user_client(user_id):
+    async with _client_lock(user_id):
+        await _stop_cached_user_client_locked(user_id)
 
 
 async def _complete_login(user_id, status_msg, temp_client, session_string):
@@ -173,6 +188,85 @@ async def cleanup_temp_login(user_id, temp_client=None):
             os.remove(os.path.join(_WORKDIR, f"temp_{user_id}.session{ext}"))
         except OSError:
             pass
+async def _sweep_login_state():
+    """Expire idle login flows and discard their lock-only state."""
+    now = time.monotonic()
+
+    for user_id in list(login_cache):
+        cache = login_cache.get(user_id)
+        if cache is None:
+            continue
+        created_at = cache.get('created_at')
+        if created_at is None:
+            cache['created_at'] = now
+            continue
+        if now - created_at <= LOGIN_TTL:
+            continue
+
+        lock = login_locks.get(user_id)
+        if lock is not None and lock.locked():
+            continue
+        if lock is None:
+            lock = _get_login_lock(user_id)
+        async with lock:
+            cache = login_cache.get(user_id)
+            if cache is None:
+                continue
+            created_at = cache.get('created_at')
+            if created_at is None:
+                cache['created_at'] = now
+                continue
+            if now - created_at <= LOGIN_TTL:
+                continue
+            try:
+                await cleanup_temp_login(user_id)
+            except Exception as exc:
+                logger.warning("Error cleaning expired login state for %s: %s", user_id, exc)
+            login_cache.pop(user_id, None)
+            login_step_times.pop(user_id, None)
+            set_user_step(user_id, None)
+
+    for user_id, timestamp in list(login_step_times.items()):
+        if user_id in login_cache:
+            continue
+        lock = login_locks.get(user_id)
+        if lock is not None and lock.locked():
+            continue
+        if lock is None:
+            lock = _get_login_lock(user_id)
+        async with lock:
+            if user_id in login_cache:
+                continue
+            step = get_user_step(user_id)
+            if step is None:
+                login_step_times.pop(user_id, None)
+                continue
+            if now - timestamp > LOGIN_TTL:
+                set_user_step(user_id, None)
+                login_step_times.pop(user_id, None)
+
+    if user_steps is not None:
+        for user_id in list(user_steps):
+            if user_id in login_cache or user_id in login_step_times:
+                continue
+            lock = login_locks.get(user_id)
+            if lock is not None and lock.locked():
+                continue
+            if lock is None:
+                lock = _get_login_lock(user_id)
+            async with lock:
+                if user_id in login_cache or user_id in login_step_times:
+                    continue
+                set_user_step(user_id, None)
+
+    for lock_map in (login_locks, globals().get('_LOGIN_LOCKS', {})):
+        for user_id, lock in list(lock_map.items()):
+            if (
+                user_id not in login_cache
+                and get_user_step(user_id) is None
+                and not lock.locked()
+            ):
+                lock_map.pop(user_id, None)
 
 async def request_login_code(user_id, temp_client, phone):
     sent_code = await temp_client.send_code(phone)
@@ -186,6 +280,7 @@ async def request_login_code(user_id, temp_client, phone):
 
 @bot.on_message(filters.command('login'))
 async def login_command(client, message):
+    _ensure_sweeper()
     user_id = message.from_user.id
     async with _get_login_lock(user_id):
         await _clear_login_state(user_id)
@@ -267,6 +362,7 @@ async def rem_bot_token(C, m):
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 'pay',
     'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
 async def handle_login_steps(client, message):
+    _ensure_sweeper()
     user_id = message.from_user.id
     async with _get_login_lock(user_id):
         status_msg = login_cache.get(user_id, {}).get('status_msg')
@@ -513,6 +609,8 @@ async def logout_command(client, message):
             await _stop_cached_user_client(user_id)
             await edit_message_safely(status_msg,
                 '❌ 未找到您账户的有效会话。')
+
+
             return
         encss = session_data['session_string']
         session_string = dcs(encss)
@@ -556,3 +654,8 @@ async def logout_command(client, message):
         except Exception:
             pass
 
+try:
+    from plugins.batch import register_sweep_hook
+    register_sweep_hook(_sweep_login_state)
+except Exception:
+    pass
