@@ -3,6 +3,7 @@
 # See LICENSE file in the repository root for full license text.
 
 import os, re, time, asyncio, json, asyncio 
+import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from pyrogram.errors import UserNotParticipant, FloodWait
@@ -10,15 +11,17 @@ from config import API_ID, API_HASH, LOG_GROUP, STRING, FORCE_SUB, FREEMIUM_LIMI
 from utils.func import get_user_data, screenshot, thumbnail, get_video_metadata, ensure_audio_track
 from utils.func import get_user_data_key, process_text_with_rules, is_premium_user, E
 try:
-    from utils.func import save_user_bot
+    from utils.func import migrate_user_bot_token
 except ImportError:
-    save_user_bot = None
+    migrate_user_bot_token = None
 from shared_client import app as X, _WORKDIR
 from plugins.settings import rename_file
 from plugins.start import subscribe as sub
 from utils.custom_filters import login_in_progress
 from utils.encrypt import dcs
 from typing import Dict, Any, Optional
+logger = logging.getLogger(__name__)
+_PLAINTEXT_BOT_TOKEN_PATTERN = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
 
 
 Y = None if not STRING else __import__('shared_client').userbot
@@ -506,12 +509,26 @@ def _client_lock(uid):
 
 
 async def get_ubot(uid):
-    bt = await get_user_data_key(uid, "bot_token", None)
+    stored_bt = await get_user_data_key(uid, "bot_token", None)
     try:
-        bt = dcs(bt)
-    except Exception:
-        if save_user_bot is not None and bt is not None:
-            await save_user_bot(uid, bt)
+        bt = dcs(stored_bt)
+    except Exception as e:
+        candidate = stored_bt if isinstance(stored_bt, str) else None
+        if candidate and _PLAINTEXT_BOT_TOKEN_PATTERN.fullmatch(candidate):
+            bt = candidate
+            if migrate_user_bot_token is not None:
+                try:
+                    await migrate_user_bot_token(uid, candidate)
+                except Exception as migration_error:
+                    logger.error(
+                        "Error migrating plaintext bot token for user %s: %s",
+                        uid,
+                        migration_error,
+                    )
+        else:
+            if stored_bt:
+                logger.error("Invalid stored bot token for user %s: %s", uid, e)
+            bt = None
     if isinstance(bt, str):
         bt = bt.strip()
     if not bt:

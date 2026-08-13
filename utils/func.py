@@ -173,6 +173,22 @@ async def save_user_bot(user_id, bot_token):
         return False
 
 
+async def migrate_user_bot_token(user_id, expected_plaintext):
+    try:
+        encrypted_bot_token = ecs(expected_plaintext)
+        result = await users_collection.update_one(
+            {"user_id": user_id, "bot_token": expected_plaintext},
+            {"$set": {
+                "bot_token": encrypted_bot_token,
+                "updated_at": datetime.now()
+            }}
+        )
+        return result.matched_count > 0
+    except Exception as e:
+        logger.error(f"Error migrating bot token for user {user_id}: {e}")
+        return False
+
+
 async def remove_user_bot(user_id):
     try:
         await users_collection.update_one(
