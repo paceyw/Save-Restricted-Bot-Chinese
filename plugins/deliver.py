@@ -7,6 +7,12 @@ import time
 from pyrogram.errors import FloodWait
 from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from config import LOG_GROUP, MAX_FLOOD_RETRIES, UPLOAD_INTERVAL
+try:
+    from config import PROGRESS_MIN_INTERVAL
+except ImportError:
+    # Keep lightweight legacy config shims importable until they expose the
+    # progress-throttle setting.
+    PROGRESS_MIN_INTERVAL = 3.0
 from shared_client import app as main_bot, _WORKDIR
 from utils.func import (
     apply_text_rules, screenshot, thumbnail, get_video_metadata,
@@ -28,10 +34,16 @@ async def prog(c, t, C, h, m, st, fp=None):
     p = c / t * 100
     interval = 10 if t >= 100 * 1024 * 1024 else 20 if t >= 50 * 1024 * 1024 else 30 if t >= 10 * 1024 * 1024 else 50
     step = int(p // interval) * interval
+    now = time.time()
     previous = progress_state.get(m)
-    previous_step = previous[0] if isinstance(previous, tuple) else previous
-    if m not in progress_state or previous_step != step or p >= 100:
-        progress_state[m] = (step, time.time())
+    previous_ts = previous[1] if isinstance(previous, tuple) else None
+    if (
+        m not in progress_state
+        or previous_ts is None
+        or now - previous_ts >= PROGRESS_MIN_INTERVAL
+        or p >= 100
+    ):
+        progress_state[m] = (step, now)
         c_mb = c / (1024 * 1024)
         t_mb = t / (1024 * 1024)
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
@@ -194,7 +206,7 @@ def _flood_secs(e):
     return getattr(e, 'value', getattr(e, 'x', 10))
 
 
-async def with_flood_retry(coro_fn, context='', max_retries=None):
+async def with_flood_retry(coro_fn, context='', max_retries=None, on_flood=None):
     """Call ``coro_fn()`` (a zero-arg async factory), retrying on FloodWait.
 
     Waits the server-requested seconds, then retries. After MAX_FLOOD_RETRIES
@@ -210,6 +222,11 @@ async def with_flood_retry(coro_fn, context='', max_retries=None):
             secs = _flood_secs(e)
             if attempt < retries - 1:
                 print(f'FloodWait {secs}s on {context} (attempt {attempt + 1}/{retries}), waiting')
+                if on_flood is not None:
+                    try:
+                        on_flood(secs)
+                    except Exception as hook_error:
+                        print(f'FloodWait hook failed on {context}: {hook_error}')
                 await asyncio.sleep(secs)
             else:
                 print(f'FloodWait {secs}s on {context}: retries exhausted')
@@ -585,9 +602,145 @@ def _cleanup_downloaded_thumbnail(th, downloads_dir):
     except Exception:
         pass
 
-async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
-    f = None  # downloaded temp file; the finally below guarantees cleanup
-    th = None
+class _PreparedMsg:
+    """Message prepared for a later finish phase.
+
+    ``kind`` is one of ``'text'``, ``'direct'`` or ``'downloaded'``.
+    Every instance carries the delivery context needed by
+    :func:`finish_prepared_msg`; downloaded instances additionally have
+    ``f`` and ``p`` for the temporary file and progress message.
+    """
+
+    def __init__(self, kind, **fields):
+        self.kind = kind
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class _PreparedLink:
+    """A prefetched link.
+
+    ``kind == 'album'`` stores ``msgs``, ``src_lt`` and ``src_chat`` plus
+    ``ubot``, ``uc``, ``d``, ``uid``, ``oc`` and ``settings`` for
+    :func:`process_album`.  ``kind == 'single'`` stores the
+    :class:`_PreparedMsg` in ``prepared``.
+    """
+
+    def __init__(self, kind, **fields):
+        self.kind = kind
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+def _cleanup_prepared(prep):
+    if prep is None:
+        return
+    paths = []
+    for candidate in (
+        getattr(prep, 'f', None),
+        getattr(prep, 'download_path', None),
+    ):
+        if candidate and isinstance(candidate, str) and candidate not in paths:
+            paths.append(candidate)
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    _cleanup_downloaded_thumbnail(
+        getattr(prep, 'th', None),
+        getattr(prep, 'downloads_dir', ''),
+    )
+
+
+async def _cancel_cleanup_prepared(prep):
+    """Best-effort cleanup for cancellation while preparation is awaiting."""
+    _cleanup_prepared(prep)
+    if prep is None or getattr(prep, '_cancel_cleanup_done', False):
+        return
+    prep._cancel_cleanup_done = True
+    try:
+        if getattr(prep, 'p', None) is not None:
+            await main_bot.delete_messages(prep.did, prep.p.id)
+    except BaseException:
+        pass
+
+
+async def _download_prepared_msg(prep):
+    """Allocate the progress message and download a media message.
+
+    The helper is shared by the normal re-upload preparation path and by the
+    direct-send fallback in ``finish_prepared_msg``.  It deliberately performs
+    no post-download work or delivery send.
+    """
+    try:
+        prep.st = time.time()
+        prep.p = await main_bot.send_message(prep.did, '正在下载...')
+
+        # A preparation can overlap the preceding finish, so nanoseconds are
+        # required here.  In particular, document names used to have only
+        # second-resolution uniqueness and could overwrite the previous item.
+        c_name = f'{prep.uid}_{time.time_ns()}'
+        m = prep.m
+        if m.video:
+            file_name = m.video.file_name
+            if not file_name:
+                file_name = f'{time.time()}.mp4'
+                c_name = sanitize(f'{prep.uid}_{time.time_ns()}.mp4')
+        elif m.audio:
+            file_name = m.audio.file_name
+            if not file_name:
+                file_name = f'{time.time()}.mp3'
+                c_name = sanitize(f'{prep.uid}_{time.time_ns()}.mp3')
+        elif m.document:
+            file_name = m.document.file_name
+            if not file_name:
+                file_name = f'{time.time()}'
+            else:
+                c_name = sanitize(f'{prep.uid}_{time.time_ns()}_{file_name}')
+        elif m.photo:
+            file_name = f'{time.time()}.jpg'
+            c_name = sanitize(f'{prep.uid}_{time.time_ns()}.jpg')
+
+        # pyrofork download_media resolves relative names against PARENT_DIR
+        # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
+        # client workdir. Pass an absolute path under the writable volume.
+        download_path = os.path.join(_WORKDIR, 'downloads', c_name)
+        prep.download_path = download_path
+        # Download with the client that fetched the message: bot_fetched is the
+        # prepare-time snapshot of (public link + fetch_origin False), i.e. the
+        # bot holds access; otherwise the user client holds access. The live
+        # fetch_origin entry is deliberately NOT re-read here: a concurrent
+        # prefetch may have overwritten it for this chat.
+        dl_client = (prep.c or prep.u) if getattr(prep, 'bot_fetched', False) else (prep.u or prep.c)
+        prep.f = await dl_client.download_media(
+            m,
+            file_name=download_path,
+            progress=prog,
+            progress_args=(main_bot, prep.did, prep.p.id, prep.st),
+        )
+
+        if not prep.f:
+            await main_bot.edit_message_text(prep.did, prep.p.id, '失败。')
+            return 'Failed.'
+        prep.kind = 'downloaded'
+        return None
+    except asyncio.CancelledError:
+        await _cancel_cleanup_prepared(prep)
+        raise
+
+
+async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
+    """Prepare one message without sending delivered content.
+
+    The returned pair is ``(result, prepared)``.  Terminal failures return a
+    status and ``None``; text, direct-send candidates and downloaded media
+    return ``None`` plus a :class:`_PreparedMsg` of the corresponding kind.
+    Only the progress message is sent here; delivered-content sends belong to
+    :func:`finish_prepared_msg`.
+    """
+    prep = None
     downloads_dir = os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
     try:
         tcid, rtmid, deliver_via_bot = await resolve_delivery(d, settings)
@@ -605,185 +758,327 @@ async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
                 )
             user_cap = settings.get('caption', '')
             ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
-            
-            if lt == 'public' and not fetch_origin.get((uid, i), False):
-                # Direct file reference send requires the file reference holder's client.
-                sent, error = await send_direct(c, m, tcid, ft, rtmid)
-                if sent:
-                    return 'Sent directly.'
-                if error and 'PEER_ID_INVALID' in error:
-                    return (
-                        '发送失败：目标聊天不可用。请在 /settings 设置正确的 '
-                        '-100... 聊天 ID，并将 /setbot 机器人加入该频道且设为管理员。'
+            sender = c if deliver_via_bot else (u or c)
+            direct = lt == 'public' and not fetch_origin.get((uid, i), False)
+            prep = _PreparedMsg(
+                'direct' if direct else 'downloaded',
+                c=c,
+                u=u,
+                m=m,
+                d=d,
+                lt=lt,
+                uid=uid,
+                i=i,
+                oc=oc,
+                settings=settings,
+                tcid=tcid,
+                rtmid=rtmid,
+                ft=ft,
+                sender=sender,
+                did=did,
+                # Snapshot of the fetch-origin marker at prepare time. A
+                # deferred (kind='direct') download runs during finish, where
+                # a concurrent prefetch's get_msg for the same chat may have
+                # overwritten fetch_origin — the client that actually fetched
+                # THIS message must be pinned here.
+                bot_fetched=direct,
+                f=None,
+                p=None,
+                st=None,
+                th=None,
+                downloads_dir=downloads_dir,
+            )
+            if direct:
+                return None, prep
+            result = await _download_prepared_msg(prep)
+            if result is not None:
+                _cleanup_prepared(prep)
+                return result, None
+            return None, prep
+
+        if m.text:
+            sender = c if deliver_via_bot else (u or c)
+            prep = _PreparedMsg(
+                'text',
+                c=c,
+                u=u,
+                m=m,
+                d=d,
+                lt=lt,
+                uid=uid,
+                i=i,
+                oc=oc,
+                settings=settings,
+                tcid=tcid,
+                rtmid=rtmid,
+                did=did,
+                ft=None,
+                sender=sender,
+                text=oc if oc is not None else m.text.markdown,
+                f=None,
+                p=None,
+                th=None,
+                downloads_dir=downloads_dir,
+            )
+            return None, prep
+
+        # Preserve the historical implicit-None result for an unsupported
+        # message shape.  Such a message has no phase-2 work to carry.
+        return None, None
+    except asyncio.CancelledError:
+        await _cancel_cleanup_prepared(prep)
+        raise
+    except Exception as e:
+        _cleanup_prepared(prep)
+        return f'Error: {str(e)[:50]}', None
+
+
+async def _finish_downloaded_msg(prep):
+    """Finish a downloaded message, preserving process_msg's old body."""
+    f = prep.f
+    th = prep.th
+    try:
+        await main_bot.edit_message_text(prep.did, prep.p.id, '正在重命名...')
+        if (
+            (prep.m.video and prep.m.video.file_name)
+            or (prep.m.audio and prep.m.audio.file_name)
+            or (prep.m.document and prep.m.document.file_name)
+        ):
+            f = await rename_file(f, prep.d, prep.p, prep.settings)
+            prep.f = f
+
+        fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
+        th = thumbnail(prep.d)
+        prep.th = th
+
+        if fsize > 2 and premium_userbot:
+            st = time.time()
+            await main_bot.edit_message_text(
+                prep.did, prep.p.id, '文件大于 2GB，正在使用备用方法...'
+            )
+            await upd_dlg(premium_userbot)
+            mtd = await get_video_metadata(f)
+            dur, h, w = mtd['duration'], mtd['width'], mtd['height']  # PRE-EXISTING: h/w assignment follows the historical (swapped) order;
+            # do not 'fix' inside the Phase 7 split — tracked as follow-up
+            th = await screenshot(f, dur, prep.d)
+            prep.th = th
+
+            send_funcs = {
+                'video': premium_userbot.send_video,
+                'video_note': premium_userbot.send_video_note,
+                'voice': premium_userbot.send_voice,
+                'audio': premium_userbot.send_audio,
+                'photo': premium_userbot.send_photo,
+                'document': premium_userbot.send_document,
+            }
+
+            for mtype, func in send_funcs.items():
+                if f.endswith('.mp4'):
+                    mtype = 'video'
+                if getattr(prep.m, mtype, None):
+                    sent = await func(
+                        LOG_GROUP,
+                        f,
+                        thumb=th if mtype == 'video' else None,
+                        duration=dur if mtype == 'video' else None,
+                        height=h if mtype == 'video' else None,
+                        width=w if mtype == 'video' else None,
+                        caption=(
+                            prep.ft
+                            if prep.m.caption and mtype not in ['video_note', 'voice']
+                            else None
+                        ),
+                        reply_to_message_id=prep.rtmid,
+                        progress=prog,
+                        progress_args=(main_bot, prep.did, prep.p.id, st, f),
                     )
-                # Stale or cross-client file references (MEDIA_EMPTY) are
-                # recoverable: fall through to download + re-upload instead
-                # of failing the task.
-                print(f'Direct send failed ({error}), falling back to re-upload')
-            
-            # Sender selection: a custom bot CANNOT message a user who never
-            # started it (PEER_ID_INVALID on resolve_peer). When delivering to
-            # a bot-managed target (configured chat or LOG_GROUP), use the
-            # custom bot — it must be a member there. When falling back to the
-            # user's own chat, use the user client (messaging self always works).
-            # Progress reports go through the main bot (main_bot) to the user's bot
-            # chat, so channels are never spammed and the client always edits
-            # its own messages.
-            sender = c if deliver_via_bot else (u or c)
-            st = time.time()
-            p = await main_bot.send_message(did, '正在下载...')
+                    break
+            else:
+                sent = await premium_userbot.send_document(
+                    LOG_GROUP,
+                    f,
+                    thumb=th,
+                    caption=prep.ft if prep.m.caption else None,
+                    reply_to_message_id=prep.rtmid,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                )
 
-            # Temp names carry uid + timestamp: concurrent users must never
-            # share a downloads/ path (overwrite / cross-delivery / premature
-            # cleanup).
-            c_name = f"{uid}_{time.time()}"
-            if m.video:
-                file_name = m.video.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp4"
-                    c_name = sanitize(f"{uid}_{file_name}")
-            elif m.audio:
-                file_name = m.audio.file_name
-                if not file_name:
-                    file_name = f"{time.time()}.mp3"
-                    c_name = sanitize(f"{uid}_{file_name}")
-            elif m.document:
-                file_name = m.document.file_name
-                if not file_name:
-                    file_name = f"{time.time()}"
-                else:
-                    c_name = sanitize(f"{uid}_{int(time.time())}_{file_name}")
-            elif m.photo:
-                file_name = f"{time.time()}.jpg"
-                c_name = sanitize(f"{uid}_{file_name}")
-    
-            # pyrofork download_media resolves relative names against PARENT_DIR
-            # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
-            # client workdir. Pass an absolute path under the writable volume.
-            download_path = os.path.join(_WORKDIR, 'downloads', c_name)
-            # Download with the client that fetched the message: fetch_origin False on a
-            # public link means the bot fetched it (user client may be absent
-            # or not a member); otherwise the user client holds access.
-            dl_client = (c or u) if (lt == 'public' and not fetch_origin.get((uid, i), False)) else (u or c)
-            f = await dl_client.download_media(m, file_name=download_path, progress=prog, progress_args=(main_bot, did, p.id, st))
-            
-            if not f:
-                await main_bot.edit_message_text(did, p.id, '失败。')
-                return 'Failed.'
-            
-            await main_bot.edit_message_text(did, p.id, '正在重命名...')
-            if (
-                (m.video and m.video.file_name) or
-                (m.audio and m.audio.file_name) or
-                (m.document and m.document.file_name)
-            ):
-                f = await rename_file(f, d, p, settings)
-            
-            fsize = os.path.getsize(f) / (1024 * 1024 * 1024)
-            th = thumbnail(d)
-            
-            if fsize > 2 and premium_userbot:
-                st = time.time()
-                await main_bot.edit_message_text(did, p.id, '文件大于 2GB，正在使用备用方法...')
-                await upd_dlg(premium_userbot)
-                mtd = await get_video_metadata(f)
-                dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                th = await screenshot(f, dur, d)
-                
-                send_funcs = {'video': premium_userbot.send_video, 'video_note': premium_userbot.send_video_note, 
-                            'voice': premium_userbot.send_voice, 'audio': premium_userbot.send_audio, 
-                            'photo': premium_userbot.send_photo, 'document': premium_userbot.send_document}
-                
-                for mtype, func in send_funcs.items():
-                    if f.endswith('.mp4'): mtype = 'video'
-                    if getattr(m, mtype, None):
-                        sent = await func(LOG_GROUP, f, thumb=th if mtype == 'video' else None, 
-                                        duration=dur if mtype == 'video' else None,
-                                        height=h if mtype == 'video' else None,
-                                        width=w if mtype == 'video' else None,
-                                        caption=ft if m.caption and mtype not in ['video_note', 'voice'] else None, 
-                                        reply_to_message_id=rtmid, progress=prog, progress_args=(main_bot, did, p.id, st, f))
-                        break
-                else:
-                    sent = await premium_userbot.send_document(LOG_GROUP, f, thumb=th, caption=ft if m.caption else None,
-                                                reply_to_message_id=rtmid, progress=prog, progress_args=(main_bot, did, p.id, st, f))
-                
-                await sender.copy_message(tcid, LOG_GROUP, sent.id)
-                os.remove(f)
-                await _safe_cleanup(main_bot.delete_messages(did, p.id))
-                
-                return 'Done (Large file).'
-            
-            await main_bot.edit_message_text(did, p.id, '正在上传...')
-            st = time.time()
-
-            try:
-                file_ext = os.path.splitext(f)[1].lower().lstrip('.')
-                if m.video or (m.document and file_ext in VIDEO_EXTENSIONS):
-                    mtd = await get_video_metadata(f)
-                    dur, h, w = mtd['duration'], mtd['width'], mtd['height']
-                    th = await screenshot(f, dur, d)
-                    await sender.send_video(tcid, video=f, caption=ft if m.caption else None, 
-                                    thumb=th, width=w, height=h, duration=dur, 
-                                    progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                    reply_to_message_id=rtmid)
-                elif m.video_note:
-                    await sender.send_video_note(tcid, video_note=f, progress=prog, 
-                                        progress_args=(main_bot, did, p.id, st, f), reply_to_message_id=rtmid)
-                elif m.voice:
-                    await sender.send_voice(tcid, f, progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                    reply_to_message_id=rtmid)
-                elif m.sticker:
-                    await sender.send_sticker(tcid, f, reply_to_message_id=rtmid)
-                elif m.audio or (m.document and file_ext in AUDIO_EXTENSIONS):
-                    await sender.send_audio(tcid, audio=f, caption=ft if m.caption else None, 
-                                    thumb=th, progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                    reply_to_message_id=rtmid)
-                elif m.photo:
-                    await sender.send_photo(tcid, photo=f, caption=ft if m.caption else None, 
-                                    progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                    reply_to_message_id=rtmid)
-                elif m.document:
-                    await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                        reply_to_message_id=rtmid)
-                else:
-                    await sender.send_document(tcid, document=f, caption=ft if m.caption else None, 
-                                        progress=prog, progress_args=(main_bot, did, p.id, st, f), 
-                                        reply_to_message_id=rtmid)
-            except Exception as e:
-                err = str(e)
-                if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
-                    hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
-                else:
-                    hint = ''
-                try:
-                    await main_bot.edit_message_text(did, p.id, f'上传失败：{err[:60]} {hint}')
-                except Exception:
-                    pass
-                if os.path.exists(f): os.remove(f)
-                return f'上传失败：{err[:60]} {hint}'.strip()
-            
+            await prep.sender.copy_message(prep.tcid, LOG_GROUP, sent.id)
             os.remove(f)
-            await _safe_cleanup(main_bot.delete_messages(did, p.id))
-            
-            return 'Done.'
-            
-        elif m.text:
-            sender = c if deliver_via_bot else (u or c)
-            await sender.send_message(tcid, text=oc if oc is not None else m.text.markdown, reply_to_message_id=rtmid)
-            return 'Sent.'
+            await _safe_cleanup(main_bot.delete_messages(prep.did, prep.p.id))
+            return 'Done (Large file).'
+
+        await main_bot.edit_message_text(prep.did, prep.p.id, '正在上传...')
+        st = time.time()
+
+        try:
+            file_ext = os.path.splitext(f)[1].lower().lstrip('.')
+            if prep.m.video or (prep.m.document and file_ext in VIDEO_EXTENSIONS):
+                mtd = await get_video_metadata(f)
+                dur, h, w = mtd['duration'], mtd['width'], mtd['height']  # PRE-EXISTING: h/w assignment follows the historical (swapped) order;
+                # do not 'fix' inside the Phase 7 split — tracked as follow-up
+                th = await screenshot(f, dur, prep.d)
+                prep.th = th
+                await prep.sender.send_video(
+                    prep.tcid,
+                    video=f,
+                    caption=prep.ft if prep.m.caption else None,
+                    thumb=th,
+                    width=w,
+                    height=h,
+                    duration=dur,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            elif prep.m.video_note:
+                await prep.sender.send_video_note(
+                    prep.tcid,
+                    video_note=f,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            elif prep.m.voice:
+                await prep.sender.send_voice(
+                    prep.tcid,
+                    f,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            elif prep.m.sticker:
+                await prep.sender.send_sticker(
+                    prep.tcid, f, reply_to_message_id=prep.rtmid
+                )
+            elif prep.m.audio or (prep.m.document and file_ext in AUDIO_EXTENSIONS):
+                await prep.sender.send_audio(
+                    prep.tcid,
+                    audio=f,
+                    caption=prep.ft if prep.m.caption else None,
+                    thumb=th,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            elif prep.m.photo:
+                await prep.sender.send_photo(
+                    prep.tcid,
+                    photo=f,
+                    caption=prep.ft if prep.m.caption else None,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            elif prep.m.document:
+                await prep.sender.send_document(
+                    prep.tcid,
+                    document=f,
+                    caption=prep.ft if prep.m.caption else None,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+            else:
+                await prep.sender.send_document(
+                    prep.tcid,
+                    document=f,
+                    caption=prep.ft if prep.m.caption else None,
+                    progress=prog,
+                    progress_args=(main_bot, prep.did, prep.p.id, st, f),
+                    reply_to_message_id=prep.rtmid,
+                )
+        except Exception as e:
+            err = str(e)
+            if 'PEER_ID_INVALID' in err or 'CHAT_WRITE_FORBIDDEN' in err or 'ADMIN' in err.upper():
+                hint = '请将 /setbot 的机器人加入目标频道并授予发帖权限。'
+            else:
+                hint = ''
+            try:
+                await main_bot.edit_message_text(
+                    prep.did, prep.p.id, f'上传失败：{err[:60]} {hint}'
+                )
+            except Exception:
+                pass
+            if os.path.exists(f):
+                os.remove(f)
+            return f'上传失败：{err[:60]} {hint}'.strip()
+
+        os.remove(f)
+        await _safe_cleanup(main_bot.delete_messages(prep.did, prep.p.id))
+        return 'Done.'
     except Exception as e:
         return f'Error: {str(e)[:50]}'
     finally:
-        # Any mid-processing exception (rename, metadata, upload setup) would
-        # otherwise strand the downloaded file in downloads/ forever.
-        if f and isinstance(f, str) and os.path.exists(f):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-        _cleanup_downloaded_thumbnail(th, downloads_dir)
+        prep.f = f
+        prep.th = th
+        _cleanup_prepared(prep)
+
+
+async def finish_prepared_msg(prep):
+    """Send the content represented by a :class:`_PreparedMsg`."""
+    if prep.kind == 'text':
+        try:
+            await prep.sender.send_message(
+                prep.tcid,
+                text=prep.text,
+                reply_to_message_id=prep.rtmid,
+            )
+            return 'Sent.'
+        except Exception as e:
+            return f'Error: {str(e)[:50]}'
+
+    if prep.kind == 'direct':
+        try:
+            sent, error = await send_direct(
+                prep.c, prep.m, prep.tcid, prep.ft, prep.rtmid
+            )
+            if sent:
+                return 'Sent directly.'
+            if error and 'PEER_ID_INVALID' in error:
+                return (
+                    '发送失败：目标聊天不可用。请在 /settings 设置正确的 '
+                    '-100... 聊天 ID，并将 /setbot 机器人加入该频道且设为管理员。'
+                )
+            print(f'Direct send failed ({error}), falling back to re-upload')
+            result = await _download_prepared_msg(prep)
+            if result is not None:
+                return result
+            return await _finish_downloaded_msg(prep)
+        except Exception as e:
+            _cleanup_prepared(prep)
+            return f'Error: {str(e)[:50]}'
+
+    if prep.kind == 'downloaded':
+        return await _finish_downloaded_msg(prep)
+    return None
+
+
+async def abort_prepared_msg(prep):
+    """Cancel a prepared downloaded message without propagating cleanup errors."""
+    if prep is None or getattr(prep, 'kind', None) != 'downloaded':
+        return
+    try:
+        _cleanup_prepared(prep)
+    except Exception:
+        pass
+    try:
+        if getattr(prep, 'p', None) is not None:
+            await main_bot.delete_messages(prep.did, prep.p.id)
+    except Exception:
+        pass
+
+
+async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
+    result, prep = await prepare_msg(
+        c, u, m, d, lt, uid, i, oc, settings=settings
+    )
+    if prep is None:
+        return result
+    return await finish_prepared_msg(prep)
+
+
 def _ok(res):
     # Success strings are either process_msg's English markers or the
     # emoji-prefixed album results (✅ full, ⚠️ partial per-item fallback).
@@ -804,15 +1099,20 @@ async def process_one_link(
     )
 
 
-async def _process_one_link(
+async def prepare_one_link(
     ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
 ):
-    """Fetch and deliver one t.me link (expanding albums). Returns a status string."""
+    """Prepare one link into a :class:`_PreparedLink` without delivery sends.
+
+    The return pair is ``(result, prepared_link)``.  Album links carry the
+    original media messages and source coordinates; single links carry the
+    :class:`_PreparedMsg` returned by :func:`prepare_msg`.
+    """
     if not uc and lt != 'public':
-        return '用户会话无效或未登录，请先使用 /login。'
+        return '用户会话无效或未登录，请先使用 /login。', None
     msg = await get_msg(ubot, uc, i, s, lt, uid, comment_id)
     if not msg:
-        return '未找到消息'
+        return '未找到消息', None
     msgs = [msg]
     # Comment links resolve to a discussion-group message whose chat differs
     # from the URL's channel. Use the message's own chat for media-group
@@ -820,7 +1120,11 @@ async def _process_one_link(
     src_chat = msg.chat.id if getattr(msg, 'chat', None) else i
     src_lt = 'private' if comment_id else lt
     if getattr(msg, 'media_group_id', None):
-        fetch_client = uc if (uc and (src_lt == 'private' or fetch_origin.get((uid, src_chat), False))) else ubot
+        fetch_client = (
+            uc
+            if (uc and (src_lt == 'private' or fetch_origin.get((uid, src_chat), False)))
+            else ubot
+        )
         try:
             group = await fetch_client.get_media_group(src_chat, msg.id)
             if group:
@@ -830,12 +1134,72 @@ async def _process_one_link(
         except Exception as e:
             print(f'Media group fetch failed, falling back to single: {e}')
     if len(msgs) > 1:
-        return await process_album(
-            ubot, uc, msgs, d, src_lt, uid, src_chat, oc, settings=settings
+        return None, _PreparedLink(
+            'album',
+            msgs=msgs,
+            src_lt=src_lt,
+            src_chat=src_chat,
+            ubot=ubot,
+            uc=uc,
+            d=d,
+            uid=uid,
+            oc=oc,
+            settings=settings,
         )
-    return await process_msg(
-        ubot, uc, msgs[0], d, src_lt, uid, src_chat, oc, settings=settings
+    result, prepared = await prepare_msg(
+        ubot,
+        uc,
+        msgs[0],
+        d,
+        src_lt,
+        uid,
+        src_chat,
+        oc,
+        settings=settings,
     )
+    if prepared is None:
+        return result, None
+    return None, _PreparedLink('single', prepared=prepared)
+
+
+async def finish_one_link(prepared_link):
+    """Finish a :class:`_PreparedLink` after its predecessor has uploaded."""
+    if prepared_link.kind == 'album':
+        return await process_album(
+            prepared_link.ubot,
+            prepared_link.uc,
+            prepared_link.msgs,
+            prepared_link.d,
+            prepared_link.src_lt,
+            prepared_link.uid,
+            prepared_link.src_chat,
+            prepared_link.oc,
+            settings=prepared_link.settings,
+        )
+    if prepared_link.kind == 'single':
+        return await finish_prepared_msg(prepared_link.prepared)
+    return None
+
+
+async def _process_one_link(
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+):
+    """Compose :func:`prepare_one_link` and :func:`finish_one_link`."""
+    result, prepared_link = await prepare_one_link(
+        ubot,
+        uc,
+        i,
+        s,
+        lt,
+        d,
+        uid,
+        oc,
+        comment_id,
+        settings=settings,
+    )
+    if prepared_link is None:
+        return result
+    return await finish_one_link(prepared_link)
 
 async def _sweep_progress_state(now=None):
     if now is None:

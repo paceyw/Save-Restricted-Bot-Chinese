@@ -91,6 +91,7 @@ def batch_module(monkeypatch):
     config.FREEMIUM_LIMIT = 1
     config.PREMIUM_LIMIT = 10
     config.BATCH_INTERVAL = 0
+    config.BATCH_MIN_INTERVAL = 0
     config.MERGE_INTERVAL = 0
     config.CHANNEL_INTERVAL = 0
     config.UPLOAD_INTERVAL = 0

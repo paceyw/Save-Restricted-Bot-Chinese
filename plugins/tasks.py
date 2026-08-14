@@ -7,7 +7,14 @@ import re
 import time
 import inspect
 from config import BATCH_INTERVAL, CHANNEL_INTERVAL, MERGE_INTERVAL
+try:
+    from config import BATCH_MIN_INTERVAL
+except ImportError:
+    # Legacy config shims (test fixtures) predate the adaptive floor: pin the
+    # floor to the ceiling so the limiter degenerates to the old fixed sleep.
+    BATCH_MIN_INTERVAL = BATCH_INTERVAL
 from utils.func import get_user_data, filter_settings, cred_epoch, prune_cred_epochs
+from utils.ratelimit import RateLimiter
 from plugins import fetch as fetch_module
 from plugins.fetch import (
     get_ubot, get_uclient, get_msg, resolve_linked_chat, _client_lock,
@@ -349,8 +356,47 @@ async def _sweeper_loop():
 # Each takes (uid, task) and runs to completion. Cancellation is checked via
 # task_should_cancel(task['id']). Progress is reported via task_update().
 
+async def _drain_prefetch(prefetch):
+    """Cancel an armed prefetch and return its result payload if it had
+    already completed (None otherwise).
+
+    Uses asyncio.wait instead of directly awaiting the cancelled task: a
+    direct ``await`` would conflate our own ``prefetch.cancel()`` with an
+    external cancellation of this runner (both surface as CancelledError at
+    the same point). asyncio.wait never cancels the tasks it waits on, so a
+    CancelledError raised inside is unambiguously the runner's own and must
+    propagate.
+    """
+    if prefetch is None:
+        return None
+    if not prefetch.done():
+        prefetch.cancel()
+        try:
+            while not prefetch.done():
+                await asyncio.wait({prefetch})
+        except asyncio.CancelledError:
+            # External cancellation of the runner itself. The prefetch is
+            # already cancelling (its prepare self-cleans); do not swallow.
+            raise
+    if prefetch.cancelled():
+        return None
+    try:
+        _, prepared = prefetch.result()
+    except Exception:
+        return None
+    return prepared
+
+
 async def _run_batch_links(uid, task, doc, epoch):
-    """Execute multi-link batch extraction."""
+    """Execute multi-link batch extraction.
+
+    Phase 7: pipeline window=1 — prepare (fetch + download) of link j+1
+    overlaps the finish (rename/upload) of link j. Delivery order is
+    preserved because prepare performs no content sends; every send happens
+    in finish, strictly inside this loop. The fixed BATCH_INTERVAL sleep is
+    replaced by an AIMD RateLimiter (floor BATCH_MIN_INTERVAL, ceiling
+    BATCH_INTERVAL): FloodWait backs off, quiet links tighten.
+    """
     settings = task['settings']
     links = task['links']
     oc = task.get('caption')
@@ -360,23 +406,73 @@ async def _run_batch_links(uid, task, doc, epoch):
     uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     success = 0
     cancelled = False
+    limiter = RateLimiter(base=BATCH_MIN_INTERVAL, ceiling=BATCH_INTERVAL)
     task_update(task['id'], progress_msg=f'批量提取 {n} 条链接...')
-    for j, (ci, di, lti, comment_id) in enumerate(links):
-        if task_should_cancel(task['id']):
-            cancelled = True
-            task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
-            break
-        task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
-        try:
-            res = await process_one_link(
+
+    async def prepare(idx):
+        ci, di, lti, comment_id = links[idx]
+        return await with_flood_retry(
+            lambda: prepare_one_link(
                 ubot, uc, ci, di, lti, chat_id, uid, oc, comment_id,
                 settings=settings,
-            )
-            if _ok(res):
-                success += 1
-        except Exception as e:
-            print(f'Batch link {j+1}/{n} error: {e}')
-        await asyncio.sleep(BATCH_INTERVAL)
+            ),
+            context=f'{ci}/{di}',
+            max_retries=2,
+            on_flood=limiter.report_flood,
+        )
+
+    prefetch = None
+    try:
+        for j in range(n):
+            if task_should_cancel(task['id']):
+                cancelled = True
+                task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
+                break
+            if prefetch is None:
+                prefetch = asyncio.create_task(prepare(j))
+            task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
+            current, prefetch = prefetch, None
+            try:
+                result, prepared_link = await current
+                if j + 1 < n:
+                    # Arm the next preparation before finishing this link so its
+                    # fetch+download overlaps the upload below.
+                    prefetch = asyncio.create_task(prepare(j + 1))
+                if prepared_link is not None:
+                    res = await with_flood_retry(
+                        lambda: finish_one_link(prepared_link),
+                        context=f'finish {j + 1}/{n}',
+                        max_retries=2,
+                        on_flood=limiter.report_flood,
+                    )
+                else:
+                    res = result
+                # An unsupported message yields a None result: not a success,
+                # but also not the error the old _ok(None) crash logged.
+                if res is not None and _ok(res):
+                    success += 1
+                limiter.report_success()
+            except FloodWait as e:
+                limiter.report_flood(_flood_secs(e))
+                print(f'Batch link {j+1}/{n} error: {e}')
+            except Exception as e:
+                print(f'Batch link {j+1}/{n} error: {e}')
+            await limiter.wait()
+    except asyncio.CancelledError:
+        # External worker cancellation: an armed prefetch must not outlive
+        # the runner (its downloaded file / progress message would leak).
+        prepared_link = await _drain_prefetch(prefetch)
+        if prepared_link is not None and prepared_link.kind == 'single':
+            await abort_prepared_msg(prepared_link.prepared)
+        raise
+    if cancelled and prefetch is not None:
+        # The armed preparation may hold a downloaded file + progress
+        # message. In-flight preparation self-cleans on CancelledError; a
+        # completed one is aborted explicitly. Album preparations allocate
+        # nothing, so only single-downloaded ones need the abort.
+        prepared_link = await _drain_prefetch(prefetch)
+        if prepared_link is not None and prepared_link.kind == 'single':
+            await abort_prepared_msg(prepared_link.prepared)
     if not cancelled:
         task_update(task['id'], current=n, success=success)
         task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
@@ -571,7 +667,13 @@ async def _run_merge(uid, task, doc, epoch):
     task['result'] = res
 
 async def _run_batch_count(uid, task, doc, epoch):
-    """Execute sequential batch extraction (start link + count)."""
+    """Execute sequential batch extraction (start link + count).
+
+    Phase 7: same pipeline window=1 + adaptive interval as
+    ``_run_batch_links``; unlike link batches there is no album expansion
+    and no FloodWait retry wrapper (preserved), a flood simply fails the
+    item after the limiter records it.
+    """
     settings = task['settings']
     ci = task['cid']
     sid = task['sid']
@@ -583,26 +685,58 @@ async def _run_batch_count(uid, task, doc, epoch):
     uc = await get_uclient(uid, prefetched=doc, prefetched_epoch=epoch)
     success = 0
     cancelled = False
+    limiter = RateLimiter(base=BATCH_MIN_INTERVAL, ceiling=BATCH_INTERVAL)
     task_update(task['id'], progress_msg=f'批量提取 {n} 条...')
-    for j in range(n):
-        if task_should_cancel(task['id']):
-            cancelled = True
-            task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
-            break
-        task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
-        mid = int(sid) + j
-        try:
-            msg = await get_msg(ubot, uc, ci, mid, lt, uid)
-            if msg:
-                res = await process_msg(
-                    ubot, uc, msg, chat_id, lt, uid, ci, oc,
-                    settings=settings,
-                )
-                if _ok(res):
+
+    async def prepare(idx):
+        msg = await get_msg(ubot, uc, ci, int(sid) + idx, lt, uid)
+        if not msg:
+            return None, None
+        return await prepare_msg(
+            ubot, uc, msg, chat_id, lt, uid, ci, oc, settings=settings,
+        )
+
+    prefetch = None
+    try:
+        for j in range(n):
+            if task_should_cancel(task['id']):
+                cancelled = True
+                task_update(task['id'], current=j, success=success, progress_msg=f'已取消（{j}/{n}）')
+                break
+            if prefetch is None:
+                prefetch = asyncio.create_task(prepare(j))
+            task_update(task['id'], current=j, success=success, progress_msg=f'正在提取 {j+1}/{n}...')
+            current, prefetch = prefetch, None
+            try:
+                result, prepared = await current
+                if j + 1 < n:
+                    prefetch = asyncio.create_task(prepare(j + 1))
+                if prepared is not None:
+                    res = await finish_prepared_msg(prepared)
+                else:
+                    res = result
+                if res is not None and _ok(res):
                     success += 1
-        except Exception as e:
-            print(f'Count batch {j+1}/{n} error: {e}')
-        await asyncio.sleep(BATCH_INTERVAL)
+                limiter.report_success()
+            except FloodWait as e:
+                limiter.report_flood(_flood_secs(e))
+                print(f'Count batch {j+1}/{n} error: {e}')
+            except Exception as e:
+                print(f'Count batch {j+1}/{n} error: {e}')
+            await limiter.wait()
+    except asyncio.CancelledError:
+        # External worker cancellation: drain the armed prefetch so its
+        # downloaded file / progress message cannot outlive the runner.
+        prepared = await _drain_prefetch(prefetch)
+        if prepared is not None:
+            await abort_prepared_msg(prepared)
+        raise
+    if cancelled and prefetch is not None:
+        # In-flight preparation self-cleans on CancelledError; a completed
+        # one is aborted explicitly.
+        prepared = await _drain_prefetch(prefetch)
+        if prepared is not None:
+            await abort_prepared_msg(prepared)
     if not cancelled:
         task_update(task['id'], current=n, success=success)
         task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
@@ -612,6 +746,26 @@ async def _run_batch_count(uid, task, doc, epoch):
 async def process_one_link(*args, **kwargs):
     from plugins.deliver import process_one_link as deliver_process_one_link
     return await deliver_process_one_link(*args, **kwargs)
+
+async def prepare_one_link(*args, **kwargs):
+    from plugins.deliver import prepare_one_link as deliver_prepare_one_link
+    return await deliver_prepare_one_link(*args, **kwargs)
+
+async def finish_one_link(*args, **kwargs):
+    from plugins.deliver import finish_one_link as deliver_finish_one_link
+    return await deliver_finish_one_link(*args, **kwargs)
+
+async def prepare_msg(*args, **kwargs):
+    from plugins.deliver import prepare_msg as deliver_prepare_msg
+    return await deliver_prepare_msg(*args, **kwargs)
+
+async def finish_prepared_msg(*args, **kwargs):
+    from plugins.deliver import finish_prepared_msg as deliver_finish_prepared_msg
+    return await deliver_finish_prepared_msg(*args, **kwargs)
+
+async def abort_prepared_msg(*args, **kwargs):
+    from plugins.deliver import abort_prepared_msg as deliver_abort_prepared_msg
+    return await deliver_abort_prepared_msg(*args, **kwargs)
 
 async def process_merged(*args, **kwargs):
     from plugins.deliver import process_merged as deliver_process_merged

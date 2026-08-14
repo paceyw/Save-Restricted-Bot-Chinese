@@ -119,6 +119,7 @@ def batch_module(monkeypatch):
     config.FREEMIUM_LIMIT = 1
     config.PREMIUM_LIMIT = 10
     config.BATCH_INTERVAL = 0.01
+    config.BATCH_MIN_INTERVAL = 0.01
     config.MERGE_INTERVAL = 0.01
     config.CHANNEL_INTERVAL = 0.01
     config.UPLOAD_INTERVAL = 0.01
@@ -1371,7 +1372,10 @@ def test_process_msg_builds_caption_from_snapshot_rules(batch_module, monkeypatc
 
 def test_run_batch_count_forwards_snapshot_to_process_msg(batch_module):
     """Runner coverage: _run_batch_count threads the dispatch snapshot through
-    every iteration (batch_links/single covered elsewhere)."""
+    every iteration (batch_links/single covered elsewhere). Phase 7 pipelines
+    the loop through prepare_msg/finish_prepared_msg, so the snapshot is
+    pinned at the prepare seam (finish receives it inside the prepared
+    object)."""
     module, _ = batch_module
     seen = []
 
@@ -1379,11 +1383,11 @@ def test_run_batch_count_forwards_snapshot_to_process_msg(batch_module):
     module.get_uclient = lambda _uid, **_k: asyncio.sleep(0, result=None)
     module.get_msg = lambda *_a: asyncio.sleep(0, result=object())
 
-    async def process_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
+    async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
         seen.append(settings)
-        return 'Done.'
+        return 'Done.', None
 
-    module.process_msg = process_msg
+    module.prepare_msg = prepare_msg
     task = module.create_task(
         42, 'batch_count', 2, cid='chan', sid=5, lt='public', num=2,
         caption=None, chat_id='42',
