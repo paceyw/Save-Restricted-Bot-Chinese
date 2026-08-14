@@ -55,8 +55,10 @@ FREEMIUM_LIMIT = int(os.getenv("FREEMIUM_LIMIT", "0"))
 PREMIUM_LIMIT  = int(os.getenv("PREMIUM_LIMIT", "500"))
 
 # ─── RATE CONTROL (anti-flood) ──────────────────────────────────────────────────
-# Inter-request delays (seconds). Conservative defaults prevent auth FLOOD_WAIT.
-BATCH_INTERVAL   = float(os.getenv("BATCH_INTERVAL", "10"))   # batch/count: between links
+# Adaptive batch/count interval (seconds): starts at the floor and backs off to the ceiling.
+BATCH_INTERVAL   = float(os.getenv("BATCH_INTERVAL", "10"))   # adaptive ceiling for batch/count loops
+BATCH_MIN_INTERVAL = float(os.getenv("BATCH_MIN_INTERVAL", "2"))  # adaptive floor (was fixed 10s)
+PROGRESS_MIN_INTERVAL = float(os.getenv("PROGRESS_MIN_INTERVAL", "3"))  # progress edit throttle
 MERGE_INTERVAL   = float(os.getenv("MERGE_INTERVAL", "5"))    # merge: between links
 CHANNEL_INTERVAL = float(os.getenv("CHANNEL_INTERVAL", "5"))  # merge: between channels
 UPLOAD_INTERVAL  = float(os.getenv("UPLOAD_INTERVAL", "2"))   # after each media upload
