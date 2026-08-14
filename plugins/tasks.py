@@ -407,6 +407,7 @@ async def _run_batch_links(uid, task, doc, epoch):
     success = 0
     cancelled = False
     limiter = RateLimiter(base=BATCH_MIN_INTERVAL, ceiling=BATCH_INTERVAL)
+    started_at = time.time()
     task_update(task['id'], progress_msg=f'批量提取 {n} 条链接...')
 
     async def prepare(idx):
@@ -473,6 +474,11 @@ async def _run_batch_links(uid, task, doc, epoch):
         prepared_link = await _drain_prefetch(prefetch)
         if prepared_link is not None and prepared_link.kind == 'single':
             await abort_prepared_msg(prepared_link.prepared)
+    # Throughput-analysis signal: per-task wall time + terminal interval.
+    logger.info(
+        'batch_links done uid=%s links=%d success=%d cancelled=%s wall=%.1fs final_interval=%.1fs',
+        uid, n, success, cancelled, time.time() - started_at, limiter.current,
+    )
     if not cancelled:
         task_update(task['id'], current=n, success=success)
         task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
@@ -686,6 +692,7 @@ async def _run_batch_count(uid, task, doc, epoch):
     success = 0
     cancelled = False
     limiter = RateLimiter(base=BATCH_MIN_INTERVAL, ceiling=BATCH_INTERVAL)
+    started_at = time.time()
     task_update(task['id'], progress_msg=f'批量提取 {n} 条...')
 
     async def prepare(idx):
@@ -737,6 +744,11 @@ async def _run_batch_count(uid, task, doc, epoch):
         prepared = await _drain_prefetch(prefetch)
         if prepared is not None:
             await abort_prepared_msg(prepared)
+    # Throughput-analysis signal: per-task wall time + terminal interval.
+    logger.info(
+        'batch_count done uid=%s links=%d success=%d cancelled=%s wall=%.1fs final_interval=%.1fs',
+        uid, n, success, cancelled, time.time() - started_at, limiter.current,
+    )
     if not cancelled:
         task_update(task['id'], current=n, success=success)
         task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'

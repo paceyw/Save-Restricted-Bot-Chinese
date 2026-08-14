@@ -589,6 +589,60 @@ def test_process_msg_sends_sticker_from_downloaded_file(batch_module, tmp_path):
     assert sent["sticker"] == str(downloaded)
     assert not downloaded.exists()
 
+
+def test_process_msg_video_passes_unswapped_width_height(batch_module, tmp_path):
+    """Regression: send_video must receive width=metadata width and
+    height=metadata height. The historical code destructured
+    ``dur, h, w = duration, width, height`` and passed height=h/width=w,
+    transposing the dimensions of every non-square video."""
+    module, _ = batch_module
+    module.fetch_origin[(42, "public_channel")] = True
+    _stub_progress_app(module)
+    module.thumbnail = lambda d: None
+
+    async def fake_metadata(f):
+        return {'duration': 12, 'width': 1920, 'height': 1080}
+
+    async def fake_screenshot(f, dur, d):
+        return None
+
+    module.get_video_metadata = fake_metadata
+    module.screenshot = fake_screenshot
+
+    downloaded = tmp_path / "42_video.mp4"
+    sent = {}
+
+    class UserClient:
+        async def download_media(self, m, file_name=None, progress=None, progress_args=None):
+            downloaded.write_bytes(b"mp4")
+            return str(downloaded)
+
+        async def send_video(self, tcid, video=None, caption=None, thumb=None,
+                             width=None, height=None, duration=None,
+                             progress=None, progress_args=None,
+                             reply_to_message_id=None):
+            sent.update(width=width, height=height, duration=duration, video=video)
+
+    message = types.SimpleNamespace(
+        media=True, caption=None,
+        video=types.SimpleNamespace(file_name=None),
+        video_note=None, voice=None, sticker=None, audio=None, photo=None,
+        document=None,
+    )
+
+    result = asyncio.run(
+        module.process_msg(
+            UserClient(), UserClient(), message, "42", "public", 42,
+            "public_channel", settings=_settings()
+        )
+    )
+
+    assert result == "Done."
+    assert sent["width"] == 1920
+    assert sent["height"] == 1080
+    assert sent["duration"] == 12
+    assert not downloaded.exists()
+
 # ---------------------------------------------------------------------------
 # /merge — process_merged + _download_media_item
 
