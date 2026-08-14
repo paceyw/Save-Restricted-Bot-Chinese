@@ -764,6 +764,148 @@ def test_download_media_item_skips_non_media(batch_module):
     assert files == []
 
 
+def test_download_media_item_retries_zero_byte_download(batch_module, tmp_path):
+    """Pyrofork may return a finalized 0-byte file after GetFile times out."""
+    module, _ = batch_module
+    _stub_input_media(module)
+
+    class Client:
+        calls = 0
+
+        async def download_media(self, m, file_name=None, progress=None, progress_args=None):
+            self.calls += 1
+            p = tmp_path / f"dl_{self.calls}.jpg"
+            p.write_bytes(b"" if self.calls == 1 else b"x")
+            return str(p)
+
+    client = Client()
+    msg = types.SimpleNamespace(
+        photo=types.SimpleNamespace(file_size=1),
+        video=None, document=None, audio=None,
+    )
+    im, files = asyncio.run(
+        module._download_media_item(client, msg, 42, 0, 'album', None, 42, 1, 0)
+    )
+
+    assert client.calls == 2
+    assert im.media == str(tmp_path / "dl_2.jpg")
+    assert files == [im.media]
+    assert not (tmp_path / "dl_1.jpg").exists()
+
+
+def test_process_album_captioned_uses_server_copy_without_download(batch_module):
+    """A captioned public album must not be re-uploaded; re-upload makes >2GB
+    videos hit the custom bot's 2000 MiB limit and silently drops them."""
+    module, _ = batch_module
+    _stub_progress_app(module)
+    module.LOG_GROUP = -100999
+
+    msg = types.SimpleNamespace(
+        id=99,
+        chat=types.SimpleNamespace(id=-100123),
+        photo=types.SimpleNamespace(),
+        video=None, audio=None, document=None,
+        caption=types.SimpleNamespace(markdown='Original'),
+    )
+
+    class Client:
+        copies = []
+
+        async def copy_media_group(self, tcid, from_chat_id, message_id,
+                                   captions=None, reply_to_message_id=None):
+            self.copies.append((tcid, from_chat_id, message_id, captions, reply_to_message_id))
+
+        async def download_media(self, *args, **kwargs):
+            raise AssertionError('captioned album must use server-side copy')
+
+    client = Client()
+    result = asyncio.run(
+        module.process_album(
+            client, client, [msg], '42', 'public', 42, 'chan',
+            settings=_settings(caption='Tag')
+        )
+    )
+
+    assert result == '✅ 相册已一比一转发（1 项）'
+    assert client.copies == [(-100999, -100123, 99, 'Original\n\nTag', None)]
+
+
+def test_process_album_copy_response_parse_bug_is_success(batch_module):
+    module, _ = batch_module
+    _stub_progress_app(module)
+    module.LOG_GROUP = -100999
+
+    msg = types.SimpleNamespace(
+        id=99,
+        chat=types.SimpleNamespace(id=-100123),
+        photo=types.SimpleNamespace(),
+        video=None, audio=None, document=None,
+        caption=None,
+    )
+
+    class Client:
+        async def copy_media_group(self, *args, **kwargs):
+            raise TypeError("Messages.__init__() missing 1 required keyword-only argument: 'topics'")
+
+        async def download_media(self, *args, **kwargs):
+            raise AssertionError('successful copy must not fall back to re-upload')
+
+    result = asyncio.run(
+        module.process_album(
+            Client(), Client(), [msg], '42', 'public', 42, 'chan', settings=_settings()
+        )
+    )
+
+    assert result == '✅ 相册已一比一转发（1 项）'
+
+
+def test_process_album_skips_bad_download_without_splitting_group(batch_module, tmp_path):
+    """A timed-out item must not poison SendMultiMedia and trigger per-item fallback."""
+    module, _ = batch_module
+    _stub_progress_app(module)
+    _stub_input_media(module)
+
+    def _photo(name):
+        return types.SimpleNamespace(
+            name=name,
+            photo=types.SimpleNamespace(file_size=1),
+            video=None, document=None, audio=None,
+            caption=None,
+        )
+
+    class Client:
+        def __init__(self):
+            self.groups = []
+            self.single_photos = []
+
+        async def download_media(self, m, file_name=None, progress=None, progress_args=None):
+            self.calls = getattr(self, 'calls', 0) + 1
+            p = tmp_path / f"dl_{self.calls}.jpg"
+            p.write_bytes(b"" if m.name == "bad" else b"x")
+            return str(p)
+
+        async def send_media_group(self, tcid, media, reply_to_message_id=None):
+            for im in media:
+                assert Path(im.media).stat().st_size > 0
+            self.groups.append(list(media))
+
+        async def send_photo(self, *args, **kwargs):
+            self.single_photos.append((args, kwargs))
+
+    client = Client()
+    result = asyncio.run(
+        module.process_album(
+            client, client, [_photo("bad"), _photo("good")],
+            "42", "public", 42, "chan", settings=_settings()
+        )
+    )
+
+    assert result == '✅ 相册已发送（1 项）'
+    assert len(client.groups) == 1
+    assert len(client.groups[0]) == 1
+    assert client.single_photos == []
+
+
 def test_process_merged_combines_text_only(batch_module):
     module, _ = batch_module
     _stub_progress_app(module)

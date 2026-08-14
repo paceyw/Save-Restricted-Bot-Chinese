@@ -242,6 +242,14 @@ async def _safe_cleanup(coro):
         print(f'cleanup failed (delivery already done): {e}')
 
 
+def _valid_download(path, expected_size=0):
+    """Pyrofork 2.3.69 can finalize an empty .temp file after GetFile times out."""
+    if not path or not os.path.isfile(path):
+        return False
+    actual_size = os.path.getsize(path)
+    return actual_size > 0 and (not expected_size or actual_size == expected_size)
+
+
 async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
     """Download one message's media and wrap it as an InputMedia for grouping.
 
@@ -254,6 +262,8 @@ async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
         return None, []
     # SendMultiMedia validates uploads by file extension (PHOTO_EXT_INVALID
     # otherwise), so the temp name must carry one.
+    source_media = one.photo or one.video or one.audio or one.document
+    expected_size = getattr(source_media, 'file_size', 0) or 0
     if one.photo:
         ext = '.jpg'
     elif one.video:
@@ -262,32 +272,54 @@ async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
         ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
     else:
         ext = os.path.splitext(one.document.file_name or '')[1]
-    f = await u.download_media(
-        one,
-        file_name=os.path.join(_WORKDIR, 'downloads', f'{tag}_{uid}_{int(time.time())}_{idx}{ext}'),
-        progress=prog, progress_args=(main_bot, did, p_id, st),
-    )
-    if not f:
-        print(f'{tag} item {idx + 1} download failed, skipping')
-        return None, []
+    f = None
+    for attempt in range(2):
+        f = await u.download_media(
+            one,
+            file_name=os.path.join(_WORKDIR, 'downloads', f'{tag}_{uid}_{int(time.time())}_{idx}{ext}'),
+            progress=prog, progress_args=(main_bot, did, p_id, st),
+        )
+        if _valid_download(f, expected_size):
+            break
+        actual_size = os.path.getsize(f) if f and os.path.exists(f) else 0
+        if f and os.path.exists(f):
+            os.remove(f)
+        if attempt == 0:
+            print(
+                f'{tag} item {idx + 1} download incomplete '
+                f'({actual_size}/{expected_size or "?"} B), retrying'
+            )
+        else:
+            print(f'{tag} item {idx + 1} download failed, skipping')
+            return None, []
     files = [f]
     if one.video:
         # Videos without an audio track are treated as animations by Telegram;
         # mixed into SendMultiMedia they fail the whole group (MEDIA_EMPTY).
         f = await ensure_audio_track(f)
+        if not _valid_download(f):
+            print(f'{tag} item {idx + 1} is not a readable video, skipping')
+            if f and os.path.exists(f):
+                os.remove(f)
+            return None, []
         files = [f]
         # Keep the source channel's thumbnail; without one Telegram shows the
         # first frame, which is often black.
         thumb_path = None
         if one.video.thumbs:
+            thumb = one.video.thumbs[-1]
             try:
                 thumb_path = await u.download_media(
-                    one.video.thumbs[-1].file_id,
+                    thumb.file_id,
                     file_name=os.path.join(
                         _WORKDIR, 'downloads',
                         f'{tag}_thumb_{uid}_{int(time.time())}_{idx}.jpg',
                     ),
                 )
+                if not _valid_download(thumb_path, getattr(thumb, 'file_size', 0) or 0):
+                    if thumb_path and os.path.exists(thumb_path):
+                        os.remove(thumb_path)
+                    thumb_path = None
             except Exception as e:
                 print(f'Thumb download failed for {tag} item {idx + 1}: {e}')
         if thumb_path:
@@ -330,13 +362,28 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
     user_cap = settings.get('caption', '')
     ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
-    # Fast server-side copy preserves the ORIGINAL caption — skip it whenever
-    # text rules or a user caption apply, so both paths produce the same text.
-    if deliver_via_bot and not ft:
+    # Server-side copy supports replacement captions and does not re-upload the
+    # files, so it also handles albums containing >2GB videos that the custom
+    # bot could never upload itself.
+    if deliver_via_bot:
         try:
-            await sender.copy_media_group(tcid, msgs[0].chat.id, msgs[0].id)
+            await sender.copy_media_group(
+                tcid,
+                msgs[0].chat.id,
+                msgs[0].id,
+                captions=ft,
+                reply_to_message_id=rtmid,
+            )
             await _safe_cleanup(main_bot.delete_messages(did, p.id))
             return f'✅ 相册已一比一转发（{len(msgs)} 项）'
+        except TypeError as e:
+            if 'keyword-only argument' in str(e):
+                # pyrofork 2.3.69 has the same SendMultiMedia response parse
+                # bug here as send_media_group: the copy already succeeded.
+                print(f'copy_media_group response parse bug (treating as success): {e}')
+                await _safe_cleanup(main_bot.delete_messages(did, p.id))
+                return f'✅ 相册已一比一转发（{len(msgs)} 项）'
+            print(f'copy_media_group failed, falling back to re-upload: {e}')
         except Exception as e:
             print(f'copy_media_group failed, falling back to re-upload: {e}')
 
