@@ -364,28 +364,36 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
 
     # Server-side copy supports replacement captions and does not re-upload the
     # files, so it also handles albums containing >2GB videos that the custom
-    # bot could never upload itself.
+    # bot could never upload itself. The custom bot only sees channels it is a
+    # member of, so when it cannot resolve the SOURCE chat (CHANNEL_INVALID on
+    # channels.GetChannels) retry with the client that fetched the messages —
+    # it demonstrably has source access and often also owns/admins the target.
     if deliver_via_bot:
-        try:
-            await sender.copy_media_group(
-                tcid,
-                msgs[0].chat.id,
-                msgs[0].id,
-                captions=ft,
-                reply_to_message_id=rtmid,
-            )
-            await _safe_cleanup(main_bot.delete_messages(did, p.id))
-            return f'✅ 相册已一比一转发（{len(msgs)} 项）'
-        except TypeError as e:
-            if 'keyword-only argument' in str(e):
-                # pyrofork 2.3.69 has the same SendMultiMedia response parse
-                # bug here as send_media_group: the copy already succeeded.
-                print(f'copy_media_group response parse bug (treating as success): {e}')
+        copy_clients = [c]
+        if u is not None and u is not c:
+            copy_clients.append(u)
+        for copy_client in copy_clients:
+            try:
+                await copy_client.copy_media_group(
+                    tcid,
+                    msgs[0].chat.id,
+                    msgs[0].id,
+                    captions=ft,
+                    reply_to_message_id=rtmid,
+                )
                 await _safe_cleanup(main_bot.delete_messages(did, p.id))
                 return f'✅ 相册已一比一转发（{len(msgs)} 项）'
-            print(f'copy_media_group failed, falling back to re-upload: {e}')
-        except Exception as e:
-            print(f'copy_media_group failed, falling back to re-upload: {e}')
+            except TypeError as e:
+                if 'keyword-only argument' in str(e):
+                    # pyrofork 2.3.69 has the same SendMultiMedia response
+                    # parse bug here as send_media_group: the copy already
+                    # succeeded.
+                    print(f'copy_media_group response parse bug (treating as success): {e}')
+                    await _safe_cleanup(main_bot.delete_messages(did, p.id))
+                    return f'✅ 相册已一比一转发（{len(msgs)} 项）'
+                print(f'copy_media_group failed for {getattr(copy_client, "name", copy_client)}, trying next: {e}')
+            except Exception as e:
+                print(f'copy_media_group failed for {getattr(copy_client, "name", copy_client)}, trying next: {e}')
 
     st = time.time()
     media = []

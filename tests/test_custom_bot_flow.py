@@ -905,6 +905,52 @@ def test_process_album_skips_bad_download_without_splitting_group(batch_module, 
     assert len(client.groups[0]) == 1
     assert client.single_photos == []
 
+def test_process_album_retries_copy_with_fetch_client(batch_module):
+    """The custom bot cannot resolve source channels it never joined
+    (CHANNEL_INVALID); the logged-in client that fetched the album can, and
+    often owns/admins the target channel — its server-side copy keeps the
+    >2GB video inside the album instead of dropping it on re-upload."""
+    module, _ = batch_module
+    _stub_progress_app(module)
+    module.LOG_GROUP = -100999
+
+    msg = types.SimpleNamespace(
+        id=99,
+        chat=types.SimpleNamespace(id=-100123),
+        photo=types.SimpleNamespace(),
+        video=None, audio=None, document=None,
+        caption=types.SimpleNamespace(markdown='Original'),
+    )
+
+    class BotClient:
+        async def copy_media_group(self, *args, **kwargs):
+            raise RuntimeError('[400 CHANNEL_INVALID] (caused by "channels.GetChannels")')
+
+        async def download_media(self, *args, **kwargs):
+            raise AssertionError('bot copy failure must fall through to user copy')
+
+    class UserClient:
+        copies = []
+
+        async def copy_media_group(self, tcid, from_chat_id, message_id,
+                                   captions=None, reply_to_message_id=None):
+            self.copies.append((tcid, from_chat_id, message_id, captions, reply_to_message_id))
+
+        async def download_media(self, *args, **kwargs):
+            raise AssertionError('successful user copy must not re-upload')
+
+    user = UserClient()
+    result = asyncio.run(
+        module.process_album(
+            BotClient(), user, [msg], '42', 'public', 42, 'chan',
+            settings=_settings(caption='Tag')
+        )
+    )
+
+    assert result == '✅ 相册已一比一转发（1 项）'
+    assert user.copies == [(-100999, -100123, 99, 'Original\n\nTag', None)]
+
+
 
 def test_process_merged_combines_text_only(batch_module):
     module, _ = batch_module
