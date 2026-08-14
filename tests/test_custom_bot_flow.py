@@ -459,6 +459,56 @@ def test_resolve_delivery_defaults_to_user_chat(batch_module):
     assert via_bot is False
 
 
+def test_count_limit_uses_freemium_limit_for_non_premium(batch_module):
+    """Regression: the count branch referenced FREMIUM_LIMIT (NameError)
+    instead of FREEMIUM_LIMIT. A non-premium user over the free limit must
+    get the limit reply, not a crash. Fixture FREEMIUM_LIMIT == 1."""
+    module, _ = batch_module
+    module.get_ubot = lambda uid: asyncio.sleep(0, result=object())
+    module.is_premium_user = lambda uid: asyncio.sleep(0, result=False)
+
+    replies = []
+
+    class FakeMessage:
+        from_user = types.SimpleNamespace(id=42)
+        text = '2'
+        chat = types.SimpleNamespace(id=42)
+
+        async def reply_text(self, t, **kwargs):
+            replies.append(t)
+
+    module.pending_flows[42] = {
+        'step': 'count', 'cid': 'chan', 'sid': 5, 'lt': 'public',
+    }
+
+    asyncio.run(module.text_handler(None, FakeMessage()))
+
+    assert replies == ['最大限制为 1。']
+
+
+def test_merge_limit_uses_freemium_limit_for_non_premium(batch_module):
+    """Same regression in the merge branch (batch.py start_merge limit)."""
+    module, _ = batch_module
+    module.get_ubot = lambda uid: asyncio.sleep(0, result=object())
+    module.is_premium_user = lambda uid: asyncio.sleep(0, result=False)
+
+    replies = []
+
+    class FakeMessage:
+        from_user = types.SimpleNamespace(id=42)
+        text = 'https://t.me/fancha103/7823\nhttps://t.me/fancha103/7824'
+        chat = types.SimpleNamespace(id=42)
+
+        async def reply_text(self, t, **kwargs):
+            replies.append(t)
+
+    module.pending_flows[42] = {'step': 'start_merge'}
+
+    asyncio.run(module.text_handler(None, FakeMessage()))
+
+    assert replies == ['一次最多 1 条链接，你发送了 2 条。']
+
+
 def test_parse_link_lines_single_line_is_range(batch_module):
     module, _ = batch_module
 
