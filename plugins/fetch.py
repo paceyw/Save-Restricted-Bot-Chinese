@@ -133,6 +133,22 @@ def _peer_cache_drop(uid, key):
         _PEER_CACHE.pop(uid, None)
 
 
+def _int_if_numeric(form):
+    """Return ``form`` as an int when it is a numeric chat reference.
+
+    pyrofork's peer resolver only runs its ``channels.GetChannels``
+    (access_hash=0) fallback for INT ids; numeric STRINGS take the
+    phone-number path and raise PeerIdInvalid when the session has no cached
+    access hash (channel not among recent dialogs) — turning a fetchable
+    message into 未找到消息.
+    """
+    try:
+        return int(form)
+    except (TypeError, ValueError):
+        return form
+
+
+
  
 async def upd_dlg(c):
     try:
@@ -256,7 +272,7 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
             if cache_hit:
                 cache_key, cached_form = cache_hit
                 try:
-                    result = await u.get_messages(cached_form, d)
+                    result = await u.get_messages(_int_if_numeric(cached_form), d)
                     if result and not getattr(result, "empty", False):
                         _peer_cache_put(
                             uid, (i_key,), cached_form, time.time()
@@ -270,6 +286,11 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
 
             async for _ in u.get_dialogs(limit=50):
                 pass
+
+            # Numeric forms must reach pyrogram as ints (see _int_if_numeric):
+            # string ids never trigger the channel-resolution fallback.
+            chat_id_100 = _int_if_numeric(chat_id_100)
+            chat_id_dash = _int_if_numeric(chat_id_dash)
 
             # Try with -100 prefix first
             try:
@@ -295,7 +316,7 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
             try:
                 async for _ in u.get_dialogs(limit=200):
                     pass
-                result = await u.get_messages(i, d)
+                result = await u.get_messages(_int_if_numeric(i), d)
                 if result and not getattr(result, "empty", False):
                     _peer_cache_put(uid, (i_key,), str(i), time.time())
                     return result

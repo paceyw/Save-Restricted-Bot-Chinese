@@ -39,19 +39,19 @@ def test_private_cache_hit_skips_dialog_preheat(peer_batch_module):
     module = peer_batch_module
     uid = 101
     module._peer_cache_put(uid, ("123",), "-100123", time.time())
-    client = _PrivateClient(success_forms={"-100123"})
+    client = _PrivateClient(success_forms={-100123})
 
     result = asyncio.run(module.get_msg(None, client, "123", 7, "private", uid))
 
     assert result is not None
     assert client.dialog_calls == []
-    assert client.message_calls == ["-100123"]
+    assert client.message_calls == [-100123]
 
 
 def test_private_cache_miss_fills_then_hits(peer_batch_module):
     module = peer_batch_module
     uid = 102
-    client = _PrivateClient(success_forms={"-100123"})
+    client = _PrivateClient(success_forms={-100123})
 
     first = asyncio.run(module.get_msg(None, client, "123", 7, "private", uid))
     assert first is not None
@@ -61,13 +61,13 @@ def test_private_cache_miss_fills_then_hits(peer_batch_module):
     second = asyncio.run(module.get_msg(None, client, "123", 8, "private", uid))
     assert second is not None
     assert client.dialog_calls == [50]
-    assert client.message_calls[-1] == "-100123"
+    assert client.message_calls[-1] == -100123
 
 
 def test_private_batch_ten_messages_preheats_at_most_once(peer_batch_module):
     module = peer_batch_module
     uid = 103
-    client = _PrivateClient(success_forms={"-100123"})
+    client = _PrivateClient(success_forms={-100123})
 
     for message_id in range(10):
         result = asyncio.run(
@@ -82,13 +82,13 @@ def test_invalid_cached_peer_drops_and_uses_full_fallback(peer_batch_module):
     module = peer_batch_module
     uid = 104
     module._peer_cache_put(uid, ("123",), "stale-peer", time.time())
-    client = _PrivateClient(success_forms={"123"})
+    client = _PrivateClient(success_forms={123})
 
     result = asyncio.run(module.get_msg(None, client, "123", 7, "private", uid))
 
     assert result is not None
     assert client.dialog_calls == [50, 200]
-    assert client.message_calls == ["stale-peer", "-100123", "-123", "123"]
+    assert client.message_calls == ["stale-peer", -100123, -123, 123]
     assert module._PEER_CACHE[uid]["123"][0] == "123"
 
 
@@ -97,7 +97,7 @@ def test_expired_peer_is_ignored_and_replaced(peer_batch_module):
     uid = 105
     now = time.time()
     module._PEER_CACHE[uid] = {"123": ("-100123", now - 1)}
-    client = _PrivateClient(success_forms={"-100123"})
+    client = _PrivateClient(success_forms={-100123})
 
     result = asyncio.run(module.get_msg(None, client, "123", 7, "private", uid))
 
@@ -169,4 +169,4 @@ def test_flood_wait_on_cached_peer_propagates(peer_batch_module):
         asyncio.run(module.get_msg(None, client, "123", 7, "private", uid))
 
     assert client.dialog_calls == []
-    assert client.message_calls == ["-100123"]
+    assert client.message_calls == [-100123]
