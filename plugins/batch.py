@@ -222,8 +222,7 @@ async def text_handler(c, m):
             return
         links = [payload] if mode == 'range' else payload
         n = len(links)
-        # pre-existing typo: FREMIUM_LIMIT intentionally preserved (missing E).
-        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREMIUM_LIMIT
+        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
         if n > maxlimit:
             await m.reply_text(f'一次最多 {maxlimit} 条链接，你发送了 {n} 条。')
             pending_flows.pop(uid, None)
@@ -251,7 +250,7 @@ async def text_handler(c, m):
         if count < 1:
             await m.reply_text('数量至少为 1。')
             return
-        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREMIUM_LIMIT
+        maxlimit = PREMIUM_LIMIT if await is_premium_user(uid) else FREEMIUM_LIMIT
         if count > maxlimit:
             await m.reply_text(f'最大限制为 {maxlimit}。')
             return

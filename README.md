@@ -50,6 +50,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **消息获取优化** | 私聊抓取新增 per-user peer 缓存（输入 chat key → 可访问的 chat_id 形式，TTL 24 小时、每用户上限 500 条）：缓存命中时跳过原每条消息一次的 `get_dialogs` 全量遍历直接取消息（同一私聊批量 10 条 `get_dialogs` 调用 ≤1 次）；缓存失效/过期自动降级原预热兜底链，行为与旧版完全一致；随 sweeper 在 client 驱逐时联动清理 |
 | **代码结构拆分** | 原 2130 行上帝文件 `batch.py` 拆分为 `plugins/fetch.py`（client 缓存/消息获取/peer 缓存）、`plugins/tasks.py`（任务队列/后台 sweeper）、`plugins/deliver.py`（媒体下载与投递）+ 命令层 `batch.py`（297 行）；全局单字母变量改语义名（`UB→user_bots`、`UC→user_clients`、`emp→fetch_origin`、`P→progress_state`、`Z→pending_flows`、`E→parse_link` 等）；相册/合并的逐条发送降级逻辑合一、手写 FloodWait 重试统一收敛到 `with_flood_retry`、视频/音频扩展名列表统一收敛到 `utils.func`；纯移动零功能变更 |
 | **吞吐提升** | 批量/计数任务改流水线执行：预取窗口=1（链接 j+1 的抓取+下载与链接 j 的重命名+上传重叠，投递顺序不变——prepare 阶段零内容发送，全部发送留在 finish 串行段）；固定 `sleep(10)` 改为 AIMD 自适应间隔（`RateLimiter`：下限 `BATCH_MIN_INTERVAL` 默认 2s，FloodWait 3 倍退避封顶 `BATCH_INTERVAL` 默认 10s，安静时逐步回落；`BATCH_MIN_INTERVAL=10` 恢复旧行为）；进度消息由百分比步进改为时间节流（≥`PROGRESS_MIN_INTERVAL` 默认 3s 编辑一次，100% 必发），减少 edit RPC；`process_msg` 拆分 prepare/finish 两阶段支撑流水线，临时文件全程 time_ns 唯一命名，取消/外部中断时预取产物（文件+进度消息）保证排空清理 |
+| **稳定性修复** | 修复视频上传 width/height 实参历史互换（非方形视频曾以转置尺寸渲染）；修复非会员批量/合并条数上限检查的 `FREMIUM_LIMIT` 拼写错误（原触发 NameError 致流程中断）；premium/stats 全部会员到期日格式化路径补测试覆盖（`%Y` 曾被全局改名误伤）；批量任务结束与限流退避新增分析日志（wall/成功数/终期间隔，便于吞吐观测） |
 
 > ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
 
