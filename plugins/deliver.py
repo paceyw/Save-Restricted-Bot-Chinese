@@ -858,8 +858,7 @@ async def _finish_downloaded_msg(prep):
             )
             await upd_dlg(premium_userbot)
             mtd = await get_video_metadata(f)
-            dur, h, w = mtd['duration'], mtd['width'], mtd['height']  # PRE-EXISTING: h/w assignment follows the historical (swapped) order;
-            # do not 'fix' inside the Phase 7 split — tracked as follow-up
+            dur, w, h = mtd['duration'], mtd['width'], mtd['height']
             th = await screenshot(f, dur, prep.d)
             prep.th = th
 
@@ -916,8 +915,7 @@ async def _finish_downloaded_msg(prep):
             file_ext = os.path.splitext(f)[1].lower().lstrip('.')
             if prep.m.video or (prep.m.document and file_ext in VIDEO_EXTENSIONS):
                 mtd = await get_video_metadata(f)
-                dur, h, w = mtd['duration'], mtd['width'], mtd['height']  # PRE-EXISTING: h/w assignment follows the historical (swapped) order;
-                # do not 'fix' inside the Phase 7 split — tracked as follow-up
+                dur, w, h = mtd['duration'], mtd['width'], mtd['height']
                 th = await screenshot(f, dur, prep.d)
                 prep.th = th
                 await prep.sender.send_video(
