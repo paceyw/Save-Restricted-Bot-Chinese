@@ -14,6 +14,7 @@ except ImportError:
     # progress-throttle setting.
     PROGRESS_MIN_INTERVAL = 3.0
 from shared_client import app as main_bot, _WORKDIR
+from utils.caption import restructure_caption
 from utils.func import (
     apply_text_rules, screenshot, thumbnail, get_video_metadata,
     ensure_audio_track, touch_file, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
@@ -354,6 +355,9 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
         proc_text = oc
     else:
         orig_caption = next((one.caption.markdown for one in msgs if one.caption), '')
+        # auto five-block format when the source text carries catalog-ish
+        # elements (番号/labelled lines/hashtag runs); plain texts pass through
+        orig_caption = restructure_caption(orig_caption) or orig_caption
         proc_text = apply_text_rules(
             orig_caption,
             settings.get('replacement_words', {}),
@@ -497,6 +501,7 @@ async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
         proc_text = oc
     else:
         combined = '\n\n'.join(tp for tp in text_pieces if tp)
+        combined = restructure_caption(combined) or combined
         proc_text = apply_text_rules(
             combined,
             settings.get('replacement_words', {}),
@@ -806,6 +811,7 @@ async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
                 proc_text = oc
             else:
                 orig_text = m.caption.markdown if m.caption else ''
+                orig_text = restructure_caption(orig_text) or orig_text
                 proc_text = apply_text_rules(
                     orig_text,
                     settings.get('replacement_words', {}),
@@ -869,7 +875,7 @@ async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
                 did=did,
                 ft=None,
                 sender=sender,
-                text=oc if oc is not None else m.text.markdown,
+                text=oc if oc is not None else (restructure_caption(m.text.markdown) or m.text.markdown),
                 f=None,
                 p=None,
                 th=None,
