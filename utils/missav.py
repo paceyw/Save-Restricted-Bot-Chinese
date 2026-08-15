@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import shutil
+from html import unescape as html_unescape
 import tempfile as _tempfile
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -222,6 +223,163 @@ def extract_page_info(html):
     title = _meta_content(html, r'property=["\']og:title')
     thumbnail = _meta_content(html, r'property=["\']og:image')
     return {"title": title or "", "thumbnail": thumbnail}
+
+
+_PANEL_LABELS = {
+    "code": r"番号|番號|Code",
+    "orig_title": r"标题|標題|Title",
+    "actresses": r"女优|女優|Actress(?:es)?",
+    "genres": r"类型|類型|Genre|Tag",
+}
+
+
+def _panel_section(html, label_key):
+    """Return the labelled info-panel section's inner HTML, or ''.
+
+    The video page renders labelled rows like
+    ``<span>番号:</span> <span class=…>DASS-629</span>`` and
+    ``<span>女优:</span> <a …>百永さりな</a>, …`` inside one div.
+    """
+    label = _PANEL_LABELS[label_key]
+    m = re.search(
+        rf"<span>\s*(?:{label})\s*:\s*</span>(.*?)</div>", html, re.DOTALL
+    )
+    return m.group(1) if m else ""
+
+
+def _panel_plain(section):
+    return re.sub(r"<[^>]+>", "", section).strip(" ,\n\t")
+
+
+def _panel_links(section):
+    out = []
+    for m in re.finditer(r"<a\b[^>]*>([^<]+)</a>", section):
+        text = html_unescape(m.group(1)).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+_CODE_FROM_SLUG = re.compile(r"^([a-z]{2,7})-?(\d{2,5})", re.IGNORECASE)
+_SLUG_BADGES = (
+    ("chinese-subtitle", "中文字幕"),
+    ("uncensored", "无码"),
+    ("uncensored-leaked", "无码流出"),
+    ("leaked", "流出"),
+)
+
+
+def extract_video_details(page_html, url):
+    """Parse the labelled info panel + og meta into caption ingredients.
+
+    Returns {'code','title','actresses','genres','badges'} — every field
+    degrades independently (page layout changes must not break downloads).
+    """
+    details = {"code": "", "title": "", "actresses": [], "genres": [], "badges": []}
+
+    code = _panel_plain(_panel_section(page_html, "code"))
+    details["code"] = code.upper() if code else ""
+
+    og_title = _meta_content(page_html, r'property=["\']og:title') or ""
+    orig_title = _panel_plain(_panel_section(page_html, "orig_title"))
+
+    # Localized intro line: og:title minus the leading code and the
+    # trailing " - actress" segment, e.g.
+    # "DASS-629 你愿意当我的宠物吗？… - 百永さりな" -> "你愿意当我的宠物吗？…"
+    intro = og_title
+    if details["code"] and intro.upper().startswith(details["code"]):
+        intro = intro[len(details["code"]):].strip()
+    intro = re.sub(r"\s*-\s*[^-]+$", "", intro).strip(" -")
+    if not intro:
+        intro = orig_title
+    details["title"] = intro
+
+    details["actresses"] = _panel_links(_panel_section(page_html, "actresses"))
+    details["genres"] = _panel_links(_panel_section(page_html, "genres"))
+
+    slug = (parse_missav_url(url) or {}).get("slug", "") or ""
+    lowered = slug.lower()
+    badges = [label for token, label in _SLUG_BADGES if token in lowered]
+    # keep order but drop the weaker "leaked"/"uncensored" when the
+    # combined badge already covers them
+    if "无码流出" in badges:
+        badges = [b for b in badges if b not in ("无码", "流出", "无码流出")]
+        badges.append("无码流出")
+    details["badges"] = badges
+
+    if not details["code"]:
+        m = _CODE_FROM_SLUG.match(slug)
+        if m:
+            details["code"] = f"{m.group(1).upper()}-{m.group(2)}"
+    return details
+
+
+def _hashtag(text):
+    """'#' + text with characters that break Telegram hashtags mapped away."""
+    cleaned = re.sub(r"[\s#\n]+", "_", html_unescape(text).strip())
+    cleaned = cleaned.strip("_")
+    return f"#{cleaned}" if cleaned else ""
+
+
+def build_caption(details, max_len=1024):
+    """Five-block caption per issue #13 style:
+
+        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n类别：#…
+
+    The three hashtag lines form ONE block (single newlines) separated
+    from the intro by a blank line, matching the reference layout.
+    Blocks with no data are omitted; hashtag lines are trimmed from the
+    tail when the whole caption would exceed Telegram's 1024 limit.
+    """
+    code = (details.get("code") or "").strip()
+    intro = (details.get("title") or "").strip()
+    actresses = [t for t in (_hashtag(x) for x in details.get("actresses") or []) if t]
+    genres = [t for t in (_hashtag(x) for x in details.get("genres") or []) if t]
+    badges = [t for t in (_hashtag(x) for x in details.get("badges") or []) if t]
+
+    blocks = []
+    if code:
+        blocks.append(code)
+    if intro:
+        blocks.append(intro)
+
+    tag_lines = []
+    if actresses:
+        tag_lines.append("演员：" + " ".join(actresses))
+    if genres:
+        tag_lines.append("标签：" + " ".join(genres))
+    if badges:
+        tag_lines.append("类别：" + " ".join(badges))
+    if tag_lines:
+        blocks.append("\n".join(tag_lines))
+    if not blocks:
+        return ""
+
+    def render(parts):
+        return "\n\n".join(parts)
+
+    # hashtag lines carry a 「label：」prefix; trim their tails (keep the
+    # label + one tag) until the caption fits Telegram's limit
+    def is_tag_line(line):
+        return line.startswith(("演员：", "标签：", "类别：", "演员:", "标签:", "类别:"))
+
+    while len(render(blocks)) > max_len:
+        tag_block_idx = next(
+            (i for i in reversed(range(len(blocks))) if "\n" in blocks[i]), None
+        )
+        if tag_block_idx is None:
+            break
+        tag_lines = blocks[tag_block_idx].split("\n")
+        trimmable = next(
+            (j for j in reversed(range(len(tag_lines)))
+             if is_tag_line(tag_lines[j]) and len(tag_lines[j].split(" ")) > 2),
+            None,
+        )
+        if trimmable is None:
+            break
+        tag_lines[trimmable] = " ".join(tag_lines[trimmable].split(" ")[:-1])
+        blocks[tag_block_idx] = "\n".join(tag_lines)
+    return render(blocks)[:max_len]
 
 
 def extract_m3u8_url(html):
@@ -667,6 +825,7 @@ async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
             "thumbnail": info["thumbnail"],
             "segments": total,
             "host": host,
+            "details": extract_video_details(page_html, url),
         }
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

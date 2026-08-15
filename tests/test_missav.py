@@ -365,6 +365,7 @@ def test_download_missav_roundtrip(monkeypatch, tmp_path):
     assert meta["thumbnail"] == "https://cdn.example/pic.jpg"
     assert meta["segments"] == 3
     assert meta["host"] == "missav.ai"
+    assert meta["details"]["code"] == "SONE-543"  # slug fallback (fixture has no panel)
     assert events[0] == ("page", 0, 1)
     assert events[-1] == ("merge", 3, 3)
     seg_events = [e for e in events if e[0] == "segments"]
@@ -516,7 +517,6 @@ def test_download_missav_enforces_byte_budget(monkeypatch, tmp_path):
 
 
 def test_http_get_aborts_oversized_stream(monkeypatch):
-    import io
 
     class _SlowStream:
         def __init__(self, total):
@@ -552,7 +552,6 @@ def test_http_get_aborts_oversized_stream(monkeypatch):
 
 
 def test_unpack_packed_js_rejects_oversized_dictionary():
-    url = "https://surrit.com/x.m3u8"
     huge_key = "z" * (65 * 1024)
     block = _packed_block("var 0=1", 36, 2, ["source", huge_key])
     assert missav.unpack_packed_js(block) is None
@@ -565,3 +564,132 @@ def test_mirror_candidates_drops_port():
     # out-of-range ports must not raise
     cands = missav.mirror_candidates("https://missav.ai:99999/sone-543")
     assert cands[0] == "https://missav.ai/sone-543"
+
+
+# ─── video details + caption (issue #13 follow-up) ────────────────────────────
+
+# trimmed from a real missav.ai/cn/dass-629 page (2026-08)
+REAL_PAGE = """
+<html><head>
+<meta property="og:title" content="DASS-629 你愿意当我的宠物吗？真实的故事。饲养女同宠物的美女：桃永纱里奈、仙谷最中、松井日菜子 - 百永さりな">
+<meta property="og:image" content="https://fourhoi.com/dass-629/cover-n.jpg">
+</head><body>
+<div class="space-y-2">
+ <div class="text-secondary"><span>发行日期:</span> <time>2025-05-09</time></div>
+ <div class="text-secondary"><span>番号:</span> <span class="font-medium">DASS-629</span></div>
+ <div class="text-secondary"><span>标题:</span> <span class="font-medium">私に飼われてみない？ 実録。</span></div>
+ <div class="text-secondary"><span>女优:</span>
+   <a href="https://missav.live/dm71/cn/actresses/%E7%99%BE%E6%B0%B8" class="text-nord13 font-medium">百永さりな</a>,
+   <a href="https://missav.live/dm30/cn/actresses/%E5%8D%83%E7%9F%B3" class="text-nord13 font-medium">千石もなか</a>,
+   <a href="https://missav.live/dm5/cn/actresses/%E6%9D%BE%E4%BA%95" class="text-nord13 font-medium">松井日奈子</a>
+ </div>
+ <div class="text-secondary"><span>类型:</span>
+   <a href="https://missav.live/dm757/cn/genres/%E8%8B%97%E6%9D%A1" class="text-nord13 font-medium">苗条</a>,
+   <a href="https://missav.live/dm900/cn/genres/%E5%A5%B3%E5%90%8C" class="text-nord13 font-medium">女同性恋</a>,
+   <a href="https://missav.live/dm906/cn/genres/%E6%BD%AE%E5%90%B" class="text-nord13 font-medium">潮吹</a>,
+   <a href="https://missav.live/dm166/cn/genres/%E5%A4%9A%E4%BA" class="text-nord13 font-medium">多人运动</a>
+ </div>
+</div>
+</body></html>
+"""
+
+REAL_PAGE_EN = """
+<html><head><meta property="og:title" content="DASS-629 Would you be my pet? - Sarina Momonaga"></head><body>
+<div class="text-secondary"><span>Code:</span> <span class="font-medium">DASS-629</span></div>
+<div class="text-secondary"><span>Title:</span> <span class="font-medium">Watashi ni kawareteminai?</span></div>
+<div class="text-secondary"><span>Actress:</span>
+ <a href="https://missav.live/dm71/en/actresses/Sarina%20Momonaga" class="text-nord13 font-medium">Sarina Momonaga</a>
+</div>
+<div class="text-secondary"><span>Genre:</span>
+ <a href="https://missav.live/dm757/en/genres/Slim" class="text-nord13 font-medium">Slim</a>,
+ <a href="https://missav.live/dm900/en/genres/Lesbian" class="text-nord13 font-medium">Lesbian</a>
+</div>
+</body></html>
+"""
+
+
+def test_extract_video_details_cn_page():
+    d = missav.extract_video_details(REAL_PAGE, "https://missav.ai/cn/dass-629")
+    assert d["code"] == "DASS-629"
+    assert d["actresses"] == ["百永さりな", "千石もなか", "松井日奈子"]
+    assert d["genres"] == ["苗条", "女同性恋", "潮吹", "多人运动"]
+    assert d["badges"] == []
+    # intro: og:title minus code prefix and trailing "- actress"
+    assert d["title"].startswith("你愿意当我的宠物吗")
+    assert "DASS-629" not in d["title"]
+    assert not d["title"].endswith("百永さりな")
+
+
+def test_extract_video_details_en_page_and_badges():
+    d = missav.extract_video_details(REAL_PAGE_EN, "https://missav.ai/en/dass-629-chinese-subtitle")
+    assert d["code"] == "DASS-629"
+    assert d["actresses"] == ["Sarina Momonaga"]
+    assert d["genres"] == ["Slim", "Lesbian"]
+    assert d["badges"] == ["中文字幕"]
+    assert d["title"].startswith("Would you be my pet?")
+
+
+def test_extract_video_details_degrades_without_panel():
+    # layout change / empty page: every field falls back independently
+    d = missav.extract_video_details("<html></html>", "https://missav.ai/sone-543")
+    assert d["actresses"] == [] and d["genres"] == []
+    # slug fallback code: sone-543 -> SONE-543
+    assert d["code"] == "SONE-543"
+    d2 = missav.extract_video_details("<html></html>", "https://missav.ai/dm1151/092014_887")
+    assert d2["code"] == ""  # slug starts with digits: no letters prefix, no fake code
+    assert d2["badges"] == []
+
+
+def test_extract_video_details_uncensored_leaked_slug():
+    d = missav.extract_video_details(
+        "<html></html>", "https://missav.ai/cn/stars-804-uncensored-leaked")
+    assert d["badges"] == ["无码流出"]
+
+
+def test_build_caption_full_format():
+    d = {
+        "code": "DASS-629",
+        "title": "想不想被我饲养？实录",
+        "actresses": ["百永さりな", "千石もなか"],
+        "genres": ["女同性恋", "潮吹", "多人运动"],
+        "badges": ["中文字幕"],
+    }
+    cap = missav.build_caption(d)
+    assert cap == (
+        "DASS-629\n\n"
+        "想不想被我饲养？实录\n\n"
+        "演员：#百永さりな #千石もなか\n"
+        "标签：#女同性恋 #潮吹 #多人运动\n"
+        "类别：#中文字幕"
+    )
+
+
+def test_build_caption_sanitizes_and_skips_empty_blocks():
+    d = {
+        "code": "ABP-1",
+        "title": "",
+        "actresses": ["Sarina Momonaga"],   # space -> underscore in hashtag
+        "genres": [],
+        "badges": ["无码"],
+    }
+    cap = missav.build_caption(d)
+    assert cap == "ABP-1\n\n演员：#Sarina_Momonaga\n类别：#无码"
+
+
+def test_build_caption_trims_to_telegram_limit():
+    d = {
+        "code": "DASS-629",
+        "title": "intro " * 5,
+        "actresses": [f" Actress {i:03d} " for i in range(40)],
+        "genres": [f" Genre {i:03d} " for i in range(40)],
+        "badges": ["中文字幕"],
+    }
+    cap = missav.build_caption(d)
+    assert len(cap) <= 1024
+    assert cap.startswith("DASS-629")       # code line never trimmed
+    assert cap.count("\n\n") == 2            # code / intro / tag-block layout kept
+    assert "类别：" in cap                     # last tag line survives trimming
+
+
+def test_build_caption_empty_details():
+    assert missav.build_caption({}) == ""

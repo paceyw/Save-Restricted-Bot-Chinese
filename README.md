@@ -111,7 +111,9 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 <summary><b>missav.ai 下载说明（issue #13）</b></summary>
 
 - 支持 `missav.ai / missav.ws / missav.live / missav123.com` 的视频页链接（含 `cn/en` 等语言前缀与 `dm\d+` 路由前缀），自动镜像轮询过 Cloudflare
-- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4 → 回传 Telegram（>2GB 自动分片）
+- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4 → 回传（>2GB 自动分片）
+- 投递：与提取流程一致（`/settings` 投递频道 → `LOG_GROUP` → 私聊回退），频道优先用 `/setbot` 机器人发送；封面用页面 og:image
+- caption 五段式：番号 / 简介 / 演员# / 标签# / 类别#（中文字幕、无码等从 URL 徽章推导，缺失块自动省略）
 - 内置资源防护：单任务 20k 段 / 20GB / 8 小时上限，私网与云元数据地址拒绝访问，跨用户最多同时 2 个 missav 任务
 - 依赖：`curl-cffi`（Chrome TLS 指纹）、`m3u8`；`MISSAV_MIRRORS` / `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` 可调
 

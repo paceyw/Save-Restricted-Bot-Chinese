@@ -28,6 +28,7 @@ from utils.func import get_video_metadata, screenshot, touch_file
 from utils.missav import (
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     MissAVError,
+    build_caption,
     download_missav,
     is_missav_url,
 )
@@ -284,14 +285,23 @@ async def dl_handler(client, message):
 
 
 async def _finalize_and_upload(message, download_path, title, thumbnail_url,
-                               progress_message, extra_meta=None):
+                               progress_message, extra_meta=None,
+                               target_chat=None, sender=None,
+                               caption_override=None):
     """Probe metadata, resolve a thumbnail (download → screenshot fallback),
     then upload (splitting first when >2 GB).
+
+    Progress/notice messages always go to the requesting chat via the main
+    bot; the media itself goes to ``target_chat`` (default: requesting
+    chat) via ``sender`` (default: main bot). ``caption_override``
+    replaces the default bold-title caption entirely.
 
     Owns and cleans its thumbnail/screenshot temp files; the caller owns
     ``download_path``.
     """
     chat_id = message.chat.id
+    dest_chat = target_chat if target_chat is not None else chat_id
+    uploader = sender or app
     download_dir = os.path.dirname(download_path)
     extra = extra_meta or {}
     thumbnail_file = None
@@ -329,20 +339,20 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
 
         # clamp remote titles: Telegram captions cap at 1024 chars and a
         # hostile og:title must not fail the upload after the full download
-        caption = f"**{title[:500]}**"
+        caption = caption_override if caption_override is not None else f"**{title[:500]}**"
         # Telegram bot API single-file limit is 2 GB; larger files are split.
         SIZE = 2 * 1024 * 1024 * 1024
-
         if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
             prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await split_and_upload_file(app, chat_id, download_path, caption)
+            await split_and_upload_file(uploader, dest_chat, download_path, caption)
             await prog.delete()
+            await _safe_delete(progress_message)
+            return
 
         if os.path.exists(download_path):
-            await progress_message.delete()
             prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await app.send_video(
-                chat_id,
+            await uploader.send_video(
+                dest_chat,
                 video=download_path,
                 caption=caption,
                 duration=duration,
@@ -408,13 +418,40 @@ async def _run_missav_download(message, url, hosts, progress_message):
             concurrency=MISSAV_SEGMENT_CONCURRENCY,
             progress=progress,
         )
-        await _finalize_and_upload(
-            message,
-            download_path,
-            info.get('title') or 'missav 视频',
-            info.get('thumbnail'),
-            progress_message,
-        )
+        details = info.get('details') or {}
+        caption = build_caption(details) or f"**{info.get('title') or 'missav 视频'}**"
+
+        target_chat, sender = await _resolve_missav_delivery(message)
+        try:
+            await _finalize_and_upload(
+                message,
+                download_path,
+                info.get('title') or 'missav 视频',
+                info.get('thumbnail'),
+                progress_message,
+                target_chat=target_chat,
+                sender=sender,
+                caption_override=caption,
+            )
+        except Exception as e:
+            if sender is app or target_chat == message.chat.id:
+                raise  # no alternate route to try
+            # channel send failed (custom bot not a member / no rights):
+            # fall back to the main bot, then to the requesting chat
+            logger.warning("missav channel delivery failed (%s); retrying via main bot", e)
+            try:
+                await _finalize_and_upload(
+                    message, download_path, info.get('title') or 'missav 视频',
+                    info.get('thumbnail'), progress_message,
+                    target_chat=target_chat, sender=app, caption_override=caption,
+                )
+            except Exception as e2:
+                logger.warning("missav main-bot delivery failed too (%s); sending to user chat", e2)
+                await _finalize_and_upload(
+                    message, download_path, info.get('title') or 'missav 视频',
+                    info.get('thumbnail'), progress_message,
+                    caption_override=caption,
+                )
     except MissAVError as e:
         logger.warning("missav download failed: %s", e)
         await _safe_delete(progress_message)
@@ -426,6 +463,31 @@ async def _run_missav_download(message, url, hosts, progress_message):
     finally:
         if os.path.exists(download_path):
             os.remove(download_path)
+
+
+async def _resolve_missav_delivery(message):
+    """Pick the missav delivery target/sender, mirroring resolve_delivery:
+    per-user settings chat -> LOG_GROUP -> the requesting chat. Channel
+    targets are served by the user's /setbot bot when available (same
+    membership rules as the fetch flow), else the main bot."""
+    try:
+        from plugins.deliver import resolve_delivery
+        from plugins.fetch import get_ubot
+        from utils.func import get_user_settings
+
+        settings = await get_user_settings(message.from_user.id) or {}
+        tcid, rtmid, deliver_via_bot = await resolve_delivery(message.chat.id, settings)
+        if deliver_via_bot and tcid != message.chat.id:
+            ubot = None
+            try:
+                ubot = await get_ubot(message.from_user.id)
+            except Exception as e:
+                logger.info("get_ubot unavailable for missav delivery: %s", e)
+            return tcid, (ubot or app)
+        return tcid, app
+    except Exception as e:
+        logger.warning("missav delivery resolution failed, defaulting to chat: %s", e)
+        return message.chat.id, app
 
 
 async def _safe_delete(message):
