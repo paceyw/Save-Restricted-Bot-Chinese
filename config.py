@@ -64,6 +64,14 @@ CHANNEL_INTERVAL = float(os.getenv("CHANNEL_INTERVAL", "5"))  # merge: between c
 UPLOAD_INTERVAL  = float(os.getenv("UPLOAD_INTERVAL", "2"))   # after each media upload
 MAX_FLOOD_RETRIES = int(os.getenv("MAX_FLOOD_RETRIES", "3"))  # FloodWait retry attempts
 
+# ─── MISSAV (issue #13) ─────────────────────────────────────────────────────────
+# 镜像域名逗号分隔；留空使用内置列表（missav.ai/.ws/.live + missav123.com）
+MISSAV_MIRRORS = [h.strip() for h in os.getenv("MISSAV_MIRRORS", "").split(",") if h.strip()] or None
+# clamp to a sane range: 0/negative would stall, 1000 would flood the CDN
+MISSAV_SEGMENT_CONCURRENCY = min(32, max(1, int(os.getenv("MISSAV_SEGMENT_CONCURRENCY", "8"))))
+# cross-user cap on simultaneous missav jobs (disk/bandwidth guard)
+MISSAV_MAX_JOBS = max(1, int(os.getenv("MISSAV_MAX_JOBS", "2")))
+
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")

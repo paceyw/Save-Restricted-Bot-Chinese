@@ -104,8 +104,19 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 ### 🎬 媒体下载
 | 命令 | 说明 |
 |---|---|
-| `/dl <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点） |
+| `/dl <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点，以及 missav.ai 视频页 —— 后者走内置 HLS 提取管线，见下） |
 | `/adl <链接>` | 提取音频 |
+
+<details>
+<summary><b>missav.ai 下载说明（issue #13）</b></summary>
+
+- 支持 `missav.ai / missav.ws / missav.live / missav123.com` 的视频页链接（含 `cn/en` 等语言前缀与 `dm\d+` 路由前缀），自动镜像轮询过 Cloudflare
+- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4 → 回传 Telegram（>2GB 自动分片）
+- 内置资源防护：单任务 20k 段 / 20GB / 8 小时上限，私网与云元数据地址拒绝访问，跨用户最多同时 2 个 missav 任务
+- 依赖：`curl-cffi`（Chrome TLS 指纹）、`m3u8`；`MISSAV_MIRRORS` / `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` 可调
+
+</details>
+
 
 ### ℹ️ 其他
 | 命令 | 说明 |
@@ -153,6 +164,9 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | `CHANNEL_INTERVAL` | `5` | 频道遍历间隔（秒） |
 | `UPLOAD_INTERVAL` | `2` | 媒体上传间隔（秒） |
 | `MAX_FLOOD_RETRIES` | `3` | FloodWait 最大重试次数 |
+| `MISSAV_MIRRORS` | 内置列表 | missav 镜像域名，逗号分隔；留空用 `missav.ai/.ws/.live` + `missav123.com` |
+| `MISSAV_SEGMENT_CONCURRENCY` | `8` | missav 分段下载并发数（1–32） |
+| `MISSAV_MAX_JOBS` | `2` | 同时进行的 missav 任务数上限（跨用户） |
 
 > ⚠️ **安全**：`config.py` 中 `MASTER_KEY`/`IV_KEY` 的默认值仅用于演示。生产部署务必通过环境变量覆盖为随机值，否则任何人都能解密你的用户会话。
 
@@ -197,8 +211,9 @@ docker compose up -d --build
 ├── utils/
 │   ├── func.py          # MongoDB 集合、文件处理、视频元数据
 │   ├── encrypt.py       # 会话加密（AES-GCM）
+│   ├── missav.py        # missav.ai HLS 下载管线（镜像轮询/packed JS/AES-128/remux，issue #13）
 │   └── custom_filters.py# 登录流程过滤器
-├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引 / peer 缓存）
+├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引 / peer 缓存 / missav 下载与路由）
 └── templates/welcome.html
 ```
 
