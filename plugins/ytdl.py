@@ -480,17 +480,24 @@ async def _resolve_cover(thumbnail_url, download_dir, video_path, duration, user
 def _build_album_group(cover_file, video_paths, caption, duration, width, height):
     """Assemble the media-group items: cover photo first, then the video
     (or >2GB split parts) as streamable videos. The caption rides the
-    FIRST item — Telegram renders one caption for the whole album."""
+    FIRST item — Telegram renders one caption for the whole album.
+
+    duration/width/height must never be None: pyrofork serializes the
+    video attribute duration as a TL Double and struct.pack('d', None)
+    aborts the whole send with "required argument is not a float"
+    (observed live on 2026-08-15). Later split parts get 0 — only part 0
+    carries the moov atom and real metadata anyway."""
     group = []
     if cover_file:
         group.append(InputMediaPhoto(cover_file, caption=caption))
     for i, path in enumerate(video_paths):
+        first = i == 0
         group.append(InputMediaVideo(
             path,
-            caption=caption if i == 0 and not group else None,
-            width=width if i == 0 else None,
-            height=height if i == 0 else None,
-            duration=duration if i == 0 else None,
+            caption=caption if first and not group else None,
+            width=int(width) if first and width else 0,
+            height=int(height) if first and height else 0,
+            duration=int(duration) if first and duration else 0,
             supports_streaming=True,
         ))
     return group
@@ -543,6 +550,7 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
     size = os.path.getsize(video_path)
     SIZE_LIMIT = 2 * 1024 * 1024 * 1024
     video_paths = None
+    prog = None
     try:
         if size <= SIZE_LIMIT:
             video_paths = [video_path]
@@ -554,8 +562,14 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
                 await _safe_delete(notice)
 
         group = _build_album_group(cover_file, video_paths, caption, duration, width, height)
+        prog = await app.send_message(
+            notice_chat, f"**__开始上传相册（{len(group)} 项）...__**")
         try:
-            await sender.send_media_group(dest_chat, group)
+            await sender.send_media_group(
+                dest_chat, group,
+                progress=progress_bar,
+                progress_args=(UPLOAD_HEADER, prog, time.time(), video_path),
+            )
         except Exception as e:
             # media-group upload failed midway (flood/network): fall back to
             # item-by-item sends so the video still reaches the channel
@@ -563,14 +577,18 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
             if cover_file:
                 await sender.send_photo(dest_chat, cover_file, caption=caption)
             for i, path in enumerate(video_paths):
+                first = i == 0
                 await sender.send_video(
                     dest_chat, path,
-                    caption=caption if i == 0 and not cover_file else None,
-                    duration=duration if i == 0 else None,
-                    width=width if i == 0 else None,
-                    height=height if i == 0 else None,
+                    caption=caption if first and not cover_file else None,
+                    duration=int(duration) if first and duration else 0,
+                    width=int(width) if first and width else 0,
+                    height=int(height) if first and height else 0,
                     supports_streaming=True,
+                    progress=progress_bar,
+                    progress_args=(UPLOAD_HEADER, prog, time.time(), video_path),
                 )
+        await _safe_delete(prog)
     finally:
         if video_paths and video_paths[0] != video_path:
             shutil.rmtree(os.path.dirname(video_paths[0]), ignore_errors=True)

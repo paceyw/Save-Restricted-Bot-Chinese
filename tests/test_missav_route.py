@@ -212,22 +212,29 @@ def test_build_album_group_caption_and_dims(ytdl, monkeypatch):
 
     captured.clear()
     g2 = ytdl._build_album_group(None, ["v1.mp4", "v2.mp4", "v3.mp4"], "CAP", 100, 640, 360)
-    # no cover: caption rides the FIRST video; later parts carry no dims
+    # no cover: caption rides the FIRST video; later parts carry 0 dims —
+    # pyrofork serializes duration as a TL double, None aborts the send
     assert [(x.kind, x.caption) for x in g2] == [
         ("video", "CAP"), ("video", None), ("video", None)]
-    assert g2[1].kw["width"] is None and g2[2].kw["duration"] is None
+    assert g2[0].kw["width"] == 640 and g2[0].kw["duration"] == 100
+    assert g2[1].kw["width"] == 0 and g2[2].kw["duration"] == 0
 
 
 def test_upload_album_small_file_sends_only_album(ytdl, monkeypatch, tmp_path):
     sent = {"album": [], "notices": []}
 
     class FakeSender:
-        async def send_media_group(self, chat, group):
+        async def send_media_group(self, chat, group, progress=None, progress_args=()):
             sent["album"].append((chat, group))
+
+    class FakeMsg:
+        async def delete(self):
+            pass
 
     class FakeApp:
         async def send_message(self, chat, text):
             sent["notices"].append((chat, text))
+            return FakeMsg()
 
     monkeypatch.setattr(ytdl, "app", FakeApp())
     video = tmp_path / "v.mp4"
@@ -240,14 +247,15 @@ def test_upload_album_small_file_sends_only_album(ytdl, monkeypatch, tmp_path):
         FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
 
     assert sent["album"] == [(-100, ["GROUP"])]
-    assert sent["notices"] == []  # nothing but the album reaches the channel
+    # only upload notices in the PRIVATE chat; channel got nothing textual
+    assert sent["notices"] == [(42, "**__开始上传相册（1 项）...__**")]
 
 
 def test_upload_album_big_file_splits_with_private_notice(ytdl, monkeypatch, tmp_path):
     sent = {"album": [], "notices": []}
 
     class FakeSender:
-        async def send_media_group(self, chat, group):
+        async def send_media_group(self, chat, group, progress=None, progress_args=()):
             sent["album"].append((chat, group))
 
     class FakeMsg:
@@ -287,8 +295,11 @@ def test_upload_album_big_file_splits_with_private_notice(ytdl, monkeypatch, tmp
     asyncio.run(ytdl._upload_missav_album(
         FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
 
-    # notice went to the PRIVATE chat only, album to the channel
-    assert sent["notices"] == [(42, "**__文件超过 2GB，正在分片...__**")]
+    # every notice went to the PRIVATE chat only; album to the channel
+    assert sent["notices"] == [
+        (42, "**__文件超过 2GB，正在分片...__**"),
+        (42, "**__开始上传相册（2 项）...__**"),
+    ]
     assert sent["album"] == [(-100, ["GROUP", "GROUP"])]
     # split temp dir cleaned up
     assert not parts_dir.exists()
