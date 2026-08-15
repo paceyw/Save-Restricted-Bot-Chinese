@@ -30,7 +30,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | **`/single` 公开链接报 MEDIA_EMPTY** | 抓取来源记录（`emp`）以用户名作键、下游按数字 chat ID 查询，永远失配：相册扩展错用自定义 bot（CHANNEL_INVALID 退化为单条），再用 user 会话的 file_id 让 bot 直发（跨客户端引用无效，MEDIA_EMPTY），且失败后不回退 | `emp` 统一按数字 chat ID 记录，相册扩展正确选用抓取客户端；file_id 直发失败自动回退下载重传；下载固定使用实际抓到消息的客户端 |
 | **相册大视频丢失（>2GB）** | 带说明文字的相册被强制走"下载后重传"：无 premium 会话时自定义 bot 上限 2000 MiB，4GB 视频整组与逐条发送均失败，频道里只剩图片；且自定义 bot 不在源频道时 `copy_media_group` 直接 `CHANNEL_INVALID` | 相册一律优先**服务端整组复制**（支持替换说明文字，不重新上传、不受 bot 上传上限约束）：先由自定义 bot 复制，失败自动改用实际抓取消息的登录会话重试；下载产物校验非空/大小一致（Pyrofork 超时可能落盘 0 字节文件），坏项跳过重试，不再拆散相册；上传中 mtime 心跳防误清 |
 | **`/setbot` 令牌"已保存却仍提示提供"** | 保存路径与读取路径的清洗逻辑不一致，合法 token 被判空 | 统一令牌读取与校验，`/single` 正常识别已保存的自定义 bot |
-| **投递目标不符合直觉** | 文件只发回私聊，无法固定投递到指定频道 | 默认投递到 `LOG_GROUP` 频道（由 `/setbot` 的自定义 bot 发送，需加入频道并授发帖权限）；优先级：`/settings` 的 chat_id > `LOG_GROUP` > 私聊 |
+| **pyrofork 相册解析崩溃（双发）** | `send_media_group` 在相册**已成功送达后**构造响应对象 `raw.types.messages.Messages(...)` 漏传本层必填的 `topics` 参数，抛 TypeError 被调用方误判为失败而重发，频道收到重复内容（pyrofork 2.3.69 全应用范围） | `shared_client` 导入期 monkeypatch 给 `topics` 兜底 `[]`，覆盖全部 `send_media_group` 调用点（含相册转发与 missav 投递） |
 | **进度消息刷屏频道** | 下载/上传进度条直接发在目标频道 | 进度报告一律发到用户与主 Bot 的私聊，频道只保留最终相册/文件 |
 | **`/login` 验证码被 Telegram 失效** | 直接发原始验证码会被 Telegram 立即作废，导致登录失败 | 支持混淆格式（`1 2 3 4 5`、`s12345`、`1-2-3-4-5`），自动提取数字；登录日志手机号脱敏 |
 | **`/batch` 不支持跳选链接** | 只支持"起始链接 + 数量"连续范围，无法一次提交多个不连续链接 | `/batch` 第一步直接粘贴**多条链接（每行一条）**即可逐条下载，遵守套餐条数上限，支持 /stop 取消 |
@@ -111,9 +111,10 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 <summary><b>missav.ai 下载说明（issue #13）</b></summary>
 
 - 支持 `missav.ai / missav.ws / missav.live / missav123.com` 的视频页链接（含 `cn/en` 等语言前缀与 `dm\d+` 路由前缀），自动镜像轮询过 Cloudflare
-- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4 → 回传（>2GB 自动分片）
-- 投递：与提取流程一致（`/settings` 投递频道 → `LOG_GROUP` → 私聊回退），频道优先用 `/setbot` 机器人发送；封面用页面 og:image
+- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4（+faststart 流媒体优化）→ 以**一条相册消息**投递（封面 + 可直接播放的视频）
+- 投递：与提取流程一致（`/settings` 投递频道 → `LOG_GROUP` → 私聊回退），频道优先用 `/setbot` 机器人发送；封面用页面 og:image；下载/上传进度只发私聊
 - caption 五段式：番号 / 简介 / 演员# / 标签# / 类别#（中文字幕、无码等从 URL 徽章推导，缺失块自动省略）
+- >2GB 视频：ffmpeg **关键帧分段**（`-c copy` 无损 + 每段独立时间轴 + moov 前置），每段都是可直接播放、可拖进度的 Telegram 流媒体视频，整组仍在同一条相册内（1.8GB/段目标，最多 9 段）
 - 内置资源防护：单任务 20k 段 / 20GB / 8 小时上限，私网与云元数据地址拒绝访问，跨用户最多同时 2 个 missav 任务
 - 依赖：`curl-cffi`（Chrome TLS 指纹）、`m3u8`；`MISSAV_MIRRORS` / `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` 可调
 
