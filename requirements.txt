@@ -10,6 +10,7 @@ cffi==2.1.1
 charset-normalizer==3.4.9
 click==8.4.2
 cryptography==50.0.0
+curl-cffi==0.14.0
 dnspython==2.8.0
 Flask==2.2.5
 frozenlist==1.8.0
@@ -18,6 +19,7 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 motor==3.7.1
+m3u8==6.0.0
 multidict==6.7.1
 mutagen==1.48.1
 packaging==26.3

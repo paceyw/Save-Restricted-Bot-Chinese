@@ -39,7 +39,13 @@ class _BoundedLRU(OrderedDict):
 
     def __getitem__(self, key):
         value = super().__getitem__(key)
-        self.move_to_end(key)
+        try:
+            self.move_to_end(key)
+        except KeyError:
+            # py3.10's OrderedDict.popitem re-enters through self[key] for
+            # the key it is about to evict; move_to_end then raises because
+            # the node is already gone. The value is still correct.
+            pass
         return value
 
     def get(self, key, default=None):

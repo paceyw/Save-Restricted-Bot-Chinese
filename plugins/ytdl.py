@@ -25,10 +25,23 @@ import math
 from shared_client import app, _WORKDIR
 from pyrogram import filters
 from utils.func import get_video_metadata, screenshot, touch_file
+from utils.missav import (
+    DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
+    MissAVError,
+    download_missav,
+    is_missav_url,
+)
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp 
 import aiofiles
-from config import YT_COOKIES, INSTA_COOKIES
+from config import (
+    INSTA_COOKIES,
+    MISSAV_MAX_JOBS,
+    MISSAV_MIRRORS,
+    MISSAV_SEGMENT_CONCURRENCY,
+    PROGRESS_MIN_INTERVAL,
+    YT_COOKIES,
+)
 from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
 from mutagen.mp3 import MP3
  
@@ -38,20 +51,48 @@ logger = logging.getLogger(__name__)
 thread_pool = ThreadPoolExecutor()
 ongoing_downloads = {}
 screenshot_lock = asyncio.Lock()
+# cross-user cap on simultaneous missav pipelines (disk/bandwidth guard)
+_missav_jobs_sem = None
+
+
+def _get_missav_jobs_sem():
+    global _missav_jobs_sem
+    if _missav_jobs_sem is None:
+        _missav_jobs_sem = asyncio.Semaphore(max(1, MISSAV_MAX_JOBS))
+    return _missav_jobs_sem
+
 
 UPLOAD_HEADER = "╭─────────────────────╮\n│      **__上传中__**\n├─────────────────────"
  
-def d_thumbnail(thumbnail_url, save_path):
+def d_thumbnail(thumbnail_url, save_path, timeout=(5, 20), max_bytes=10 * 1024 * 1024):
     try:
-        response = requests.get(thumbnail_url, stream=True)
+        response = requests.get(thumbnail_url, stream=True, timeout=timeout)
         response.raise_for_status()
+        received = 0
         with open(save_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
+                received += len(chunk)
+                if received > max_bytes:
+                    raise requests.exceptions.RequestException(
+                        f"thumbnail exceeds {max_bytes} bytes")
                 f.write(chunk)
         return save_path
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to download thumbnail: {e}")
+        _remove_quiet(save_path)
         return None
+    except OSError as e:
+        logger.error(f"Failed to save thumbnail: {e}")
+        _remove_quiet(save_path)
+        return None
+
+
+def _remove_quiet(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
  
  
 async def download_thumbnail_async(url, path):
@@ -220,13 +261,16 @@ async def dl_handler(client, message):
 
     if len(message.text.split()) < 2:
         await message.reply_text("**用法：** `/dl <video-link>`\n\n请提供有效的视频链接！")
-        return    
+        return
 
     url = message.text.split()[1]
     ongoing_downloads[user_id] = True
+    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
 
     try:
-        if "instagram.com" in url:
+        if is_missav_url(url, missav_hosts):
+            await process_missav(message, url, missav_hosts)
+        elif "instagram.com" in url:
             await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False)
         elif "youtube.com" in url or "youtu.be" in url:
             await process_video(message, url, YT_COOKIES, check_duration_and_size=True)
@@ -237,6 +281,158 @@ async def dl_handler(client, message):
         await message.reply_text(f"**发生错误：** `{e}`")
     finally:
         ongoing_downloads.pop(user_id, None)
+
+
+async def _finalize_and_upload(message, download_path, title, thumbnail_url,
+                               progress_message, extra_meta=None):
+    """Probe metadata, resolve a thumbnail (download → screenshot fallback),
+    then upload (splitting first when >2 GB).
+
+    Owns and cleans its thumbnail/screenshot temp files; the caller owns
+    ``download_path``.
+    """
+    chat_id = message.chat.id
+    download_dir = os.path.dirname(download_path)
+    extra = extra_meta or {}
+    thumbnail_file = None
+    thumbnail_path = None
+    screenshot_file = None
+    try:
+        k = await get_video_metadata(download_path)
+        duration = int(extra.get('duration') or 0) or k['duration']
+        width = extra.get('width') or k['width']
+        height = extra.get('height') or k['height']
+
+        THUMB = None
+        if thumbnail_url:
+            thumbnail_path = os.path.join(download_dir, get_random_string() + ".jpg")
+            thumbnail_file = await asyncio.to_thread(d_thumbnail, thumbnail_url, thumbnail_path)
+            if thumbnail_file:
+                logger.info(f"Thumbnail saved at: {thumbnail_file}")
+            else:
+                thumbnail_file = None
+
+        if thumbnail_file:
+            THUMB = thumbnail_file
+        else:
+            thumbnail_path = None
+            async with screenshot_lock:
+                previous_cwd = os.getcwd()
+                try:
+                    os.chdir(download_dir)
+                    THUMB = await screenshot(download_path, duration, message.from_user.id)
+                    if THUMB and not os.path.isabs(THUMB):
+                        THUMB = os.path.join(download_dir, THUMB)
+                finally:
+                    os.chdir(previous_cwd)
+            screenshot_file = THUMB
+
+        # clamp remote titles: Telegram captions cap at 1024 chars and a
+        # hostile og:title must not fail the upload after the full download
+        caption = f"**{title[:500]}**"
+        # Telegram bot API single-file limit is 2 GB; larger files are split.
+        SIZE = 2 * 1024 * 1024 * 1024
+
+        if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
+            prog = await app.send_message(chat_id, "**__开始上传...__**")
+            await split_and_upload_file(app, chat_id, download_path, caption)
+            await prog.delete()
+
+        if os.path.exists(download_path):
+            await progress_message.delete()
+            prog = await app.send_message(chat_id, "**__开始上传...__**")
+            await app.send_video(
+                chat_id,
+                video=download_path,
+                caption=caption,
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                thumb=THUMB if THUMB else None,
+                progress=progress_bar,
+                progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
+            )
+            if prog:
+                await prog.delete()
+        else:
+            await message.reply_text("**__下载后未找到文件。出现了问题！__**")
+    finally:
+        for temp_path in (thumbnail_file, screenshot_file):
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+async def process_missav(message, url, hosts):
+    """Download a missav.ai video page via the dedicated HLS pipeline and
+    upload it back through the shared finalize/upload tail."""
+    logger.info(f"Received missav link: {url}")
+    sem = _get_missav_jobs_sem()
+    if sem.locked():
+        await message.reply_text(
+            f"**__当前 missav 下载任务已满（最多 {MISSAV_MAX_JOBS} 个），请稍后再试__**")
+        return
+    progress_message = await message.reply_text("**__开始下载 missav 视频...__**")
+
+    async with sem:
+        await _run_missav_download(message, url, hosts, progress_message)
+
+
+async def _run_missav_download(message, url, hosts, progress_message):
+    download_dir = os.path.join(_WORKDIR, 'downloads')
+    os.makedirs(download_dir, exist_ok=True)
+    download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
+
+    async def progress(done, total, stage):
+        if stage != "segments" or total <= 0:
+            return
+        final = done >= total
+        if not final and (time.time() - progress._last_edit) < PROGRESS_MIN_INTERVAL:
+            return
+        progress._last_edit = time.time()
+        pct = int(done * 100 / total)
+        try:
+            await progress_message.edit_text(
+                f"**__missav 下载中 {pct}%（{done}/{total} 段）...__**"
+            )
+        except Exception:
+            pass  # message deleted / flood-limited: progress display is best-effort
+
+    progress._last_edit = 0.0
+
+    try:
+        info = await download_missav(
+            url,
+            download_path,
+            hosts=hosts,
+            concurrency=MISSAV_SEGMENT_CONCURRENCY,
+            progress=progress,
+        )
+        await _finalize_and_upload(
+            message,
+            download_path,
+            info.get('title') or 'missav 视频',
+            info.get('thumbnail'),
+            progress_message,
+        )
+    except MissAVError as e:
+        logger.warning("missav download failed: %s", e)
+        await _safe_delete(progress_message)
+        await message.reply_text(f"**__missav 下载失败：{e}__**")
+    except Exception as e:
+        logger.exception("missav download/upload failed.")
+        await _safe_delete(progress_message)
+        await message.reply_text(f"**__发生错误：{e}__**")
+    finally:
+        if os.path.exists(download_path):
+            os.remove(download_path)
+
+
+async def _safe_delete(message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 async def process_video(message, url, cookies, check_duration_and_size=False):
@@ -254,11 +450,6 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
             temp_cookie_path = temp_cookie_file.name
         logger.info(f"Created temporary cookie file at: {temp_cookie_path}")
 
-    thumbnail_file = None
-    thumbnail_path = None
-    screenshot_file = None
-    metadata = {'width': None, 'height': None, 'duration': None, 'thumbnail': None}
-
     ydl_opts = {
         'outtmpl': download_path,
         'format': 'best',
@@ -267,7 +458,6 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
         'verbose': True,
     }
 
-    chat_id = message.chat.id
     progress_message = await message.reply_text("**__开始下载...__**")
     logger.info("Starting the download process...")
     try:
@@ -276,77 +466,20 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
             return
 
         await asyncio.to_thread(download_video, url, ydl_opts)
-        title = info_dict.get('title', '由 Team SPY 提供支持')
-        k = await get_video_metadata(download_path)
-        W = k['width']
-        H = k['height']
-        D = k['duration']
-        metadata['width'] = info_dict.get('width') or W
-        metadata['height'] = info_dict.get('height') or H
-        metadata['duration'] = int(info_dict.get('duration') or 0) or D
-        thumbnail_url = info_dict.get('thumbnail', None)
-        THUMB = None
-
-        if thumbnail_url:
-            thumbnail_path = os.path.join(download_dir, get_random_string() + ".jpg")
-            downloaded_thumb = d_thumbnail(thumbnail_url, thumbnail_path)
-            if downloaded_thumb:
-                thumbnail_file = downloaded_thumb
-                logger.info(f"Thumbnail saved at: {downloaded_thumb}")
-            else:
-                thumbnail_file = None
-
-        if thumbnail_file:
-            THUMB = thumbnail_file
-        else:
-            async with screenshot_lock:
-                previous_cwd = os.getcwd()
-                try:
-                    os.chdir(download_dir)
-                    THUMB = await screenshot(download_path, metadata['duration'], message.from_user.id)
-                    if THUMB and not os.path.isabs(THUMB):
-                        THUMB = os.path.join(download_dir, THUMB)
-                finally:
-                    os.chdir(previous_cwd)
-            screenshot_file = THUMB
-
-        caption = f"{title}"
-        # Telegram bot API single-file limit is 2 GB; larger files are split.
-        SIZE = 2 * 1024 * 1024 * 1024
-
-        if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
-            prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await split_and_upload_file(app, chat_id, download_path, caption)
-            await prog.delete()
-
-        if os.path.exists(download_path):
-            await progress_message.delete()
-            prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await app.send_video(
-                chat_id,
-                video=download_path,
-                caption=f"**{title}**",
-                duration=metadata['duration'],
-                width=metadata['width'],
-                height=metadata['height'],
-                supports_streaming=True,
-                thumb=THUMB if THUMB else None,
-                progress=progress_bar,
-                progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
-            )
-            if prog:
-                await prog.delete()
-        else:
-            await message.reply_text("**__下载后未找到文件。出现了问题！__**")
+        await _finalize_and_upload(
+            message,
+            download_path,
+            info_dict.get('title', '由 Team SPY 提供支持'),
+            info_dict.get('thumbnail', None),
+            progress_message,
+            extra_meta=info_dict,
+        )
     except Exception as e:
         logger.exception("An error occurred during download or upload.")
         await message.reply_text(f"**__发生错误：{e}__**")
     finally:
         cleanup_paths = {
             download_path,
-            thumbnail_file,
-            thumbnail_path,
-            screenshot_file,
             os.path.splitext(download_path)[0] + ".jpg",
             os.path.splitext(download_path)[0] + ".webp",
         }
