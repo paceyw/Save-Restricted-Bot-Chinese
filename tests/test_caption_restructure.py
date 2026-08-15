@@ -73,9 +73,30 @@ def test_long_intro_truncated():
     out = caption.restructure_caption("ABP-123 " + "很长的简介" * 300 + "\n标签：#测试")
     assert out is not None
     assert len(out) <= 1024
-    assert out.endswith("…\n\n标签：#测试")
+    # five-line skeleton: intro truncated, then the fixed three label lines
+    assert out.count("\n\n") == 2 and "…" in out
+    assert out.split("\n")[-3:] == ["演员：", "标签：#测试", "类别："]
 
 
 def test_code_inside_filename_detected():
     out = caption.restructure_caption("分享文件 SONE-001_4K.mp4 #收藏")
     assert out.startswith("SONE-001")
+
+
+def test_skeleton_keeps_empty_slots():
+    """All five lines + two blank separators, missing items as bare labels
+    or empty lines so the user can fill them in by hand."""
+    out = caption.restructure_caption("GVH-690 只有番号 #无码")
+    lines = out.split("\n")
+    assert lines[0] == "GVH-690"
+    assert lines[2].startswith("只有番号")
+    assert lines[4:] == ["演员：", "标签：#无码", "类别："]
+    assert out.count("\n\n") == 2
+
+
+def test_skeleton_no_code_no_leading_blanks():
+    out = caption.restructure_caption("标签：#痴女\n类别：#中文字幕")
+    assert not out.startswith("\n")
+    lines = out.split("\n")
+    assert lines[0] == "演员："
+    assert lines == ["演员：", "标签：#痴女", "类别：#中文字幕"]

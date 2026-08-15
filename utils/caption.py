@@ -12,8 +12,8 @@ it into the missav five-block layout
     标签：#… 
     类别：#…
 
-so the user can calibrate it by hand afterwards. Rendering, empty-block
-omission and the 1024-char budget all reuse missav's ``build_caption``.
+so the user can fill the missing ones in by hand (per the 2026-08-15
+request: 内容我可以手动编辑). Rendering reuses missav's ``_hashtag``.
 
 ``restructure_caption`` returns ``None`` when nothing structured is
 found — callers keep the original text untouched in that case. A user
@@ -22,7 +22,7 @@ found — callers keep the original text untouched in that case. A user
 
 import re
 
-from utils.missav import build_caption
+from utils.missav import _hashtag
 
 # JAV 番号: 2-7 letters, dash, 2-5 digits — "GVH-690", "DASS-629".
 # The dash is REQUIRED: dashless forms ("gvh690") produce far too many
@@ -151,9 +151,51 @@ def parse_details(text):
     return details
 
 
+def _hashtag_line(label, values):
+    return f'{label}：' + ' '.join(t for t in (_hashtag(x) for x in values) if t)
+
+
+def _render_skeleton(details, max_len=1024):
+    """Fixed skeleton — FIVE content lines with TWO blank separators:
+
+        <番号>
+
+        <简介>
+
+        演员：#…
+        标签：#…
+        类别：#…
+
+    Missing items stay as empty lines / bare labels so the user can fill
+    them in by hand; positions never shift between forwards.
+    """
+    code = (details.get('code') or '').strip()
+    intro = (details.get('title') or '').strip()
+    tail = '\n'.join([
+        _hashtag_line('演员', details.get('actresses') or []),
+        _hashtag_line('标签', details.get('genres') or []),
+        _hashtag_line('类别', details.get('badges') or []),
+    ])
+    budget = max_len - len(tail) - 4  # two blank separators
+
+    def render(intro_text):
+        # keep every block slot (a missing 简介 stays as a blank line the
+        # user can fill in); only LEADING empty blocks are dropped so a
+        # missing 番号 never leaves blank lines at the top
+        blocks = [code, intro_text, tail]
+        while blocks and blocks[0] == '':
+            blocks.pop(0)
+        return '\n\n'.join(blocks)
+
+    if len(intro) > budget:
+        intro = intro[:max(0, budget - 1)].rstrip() + '…'
+    return render(intro)[:max_len]
+
+
 def restructure_caption(text):
-    """Five-block caption for ``text``, or ``None`` to keep the original."""
+    """Five-line skeleton caption for ``text``, or ``None`` to keep the
+    original text (nothing structured detected / user oc override)."""
     details = parse_details(text)
     if details is None:
         return None
-    return build_caption(details) or None
+    return _render_skeleton(details) or None
