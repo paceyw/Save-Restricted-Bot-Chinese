@@ -24,6 +24,7 @@ import logging
 import math
 from shared_client import app, _WORKDIR
 from pyrogram import filters
+from pyrogram.types import InputMediaPhoto, InputMediaVideo
 from utils.func import get_video_metadata, screenshot, touch_file
 from utils.missav import (
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
@@ -33,8 +34,9 @@ from utils.missav import (
     is_missav_url,
 )
 from concurrent.futures import ThreadPoolExecutor
-import aiohttp 
+import aiohttp
 import aiofiles
+import shutil
 from config import (
     INSTA_COOKIES,
     MISSAV_MAX_JOBS,
@@ -285,23 +287,14 @@ async def dl_handler(client, message):
 
 
 async def _finalize_and_upload(message, download_path, title, thumbnail_url,
-                               progress_message, extra_meta=None,
-                               target_chat=None, sender=None,
-                               caption_override=None):
+                               progress_message, extra_meta=None):
     """Probe metadata, resolve a thumbnail (download → screenshot fallback),
     then upload (splitting first when >2 GB).
-
-    Progress/notice messages always go to the requesting chat via the main
-    bot; the media itself goes to ``target_chat`` (default: requesting
-    chat) via ``sender`` (default: main bot). ``caption_override``
-    replaces the default bold-title caption entirely.
 
     Owns and cleans its thumbnail/screenshot temp files; the caller owns
     ``download_path``.
     """
     chat_id = message.chat.id
-    dest_chat = target_chat if target_chat is not None else chat_id
-    uploader = sender or app
     download_dir = os.path.dirname(download_path)
     extra = extra_meta or {}
     thumbnail_file = None
@@ -339,20 +332,20 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
 
         # clamp remote titles: Telegram captions cap at 1024 chars and a
         # hostile og:title must not fail the upload after the full download
-        caption = caption_override if caption_override is not None else f"**{title[:500]}**"
+        caption = f"**{title[:500]}**"
         # Telegram bot API single-file limit is 2 GB; larger files are split.
         SIZE = 2 * 1024 * 1024 * 1024
         if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
             prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await split_and_upload_file(uploader, dest_chat, download_path, caption)
+            await split_and_upload_file(app, chat_id, download_path, caption)
             await prog.delete()
             await _safe_delete(progress_message)
             return
 
         if os.path.exists(download_path):
             prog = await app.send_message(chat_id, "**__开始上传...__**")
-            await uploader.send_video(
-                dest_chat,
+            await app.send_video(
+                chat_id,
                 video=download_path,
                 caption=caption,
                 duration=duration,
@@ -409,6 +402,7 @@ async def _run_missav_download(message, url, hosts, progress_message):
             pass  # message deleted / flood-limited: progress display is best-effort
 
     progress._last_edit = 0.0
+    cover_file = None
 
     try:
         info = await download_missav(
@@ -418,20 +412,20 @@ async def _run_missav_download(message, url, hosts, progress_message):
             concurrency=MISSAV_SEGMENT_CONCURRENCY,
             progress=progress,
         )
-        details = info.get('details') or {}
-        caption = build_caption(details) or f"**{info.get('title') or 'missav 视频'}**"
+        caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or 'missav 视频'}**"
 
+        k = await get_video_metadata(download_path)
+        duration, width, height = k['duration'], k['width'], k['height']
+        cover_file = await _resolve_cover(
+            info.get('thumbnail'), download_dir, download_path, duration, message.from_user.id
+        )
+
+        await _safe_delete(progress_message)
         target_chat, sender = await _resolve_missav_delivery(message)
         try:
-            await _finalize_and_upload(
-                message,
-                download_path,
-                info.get('title') or 'missav 视频',
-                info.get('thumbnail'),
-                progress_message,
-                target_chat=target_chat,
-                sender=sender,
-                caption_override=caption,
+            await _upload_missav_album(
+                sender, target_chat, message.chat.id, download_path,
+                cover_file, caption, duration, width, height,
             )
         except Exception as e:
             if sender is app or target_chat == message.chat.id:
@@ -440,17 +434,15 @@ async def _run_missav_download(message, url, hosts, progress_message):
             # fall back to the main bot, then to the requesting chat
             logger.warning("missav channel delivery failed (%s); retrying via main bot", e)
             try:
-                await _finalize_and_upload(
-                    message, download_path, info.get('title') or 'missav 视频',
-                    info.get('thumbnail'), progress_message,
-                    target_chat=target_chat, sender=app, caption_override=caption,
+                await _upload_missav_album(
+                    app, target_chat, message.chat.id, download_path,
+                    cover_file, caption, duration, width, height,
                 )
             except Exception as e2:
                 logger.warning("missav main-bot delivery failed too (%s); sending to user chat", e2)
-                await _finalize_and_upload(
-                    message, download_path, info.get('title') or 'missav 视频',
-                    info.get('thumbnail'), progress_message,
-                    caption_override=caption,
+                await _upload_missav_album(
+                    app, message.chat.id, message.chat.id, download_path,
+                    cover_file, caption, duration, width, height,
                 )
     except MissAVError as e:
         logger.warning("missav download failed: %s", e)
@@ -461,8 +453,127 @@ async def _run_missav_download(message, url, hosts, progress_message):
         await _safe_delete(progress_message)
         await message.reply_text(f"**__发生错误：{e}__**")
     finally:
-        if os.path.exists(download_path):
-            os.remove(download_path)
+        for temp_path in (download_path, cover_file):
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+async def _resolve_cover(thumbnail_url, download_dir, video_path, duration, user_id):
+    """Album lead photo: the page og:image cover, screenshot fallback."""
+    if thumbnail_url:
+        cover_path = os.path.join(download_dir, get_random_string() + ".jpg")
+        cover_file = await asyncio.to_thread(d_thumbnail, thumbnail_url, cover_path)
+        if cover_file:
+            return cover_file
+    async with screenshot_lock:
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(download_dir)
+            thumb = await screenshot(video_path, duration, user_id)
+            if thumb and not os.path.isabs(thumb):
+                thumb = os.path.join(download_dir, thumb)
+            return thumb
+        finally:
+            os.chdir(previous_cwd)
+
+
+def _build_album_group(cover_file, video_paths, caption, duration, width, height):
+    """Assemble the media-group items: cover photo first, then the video
+    (or >2GB split parts) as streamable videos. The caption rides the
+    FIRST item — Telegram renders one caption for the whole album."""
+    group = []
+    if cover_file:
+        group.append(InputMediaPhoto(cover_file, caption=caption))
+    for i, path in enumerate(video_paths):
+        group.append(InputMediaVideo(
+            path,
+            caption=caption if i == 0 and not group else None,
+            width=width if i == 0 else None,
+            height=height if i == 0 else None,
+            duration=duration if i == 0 else None,
+            supports_streaming=True,
+        ))
+    return group
+
+
+async def _split_video_parts(video_path, part_size=int(1.9 * 1024 * 1024 * 1024)):
+    """Split a >2GB video into bot-uploadable parts inside _WORKDIR/tmp.
+
+    The stale-download sweeper only walks the downloads dir; parts there
+    could be deleted mid-upload on slow links. tmp/ is never swept.
+    Returns the part paths; the caller owns cleanup."""
+    base_dir = os.path.join(_WORKDIR, "tmp")
+    os.makedirs(base_dir, exist_ok=True)
+    part_dir = tempfile.mkdtemp(prefix="ytdl_split_", dir=base_dir)
+    chunk_size = 8 * 1024 * 1024
+    part_paths = []
+    try:
+        async with aiofiles.open(video_path, mode="rb") as f:
+            part_number = 0
+            while True:
+                part_file = os.path.join(part_dir, f"part{part_number:03d}.mp4")
+                bytes_written = 0
+                async with aiofiles.open(part_file, mode="wb") as part_f:
+                    while bytes_written < part_size:
+                        chunk = await f.read(min(chunk_size, part_size - bytes_written))
+                        if not chunk:
+                            break
+                        await part_f.write(chunk)
+                        bytes_written += len(chunk)
+                if bytes_written == 0:
+                    os.remove(part_file)
+                    break
+                part_paths.append(part_file)
+                touch_file(video_path)  # keep the source fresh for the sweeper
+                part_number += 1
+        return part_paths
+    except BaseException:
+        shutil.rmtree(part_dir, ignore_errors=True)
+        raise
+
+
+async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
+                               cover_file, caption, duration, width, height):
+    """Deliver the missav result as ONE album (cover + video/parts).
+
+    All progress notices go to ``notice_chat`` (the requesting chat);
+    only the album itself lands in ``dest_chat``. >2GB videos are split
+    into <2GB streamable parts so the whole result stays one media group
+    (documents cannot join a photo+video album)."""
+    size = os.path.getsize(video_path)
+    SIZE_LIMIT = 2 * 1024 * 1024 * 1024
+    video_paths = None
+    try:
+        if size <= SIZE_LIMIT:
+            video_paths = [video_path]
+        else:
+            notice = await app.send_message(notice_chat, "**__文件超过 2GB，正在分片...__**")
+            try:
+                video_paths = await _split_video_parts(video_path)
+            finally:
+                await _safe_delete(notice)
+
+        group = _build_album_group(cover_file, video_paths, caption, duration, width, height)
+        try:
+            await sender.send_media_group(dest_chat, group)
+        except Exception as e:
+            # media-group upload failed midway (flood/network): fall back to
+            # item-by-item sends so the video still reaches the channel
+            logger.warning("missav media group failed (%s); falling back to item sends", e)
+            if cover_file:
+                await sender.send_photo(dest_chat, cover_file, caption=caption)
+            for i, path in enumerate(video_paths):
+                await sender.send_video(
+                    dest_chat, path,
+                    caption=caption if i == 0 and not cover_file else None,
+                    duration=duration if i == 0 else None,
+                    width=width if i == 0 else None,
+                    height=height if i == 0 else None,
+                    supports_streaming=True,
+                )
+    finally:
+        if video_paths and video_paths[0] != video_path:
+            shutil.rmtree(os.path.dirname(video_paths[0]), ignore_errors=True)
 
 
 async def _resolve_missav_delivery(message):

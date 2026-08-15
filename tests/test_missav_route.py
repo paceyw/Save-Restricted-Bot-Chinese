@@ -8,6 +8,7 @@ drives ``dl_handler`` with a fake message to prove missav URLs reach
 
 import asyncio
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -65,14 +66,23 @@ def ytdl(monkeypatch):
         if name == "mutagen.mp3":
             mod.MP3 = object
         monkeypatch.setitem(sys.modules, name, mod)
-    for name in ("aiohttp", "aiofiles"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    if importlib.util.find_spec("aiofiles") is not None:
+        monkeypatch.setitem(sys.modules, "aiohttp", types.ModuleType("aiohttp"))
+    else:
+        for name in ("aiohttp", "aiofiles"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
 
 
 
     pyrogram = types.ModuleType("pyrogram")
     pyrogram.filters = _Filters()
     monkeypatch.setitem(sys.modules, "pyrogram", pyrogram)
+
+    pyrogram_types = types.ModuleType("pyrogram.types")
+    pyrogram_types.InputMediaPhoto = object
+    pyrogram_types.InputMediaVideo = object
+    monkeypatch.setitem(sys.modules, "pyrogram.types", pyrogram_types)
+
 
     shared_client = types.ModuleType("shared_client")
     shared_client.app = _FakeApp()
@@ -155,3 +165,130 @@ def test_concurrent_guard_fires_before_routing(ytdl, monkeypatch):
         assert any("正在进行" in r for r in msg.replies)
     finally:
         ytdl.ongoing_downloads.pop(42, None)
+
+
+# ─── album upload flow (issue #13: channel album + private-only notices) ──────
+
+def test_split_video_parts_chunks_correctly(ytdl, monkeypatch, tmp_path):
+    monkeypatch.setattr(ytdl, "_WORKDIR", str(tmp_path))
+    monkeypatch.setattr(ytdl, "touch_file", lambda *a, **k: None)
+    payload = os.urandom(10 * 1024 * 1024)
+    src = tmp_path / "video.mp4"
+    src.write_bytes(payload)
+
+    parts = asyncio.run(ytdl._split_video_parts(str(src), part_size=4 * 1024 * 1024))
+
+    assert [os.path.basename(p) for p in parts] == [
+        "part000.mp4", "part001.mp4", "part002.mp4"]
+    # byte-exact reassembly in order
+    joined = b"".join(Path(p).read_bytes() for p in parts)
+    assert joined == payload
+    # parts live under _WORKDIR/tmp (sweeper-immune), never in downloads/
+    parts_root = os.path.commonpath(parts)
+    assert parts_root.startswith(str(tmp_path / "tmp"))
+    assert "downloads" not in parts[0]
+
+
+def test_build_album_group_caption_and_dims(ytdl, monkeypatch):
+    captured = []
+
+    class FakePhoto:
+        def __init__(self, media, caption=None):
+            self.kind, self.media, self.caption = "photo", media, caption
+            captured.append(self)
+
+    class FakeVideo:
+        def __init__(self, media, caption=None, **kw):
+            self.kind, self.media, self.caption, self.kw = "video", media, caption, kw
+            captured.append(self)
+
+    monkeypatch.setattr(ytdl, "InputMediaPhoto", FakePhoto)
+    monkeypatch.setattr(ytdl, "InputMediaVideo", FakeVideo)
+
+    g = ytdl._build_album_group("cover.jpg", ["v1.mp4"], "CAP", 100, 640, 360)
+    assert [(x.kind, x.caption) for x in g] == [("photo", "CAP"), ("video", None)]
+    assert g[1].kw["supports_streaming"] is True
+    assert g[1].kw["width"] == 640 and g[1].kw["duration"] == 100
+
+    captured.clear()
+    g2 = ytdl._build_album_group(None, ["v1.mp4", "v2.mp4", "v3.mp4"], "CAP", 100, 640, 360)
+    # no cover: caption rides the FIRST video; later parts carry no dims
+    assert [(x.kind, x.caption) for x in g2] == [
+        ("video", "CAP"), ("video", None), ("video", None)]
+    assert g2[1].kw["width"] is None and g2[2].kw["duration"] is None
+
+
+def test_upload_album_small_file_sends_only_album(ytdl, monkeypatch, tmp_path):
+    sent = {"album": [], "notices": []}
+
+    class FakeSender:
+        async def send_media_group(self, chat, group):
+            sent["album"].append((chat, group))
+
+    class FakeApp:
+        async def send_message(self, chat, text):
+            sent["notices"].append((chat, text))
+
+    monkeypatch.setattr(ytdl, "app", FakeApp())
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        ytdl, "_build_album_group",
+        lambda cover, paths, cap, d, w, h: ["GROUP"])
+
+    asyncio.run(ytdl._upload_missav_album(
+        FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
+
+    assert sent["album"] == [(-100, ["GROUP"])]
+    assert sent["notices"] == []  # nothing but the album reaches the channel
+
+
+def test_upload_album_big_file_splits_with_private_notice(ytdl, monkeypatch, tmp_path):
+    sent = {"album": [], "notices": []}
+
+    class FakeSender:
+        async def send_media_group(self, chat, group):
+            sent["album"].append((chat, group))
+
+    class FakeMsg:
+        async def delete(self):
+            pass
+
+    class FakeApp:
+        async def send_message(self, chat, text):
+            sent["notices"].append((chat, text))
+            return FakeMsg()
+
+    monkeypatch.setattr(ytdl, "app", FakeApp())
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"x" * 2048)
+
+    real_getsize = os.path.getsize
+    monkeypatch.setattr(
+        os.path, "getsize",
+        lambda p: 3 * 1024 ** 3 if p == str(video) else real_getsize(p))
+
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    part_paths = []
+    for name in ("p0.mp4", "p1.mp4"):
+        p = parts_dir / name
+        p.write_bytes(b"")
+        part_paths.append(str(p))
+
+    async def fake_split(path):
+        return part_paths
+
+    monkeypatch.setattr(ytdl, "_split_video_parts", fake_split)
+    monkeypatch.setattr(
+        ytdl, "_build_album_group",
+        lambda cover, paths, cap, d, w, h: ["GROUP"] * len(paths))
+
+    asyncio.run(ytdl._upload_missav_album(
+        FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
+
+    # notice went to the PRIVATE chat only, album to the channel
+    assert sent["notices"] == [(42, "**__文件超过 2GB，正在分片...__**")]
+    assert sent["album"] == [(-100, ["GROUP", "GROUP"])]
+    # split temp dir cleaned up
+    assert not parts_dir.exists()
