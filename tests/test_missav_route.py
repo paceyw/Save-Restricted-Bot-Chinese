@@ -9,6 +9,8 @@ drives ``dl_handler`` with a fake message to prove missav URLs reach
 import asyncio
 import importlib
 import os
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -169,24 +171,55 @@ def test_concurrent_guard_fires_before_routing(ytdl, monkeypatch):
 
 # ─── album upload flow (issue #13: channel album + private-only notices) ──────
 
-def test_split_video_parts_chunks_correctly(ytdl, monkeypatch, tmp_path):
+def test_segment_times_targets_part_size(ytdl):
+    # 3.6GB / 7200s -> 0.5MB/s -> 1.8GB target => 2 parts, split at 3600s
+    t = ytdl._segment_times(int(3.6 * 1024**3), 7200, int(1.8 * 1024**3), 9)
+    assert t == [3600.0]
+
+
+def test_segment_times_caps_part_count(ytdl):
+    # absurdly large file with tiny max_parts: evenly divided, no overflow
+    t = ytdl._segment_times(int(36 * 1024**3), 72000, int(1.8 * 1024**3), 4)
+    assert len(t) == 3 and all(d > 0 for d in t)
+
+
+def test_segment_times_degenerate_inputs(ytdl):
+    assert ytdl._segment_times(0, 100, 1, 9) == []
+    assert ytdl._segment_times(100, 0, 1, 9) == []
+    assert ytdl._segment_times(100, 100, 10 * 1024**3, 9) == []  # fits one part
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_split_video_parts_produces_playable_parts(ytdl, monkeypatch, tmp_path):
     monkeypatch.setattr(ytdl, "_WORKDIR", str(tmp_path))
     monkeypatch.setattr(ytdl, "touch_file", lambda *a, **k: None)
-    payload = os.urandom(10 * 1024 * 1024)
     src = tmp_path / "video.mp4"
-    src.write_bytes(payload)
+    # 12s 320x240 test clip with audio, ~350kbps
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=duration=12:size=320x240:rate=15",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+         "-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
+         "-c:a", "aac", str(src)],
+        check=True)
 
-    parts = asyncio.run(ytdl._split_video_parts(str(src), part_size=4 * 1024 * 1024))
+    # force ~4s parts: size/12 * 4 bytes
+    part_size = max(int(os.path.getsize(src) / 12 * 4), 1)
+    parts = asyncio.run(ytdl._split_video_parts(str(src), 12, part_size=part_size))
 
-    assert [os.path.basename(p) for p in parts] == [
-        "part000.mp4", "part001.mp4", "part002.mp4"]
-    # byte-exact reassembly in order
-    joined = b"".join(Path(p).read_bytes() for p in parts)
-    assert joined == payload
-    # parts live under _WORKDIR/tmp (sweeper-immune), never in downloads/
-    parts_root = os.path.commonpath(parts)
-    assert parts_root.startswith(str(tmp_path / "tmp"))
-    assert "downloads" not in parts[0]
+    assert 2 <= len(parts) <= 4
+    assert [os.path.basename(p) for p in parts][0] == "part000.mp4"
+    assert parts[0].startswith(str(tmp_path / "tmp"))
+    # every part is a self-contained playable mp4: ffprobe returns a duration
+    total = 0.0
+    for p in parts:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", p], capture_output=True, text=True, check=True)
+        d = float(probe.stdout.strip())
+        assert d > 0
+        total += d
+    assert abs(total - 12) < 2.0  # keyframe snapping tolerance
 
 
 def test_build_album_group_caption_and_dims(ytdl, monkeypatch):
@@ -205,19 +238,20 @@ def test_build_album_group_caption_and_dims(ytdl, monkeypatch):
     monkeypatch.setattr(ytdl, "InputMediaPhoto", FakePhoto)
     monkeypatch.setattr(ytdl, "InputMediaVideo", FakeVideo)
 
-    g = ytdl._build_album_group("cover.jpg", ["v1.mp4"], "CAP", 100, 640, 360)
+    g = ytdl._build_album_group("cover.jpg", [("v1.mp4", 100)], "CAP", 640, 360)
     assert [(x.kind, x.caption) for x in g] == [("photo", "CAP"), ("video", None)]
     assert g[1].kw["supports_streaming"] is True
     assert g[1].kw["width"] == 640 and g[1].kw["duration"] == 100
 
     captured.clear()
-    g2 = ytdl._build_album_group(None, ["v1.mp4", "v2.mp4", "v3.mp4"], "CAP", 100, 640, 360)
-    # no cover: caption rides the FIRST video; later parts carry 0 dims —
-    # pyrofork serializes duration as a TL double, None aborts the send
+    g2 = ytdl._build_album_group(
+        None, [("v1.mp4", 100), ("v2.mp4", 98), ("v3.mp4", 97)], "CAP", 640, 360)
+    # no cover: caption rides the FIRST video; each part carries its OWN
+    # duration (ffmpeg segments are self-contained); dims only on part 0
     assert [(x.kind, x.caption) for x in g2] == [
         ("video", "CAP"), ("video", None), ("video", None)]
     assert g2[0].kw["width"] == 640 and g2[0].kw["duration"] == 100
-    assert g2[1].kw["width"] == 0 and g2[2].kw["duration"] == 0
+    assert g2[1].kw["width"] == 0 and g2[2].kw["duration"] == 97
 
 
 def test_upload_album_small_file_sends_only_album(ytdl, monkeypatch, tmp_path):
@@ -241,7 +275,12 @@ def test_upload_album_small_file_sends_only_album(ytdl, monkeypatch, tmp_path):
     video.write_bytes(b"x" * 2048)
     monkeypatch.setattr(
         ytdl, "_build_album_group",
-        lambda cover, paths, cap, d, w, h: ["GROUP"])
+        lambda cover, parts, cap, w, h: ["GROUP"])
+
+    async def fake_probe(path):
+        return {"duration": 3, "width": 1, "height": 1}
+
+    monkeypatch.setattr(ytdl, "get_video_metadata", fake_probe)
 
     asyncio.run(ytdl._upload_missav_album(
         FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
@@ -284,20 +323,24 @@ def test_upload_album_big_file_splits_with_private_notice(ytdl, monkeypatch, tmp
         p.write_bytes(b"")
         part_paths.append(str(p))
 
-    async def fake_split(path):
+    async def fake_split(path, duration):
         return part_paths
 
+    async def fake_probe(path):
+        return {"duration": 123, "width": 1, "height": 1}
+
     monkeypatch.setattr(ytdl, "_split_video_parts", fake_split)
+    monkeypatch.setattr(ytdl, "get_video_metadata", fake_probe)
     monkeypatch.setattr(
         ytdl, "_build_album_group",
-        lambda cover, paths, cap, d, w, h: ["GROUP"] * len(paths))
+        lambda cover, parts, cap, w, h: ["GROUP"] * len(parts))
 
     asyncio.run(ytdl._upload_missav_album(
         FakeSender(), -100, 42, str(video), "cover.jpg", "CAP", 1, 2, 3))
 
     # every notice went to the PRIVATE chat only; album to the channel
     assert sent["notices"] == [
-        (42, "**__文件超过 2GB，正在分片...__**"),
+        (42, "**__文件超过 2GB，ffmpeg 关键帧分片中...__**"),
         (42, "**__开始上传相册（2 项）...__**"),
     ]
     assert sent["album"] == [(-100, ["GROUP", "GROUP"])]

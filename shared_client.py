@@ -5,7 +5,33 @@
 import os
 from config import API_ID, API_HASH, BOT_TOKEN, STRING
 from pyrogram import Client
+from pyrogram.raw.types.messages import Messages as _RawMessages
+import inspect
 import sys
+
+
+# pyrofork 2.3.69 bug: send_media_group builds
+# raw.types.messages.Messages(messages=…, users=…, chats=…) but the TL layer
+# makes `topics` a REQUIRED keyword — the constructor raises
+# "Messages.__init__() missing 1 required keyword-only argument: 'topics'"
+# AFTER the album is already delivered on the wire, so callers misread it
+# as a delivery failure and re-send duplicates (observed live 2026-08-15).
+# Default topics to [] until the library fixes its own call sites.
+try:
+    _topics_has_default = (
+        inspect.signature(_RawMessages.__init__)
+        .parameters.get("topics").default is not inspect.Parameter.empty
+    )
+except (AttributeError, ValueError):
+    _topics_has_default = True  # can't inspect: assume fine, don't patch
+if not _topics_has_default:
+    _orig_raw_messages_init = _RawMessages.__init__
+
+    def _raw_messages_init_with_topics(self, *args, **kwargs):
+        kwargs.setdefault("topics", [])
+        _orig_raw_messages_init(self, *args, **kwargs)
+
+    _RawMessages.__init__ = _raw_messages_init_with_topics
 
 # pyrofork defaults workdir to Path(sys.argv[0]).parent, which is /app (read-only
 # image layer) when running "python /app/main.py". Force it to the persistent CWD

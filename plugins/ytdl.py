@@ -477,66 +477,111 @@ async def _resolve_cover(thumbnail_url, download_dir, video_path, duration, user
             os.chdir(previous_cwd)
 
 
-def _build_album_group(cover_file, video_paths, caption, duration, width, height):
+def _segment_times(total_bytes, total_duration, part_size, max_parts):
+    """Keyframe-split points (seconds) targeting ``part_size`` per part.
+
+    Byte-chunked MP4 "parts" are not playable videos: only one chunk can
+    hold the moov atom and every chunk truncates mdat mid-GOP. ffmpeg's
+    segment muxer instead cuts at keyframes with ``-c copy`` and gives
+    every part a complete, self-contained MP4 (observed live 2026-08-15:
+    blank 0-second parts). Split times derive from the mean bitrate so
+    each part stays under the Telegram upload ceiling."""
+    if total_duration <= 0 or total_bytes <= 0 or max_parts < 1:
+        return []
+    rate = total_bytes / total_duration          # bytes per second
+    if rate <= 0:
+        return []
+    seg_seconds = part_size / rate
+    n_parts = math.ceil(total_duration / seg_seconds)
+    if n_parts > max_parts:
+        seg_seconds = total_duration / max_parts
+        n_parts = max_parts
+    if n_parts <= 1:
+        return []
+    seg_seconds = max(seg_seconds, 1.0)          # never spam sub-second cuts
+    return [round(seg_seconds * i, 3) for i in range(1, n_parts)]
+
+
+async def _split_video_parts(video_path, duration, part_size=int(1.8 * 1024 * 1024 * 1024),
+                             max_parts=9):
+    """ffmpeg keyframe split into self-contained streamable MP4 parts.
+
+    Every part gets its own moov atom (+faststart, moov before mdat →
+    instant playback per Telegram streaming requirements) and starts at a
+    keyframe with timestamps reset to 0, so Telegram shows it as a
+    normal playable video with the correct duration. Parts land in
+    _WORKDIR/tmp (never swept by the stale-download sweeper); the caller
+    owns cleanup. Raises on ffmpeg failure or an oversize part."""
+    size = os.path.getsize(video_path)
+    times = _segment_times(size, duration, part_size, max_parts)
+    if not times:
+        raise RuntimeError(f"无法计算分片点（时长 {duration}s，大小 {size}），拒绝分片")
+
+    base_dir = os.path.join(_WORKDIR, "tmp")
+    os.makedirs(base_dir, exist_ok=True)
+    part_dir = tempfile.mkdtemp(prefix="ytdl_split_", dir=base_dir)
+    out_pattern = os.path.join(part_dir, "part%03d.mp4")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", video_path,
+            "-map", "0", "-c", "copy",
+            "-f", "segment",
+            "-segment_times", ",".join(str(t) for t in times),
+            "-reset_timestamps", "1",
+            "-movflags", "+faststart",
+            out_pattern,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg 分片失败: {err.decode(errors='replace')[-300:]}")
+
+        parts = sorted(
+            os.path.join(part_dir, name)
+            for name in os.listdir(part_dir) if name.startswith("part")
+        )
+        if len(parts) < 2:
+            raise RuntimeError(f"ffmpeg 分片产出异常（{len(parts)} 段）")
+        hard_cap = int(1.95 * 1024 * 1024 * 1024)
+        oversize = [p for p in parts if os.path.getsize(p) > hard_cap]
+        if oversize:
+            raise RuntimeError(
+                f"分片后仍有超 1.95GB 的段（{len(oversize)} 个，码率峰值过高），"
+                "请降低 MISSAV 分片目标或改用更小 part_size 重试")
+        touch_file(video_path)
+        return parts
+    except BaseException:
+        shutil.rmtree(part_dir, ignore_errors=True)
+        raise
+
+
+def _build_album_group(cover_file, video_parts, caption, width, height):
     """Assemble the media-group items: cover photo first, then the video
-    (or >2GB split parts) as streamable videos. The caption rides the
-    FIRST item — Telegram renders one caption for the whole album.
+    (or >2GB ffmpeg keyframe parts) as streamable videos. The caption
+    rides the FIRST item — Telegram renders one caption for the whole
+    album. ``video_parts`` is a list of ``(path, duration_seconds)``.
 
     duration/width/height must never be None: pyrofork serializes the
     video attribute duration as a TL Double and struct.pack('d', None)
     aborts the whole send with "required argument is not a float"
-    (observed live on 2026-08-15). Later split parts get 0 — only part 0
-    carries the moov atom and real metadata anyway."""
+    (observed live 2026-08-15). Each part carries its OWN duration —
+    ffmpeg segments are self-contained videos."""
     group = []
     if cover_file:
         group.append(InputMediaPhoto(cover_file, caption=caption))
-    for i, path in enumerate(video_paths):
+    for i, (path, part_duration) in enumerate(video_parts):
         first = i == 0
         group.append(InputMediaVideo(
             path,
             caption=caption if first and not group else None,
             width=int(width) if first and width else 0,
             height=int(height) if first and height else 0,
-            duration=int(duration) if first and duration else 0,
+            duration=int(part_duration) or 0,
             supports_streaming=True,
         ))
     return group
-
-
-async def _split_video_parts(video_path, part_size=int(1.9 * 1024 * 1024 * 1024)):
-    """Split a >2GB video into bot-uploadable parts inside _WORKDIR/tmp.
-
-    The stale-download sweeper only walks the downloads dir; parts there
-    could be deleted mid-upload on slow links. tmp/ is never swept.
-    Returns the part paths; the caller owns cleanup."""
-    base_dir = os.path.join(_WORKDIR, "tmp")
-    os.makedirs(base_dir, exist_ok=True)
-    part_dir = tempfile.mkdtemp(prefix="ytdl_split_", dir=base_dir)
-    chunk_size = 8 * 1024 * 1024
-    part_paths = []
-    try:
-        async with aiofiles.open(video_path, mode="rb") as f:
-            part_number = 0
-            while True:
-                part_file = os.path.join(part_dir, f"part{part_number:03d}.mp4")
-                bytes_written = 0
-                async with aiofiles.open(part_file, mode="wb") as part_f:
-                    while bytes_written < part_size:
-                        chunk = await f.read(min(chunk_size, part_size - bytes_written))
-                        if not chunk:
-                            break
-                        await part_f.write(chunk)
-                        bytes_written += len(chunk)
-                if bytes_written == 0:
-                    os.remove(part_file)
-                    break
-                part_paths.append(part_file)
-                touch_file(video_path)  # keep the source fresh for the sweeper
-                part_number += 1
-        return part_paths
-    except BaseException:
-        shutil.rmtree(part_dir, ignore_errors=True)
-        raise
 
 
 async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
@@ -545,8 +590,8 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
 
     All progress notices go to ``notice_chat`` (the requesting chat);
     only the album itself lands in ``dest_chat``. >2GB videos are split
-    into <2GB streamable parts so the whole result stays one media group
-    (documents cannot join a photo+video album)."""
+    by ffmpeg at keyframes into <2GB self-contained streamable parts so
+    the whole result stays one media group of playable videos."""
     size = os.path.getsize(video_path)
     SIZE_LIMIT = 2 * 1024 * 1024 * 1024
     video_paths = None
@@ -555,13 +600,21 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
         if size <= SIZE_LIMIT:
             video_paths = [video_path]
         else:
-            notice = await app.send_message(notice_chat, "**__文件超过 2GB，正在分片...__**")
+            notice = await app.send_message(
+                notice_chat, "**__文件超过 2GB，ffmpeg 关键帧分片中...__**")
             try:
-                video_paths = await _split_video_parts(video_path)
+                video_paths = await _split_video_parts(video_path, duration)
             finally:
                 await _safe_delete(notice)
 
-        group = _build_album_group(cover_file, video_paths, caption, duration, width, height)
+        # each part is a standalone video: probe per-part duration so
+        # Telegram shows real lengths (all parts share the same WxH)
+        part_metas = []
+        for path in video_paths:
+            meta = await get_video_metadata(path)
+            part_metas.append((path, meta.get("duration") or 0))
+
+        group = _build_album_group(cover_file, part_metas, caption, width, height)
         prog = await app.send_message(
             notice_chat, f"**__开始上传相册（{len(group)} 项）...__**")
         try:
@@ -576,12 +629,12 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
             logger.warning("missav media group failed (%s); falling back to item sends", e)
             if cover_file:
                 await sender.send_photo(dest_chat, cover_file, caption=caption)
-            for i, path in enumerate(video_paths):
+            for i, (path, part_duration) in enumerate(part_metas):
                 first = i == 0
                 await sender.send_video(
                     dest_chat, path,
                     caption=caption if first and not cover_file else None,
-                    duration=int(duration) if first and duration else 0,
+                    duration=int(part_duration) or 0,
                     width=int(width) if first and width else 0,
                     height=int(height) if first and height else 0,
                     supports_streaming=True,
