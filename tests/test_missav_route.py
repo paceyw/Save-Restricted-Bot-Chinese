@@ -1,9 +1,11 @@
-"""Routing tests for the /dl handler's missav branch (issue #13).
+"""Routing + queue-enqueue tests for the /dl and /adl handlers.
 
-Loads ``plugins.ytdl`` offline with stubbed heavy deps (yt_dlp, mutagen,
+Loads plugins.ytdl against stubbed heavy deps (yt_dlp, mutagen,
 pyrogram, …) — exactly the convention of test_settings_routing.py — then
-drives ``dl_handler`` with a fake message to prove missav URLs reach
-``process_missav`` and non-missav URLs keep their existing routing.
+drives ``run_dl`` (the queue worker's site router) with a fake message to
+prove missav/getav/generic URLs reach the right pipeline, and drives the
+handlers themselves to prove /dl and /adl now land in the shared task
+queue instead of running inline.
 """
 
 import asyncio
@@ -33,9 +35,56 @@ class _Filters:
     def command(*args, **kwargs):
         return _Filter()
 
+    @staticmethod
+    def regex(pattern):
+        import re as _re
+        return _PatternFilter(_re.compile(pattern))
+
+    text = _Filter()
+    private = _Filter()
+
+
+class _PatternFilter:
+    def __init__(self, compiled):
+        self.compiled = compiled
+
+    def __and__(self, other):
+        return self
+
+
+class _Match:
+    def __init__(self, groups):
+        self._groups = groups
+
+    def group(self, i):
+        return self._groups[i]
+
+
+class _FakeQuery:
+    """Stands in for pyrogram CallbackQuery in callback tests."""
+    def __init__(self, uid, data, pattern):
+        m = _Match(["", *pattern.match(data).groups()]) if pattern.match(data) else None
+        self.from_user = types.SimpleNamespace(id=uid)
+        self.data = data
+        self.matches = [m] if m else []
+        self.answers = []
+        self.edits = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+
+    async def edit_text(self, text, *a, **kw):
+        self.edits.append(text)
+
 
 class _FakeApp:
     def on_message(self, *args, **kwargs):
+        def decorator(function):
+            return function
+
+        return decorator
+
+    def on_callback_query(self, *args, **kwargs):
         def decorator(function):
             return function
 
@@ -83,6 +132,10 @@ def ytdl(monkeypatch):
     pyrogram_types = types.ModuleType("pyrogram.types")
     pyrogram_types.InputMediaPhoto = object
     pyrogram_types.InputMediaVideo = object
+    pyrogram_types.InlineKeyboardButton = lambda text, callback_data=None: \
+        types.SimpleNamespace(text=text, callback_data=callback_data)
+    pyrogram_types.InlineKeyboardMarkup = lambda buttons: \
+        types.SimpleNamespace(buttons=buttons)
     monkeypatch.setitem(sys.modules, "pyrogram.types", pyrogram_types)
 
 
@@ -114,27 +167,47 @@ def ytdl(monkeypatch):
     plugins.__path__ = [str(SRC / "plugins")]
     monkeypatch.setitem(sys.modules, "plugins", plugins)
 
+    # Queue stub: dl/adl handlers import queue glue at call time; routing
+    # tests never need the real per-user worker machinery.
+    tasks_stub = types.ModuleType("plugins.tasks")
+    tasks_stub._MAX_QUEUE = 3
+    tasks_stub.task_update = lambda *_args, **_kwargs: None
+    def _create_task(uid, task_type, total, **params):
+        return {"id": f"task_{uid}", "uid": uid, "type": task_type,
+                "total": total, "status": "queued", **params}
+    tasks_stub.create_task = _create_task
+    async def _enqueue_task(uid, task):
+        return True
+    tasks_stub.enqueue_task = _enqueue_task
+    tasks_stub.get_queue_size = lambda uid: 0
+    monkeypatch.setitem(sys.modules, "plugins.tasks", tasks_stub)
+
     sys.modules.pop("plugins.ytdl", None)
     return importlib.import_module("plugins.ytdl")
 
 
 def _drive(ytdl, monkeypatch, text):
+    """Drive run_dl (the queue worker's site router) with a /dl command text."""
     calls = {"missav": [], "getav": [], "video": []}
 
-    async def fake_missav(message, url, hosts):
+    async def fake_missav(message, url, hosts, task_id=None):
         calls["missav"].append(url)
 
-    async def fake_getav(message, url, hosts, want_subtitle=False):
+    async def fake_getav(message, url, hosts, want_subtitle=False, task_id=None,
+                         source_url=None):
         calls["getav"].append((url, want_subtitle))
 
-    async def fake_video(message, url, cookies, check_duration_and_size=False):
+    async def fake_video(message, url, cookies, check_duration_and_size=False, task_id=None):
         calls["video"].append(url)
 
     monkeypatch.setattr(ytdl, "process_missav", fake_missav)
     monkeypatch.setattr(ytdl, "process_getav", fake_getav)
     monkeypatch.setattr(ytdl, "process_video", fake_video)
+    parts = text.split()
+    want_sub = "-sub" in parts[1:]
+    url = next((p for p in parts[1:] if p != "-sub"), "")
     msg = _FakeMessage(text)
-    asyncio.run(ytdl.dl_handler(None, msg))
+    asyncio.run(ytdl.run_dl(msg, url, want_sub))
     return calls
 
 
@@ -203,14 +276,154 @@ def test_missav_category_url_falls_through_to_generic(ytdl, monkeypatch):
     assert calls["video"] == ["https://missav.ai/dm278/chinese-subtitle"]
 
 
-def test_concurrent_guard_fires_before_routing(ytdl, monkeypatch):
-    ytdl.ongoing_downloads[42] = True
-    try:
-        msg = _FakeMessage("/dl https://missav.ai/sone-543")
-        asyncio.run(ytdl.dl_handler(None, msg))
-        assert any("正在进行" in r for r in msg.replies)
-    finally:
-        ytdl.ongoing_downloads.pop(42, None)
+def _queue_state(monkeypatch):
+    """Capture handler→queue interactions via the plugins.tasks stub."""
+    stub = sys.modules["plugins.tasks"]
+    state = {"created": [], "enqueued": []}
+
+    def _create(uid, task_type, total, **params):
+        task = {"id": f"task_{len(state['created'])}", "uid": uid, "type": task_type,
+                "total": total, "status": "queued", **params}
+        state["created"].append(task)
+        return task
+
+    async def _enqueue(uid, task):
+        state["enqueued"].append(task)
+        return True
+
+    monkeypatch.setattr(stub, "create_task", _create)
+    monkeypatch.setattr(stub, "enqueue_task", _enqueue)
+    monkeypatch.setattr(stub, "get_queue_size", lambda uid: 0)
+    return state
+
+
+def _probe_stub(ytdl, monkeypatch, sources):
+    """Stub the getav probe (fetch movie JSON + list versions)."""
+    data = {"videoSources": sources}
+    monkeypatch.setattr(ytdl, "fetch_getav_movie", lambda url, hosts: (data, "getav.net"))
+    return data
+
+
+def test_dl_handler_enqueues_task_with_params(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    # single-version getav page: probe finds one source -> direct enqueue
+    _probe_stub(ytdl, monkeypatch, [
+        {"type": "cn_1080p", "url": "https://cdn/cn1080"}])
+    msg = _FakeMessage("/dl -sub https://getav.net/zh/videos/cjod-159")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert len(state["created"]) == 1
+    task = state["enqueued"][0]
+    assert task["type"] == "dl"
+    assert task["url"] == "https://getav.net/zh/videos/cjod-159"
+    assert task["want_subtitle"] is True
+    assert task["uid"] == 42
+    assert any("加入队列" in r for r in msg.replies)
+
+
+def test_dl_handler_multiversion_getav_shows_card(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    _probe_stub(ytdl, monkeypatch, [
+        {"type": "cn_1080p", "url": "https://cdn/cn1080"},
+        {"type": "uc_720p", "url": "https://cdn/uc720"},
+        {"type": "raw_1080p", "url": "https://cdn/raw1080"},
+    ])
+    msg = _FakeMessage("/dl https://getav.net/zh/videos/cjod-159")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert not state["created"]            # nothing enqueued until picked
+    assert any("多个版本" in r for r in msg.replies)
+    prompt = ytdl._GETAV_PROMPTS[42]
+    assert len(prompt["versions"]) == 3
+    # best-first order: cn 1080 > uc 720 > raw 1080
+    assert [v[2] for v in prompt["versions"]] == [
+        "中文字幕版 1080p", "无码版 720p", "原版 1080p"]
+    assert prompt["want_subtitle"] is False
+
+
+def test_getav_version_callback_enqueues_pinned_source(ytdl, monkeypatch):
+    import re as _re
+    state = _queue_state(monkeypatch)
+    _probe_stub(ytdl, monkeypatch, [
+        {"type": "cn_1080p", "url": "https://cdn/cn1080"},
+        {"type": "uc_720p", "url": "https://cdn/uc720"},
+    ])
+    msg = _FakeMessage("/dl https://getav.net/zh/videos/cjod-159")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._GETAV_PROMPTS[42]
+    token = prompt["token"]
+
+    # user picks the SECOND button (uc 720p)
+    query = _FakeQuery(42, f"gav:{token}:1", _re.compile(r"^gav:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.getav_version_callback(None, query))
+    assert 42 not in ytdl._GETAV_PROMPTS      # prompt consumed
+    task = state["enqueued"][0]
+    assert task["source_url"] == "https://cdn/uc720"   # pinned, not auto-best
+    assert any("已选择" in e for e in query.edits)
+    assert any("加入队列" in r for r in msg.replies)
+
+
+def test_getav_version_callback_rejects_expired(ytdl, monkeypatch):
+    import re as _re
+    import time as _time
+    state = _queue_state(monkeypatch)
+    _probe_stub(ytdl, monkeypatch, [
+        {"type": "cn_1080p", "url": "https://cdn/cn1080"},
+        {"type": "uc_720p", "url": "https://cdn/uc720"},
+    ])
+    msg = _FakeMessage("/dl https://getav.net/zh/videos/cjod-159")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._GETAV_PROMPTS[42]
+    prompt["created_at"] = _time.time() - ytdl._GETAV_PROMPT_TTL - 1  # aged out
+
+    query = _FakeQuery(42, f"gav:{prompt['token']}:0",
+                       _re.compile(r"^gav:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.getav_version_callback(None, query))
+    assert not state["created"]
+    assert query.answers and "过期" in query.answers[0][0]
+
+
+def test_getav_version_callback_ignores_foreign_user(ytdl, monkeypatch):
+    import re as _re
+    state = _queue_state(monkeypatch)
+    _probe_stub(ytdl, monkeypatch, [
+        {"type": "cn_1080p", "url": "https://cdn/cn1080"},
+        {"type": "uc_720p", "url": "https://cdn/uc720"},
+    ])
+    asyncio.run(ytdl.dl_handler(
+        None, _FakeMessage("/dl https://getav.net/zh/videos/cjod-159")))
+    token = ytdl._GETAV_PROMPTS[42]["token"]
+
+    # another user's callback: uid 7 has no prompt -> expired-style answer
+    query = _FakeQuery(7, f"gav:{token}:0",
+                       _re.compile(r"^gav:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.getav_version_callback(None, query))
+    assert not state["created"]
+
+
+def test_adl_handler_enqueues_task(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    msg = _FakeMessage("/adl https://youtube.com/watch?v=x")
+    asyncio.run(ytdl.adl_handler(None, msg))
+    task = state["enqueued"][0]
+    assert task["type"] == "adl"
+    assert task["url"] == "https://youtube.com/watch?v=x"
+
+
+def test_dl_handler_rejects_when_queue_full(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    stub = sys.modules["plugins.tasks"]
+    monkeypatch.setattr(stub, "get_queue_size", lambda uid: stub._MAX_QUEUE)
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert not state["created"]
+    assert any("队列已满" in r for r in msg.replies)
+
+
+def test_dl_handler_usage_without_link(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    msg = _FakeMessage("/dl")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert not state["created"]
+    assert any("用法" in r for r in msg.replies)
 
 
 # ─── album upload flow (issue #13: channel album + private-only notices) ──────

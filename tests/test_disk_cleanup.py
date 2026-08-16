@@ -158,6 +158,10 @@ def batch_module(monkeypatch, tmp_path):
         def command(*_args, **_kwargs):
             return _Filter()
 
+        @staticmethod
+        def regex(_pattern):
+            return _Filter()
+
     class _FakeApp:
         def on_message(self, *_args, **_kwargs):
             def decorator(function):

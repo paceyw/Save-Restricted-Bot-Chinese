@@ -24,7 +24,10 @@ import logging
 import math
 from shared_client import app, _WORKDIR
 from pyrogram import filters
-from pyrogram.types import InputMediaPhoto, InputMediaVideo
+from pyrogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, InputMediaVideo,
+)
 from utils.func import get_video_metadata, screenshot, touch_file
 from utils.missav import (
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
@@ -33,8 +36,10 @@ from utils.missav import (
     build_caption,
     download_getav,
     download_missav,
+    fetch_getav_movie,
     is_getav_url,
     is_missav_url,
+    list_getav_sources,
 )
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
@@ -56,7 +61,6 @@ logger = logging.getLogger(__name__)
  
  
 thread_pool = ThreadPoolExecutor()
-ongoing_downloads = {}
 screenshot_lock = asyncio.Lock()
 # cross-user cap on simultaneous missav pipelines (disk/bandwidth guard)
 _missav_jobs_sem = None
@@ -67,6 +71,22 @@ def _get_missav_jobs_sem():
     if _missav_jobs_sem is None:
         _missav_jobs_sem = asyncio.Semaphore(max(1, MISSAV_MAX_JOBS))
     return _missav_jobs_sem
+
+
+def _report_task(task_id, msg):
+    """Push a live progress line into the task's /tasks entry (queue glue)."""
+    if not task_id:
+        return
+    from plugins.tasks import task_update
+    task_update(task_id, progress_msg=msg)
+
+
+def _task_result(task_id, result):
+    """Record the terminal outcome and drop the stale progress line."""
+    if not task_id:
+        return
+    from plugins.tasks import task_update
+    task_update(task_id, progress_msg='', result=result)
 
 
 UPLOAD_HEADER = "╭─────────────────────╮\n│      **__上传中__**\n├─────────────────────"
@@ -120,9 +140,7 @@ async def extract_audio_async(ydl_opts, url):
 def get_random_string(length=7):
     characters = string.ascii_letters + string.digits
     return ''.join(random.choice(characters) for _ in range(length)) 
- 
- 
-async def process_audio(message, url, cookies_env_var=None):
+async def process_audio(message, url, cookies_env_var=None, task_id=None):
     cookies = cookies_env_var if cookies_env_var else None
 
     temp_cookie_path = None
@@ -148,12 +166,14 @@ async def process_audio(message, url, cookies_env_var=None):
 
     chat_id = message.chat.id
     progress_message = await message.reply_text("**__开始提取音频...__**")
-
+    _report_task(task_id, '提取音频中...')
+ 
     try:
         info_dict = await extract_audio_async(ydl_opts, url)
         title = info_dict.get('title', '提取的音频')
 
         await progress_message.edit_text("**__正在编辑元数据...__**")
+        _report_task(task_id, '编辑音频元数据...')
 
         if os.path.exists(download_path):
             def edit_metadata():
@@ -183,6 +203,7 @@ async def process_audio(message, url, cookies_env_var=None):
         if os.path.exists(download_path):
             await progress_message.delete()
             prog = await app.send_message(chat_id, "**__开始上传...__**")
+            _report_task(task_id, '上传音频中...')
             await app.send_audio(
                 chat_id,
                 audio=download_path,
@@ -194,12 +215,15 @@ async def process_audio(message, url, cookies_env_var=None):
             )
             if prog:
                 await prog.delete()
+            _task_result(task_id, '✅ 音频上传完成')
         else:
             await message.reply_text("**__提取后未找到音频文件！__**")
+            _task_result(task_id, '❌ 提取后未找到音频文件')
 
     except Exception as e:
         logger.exception("Error during audio extraction or upload")
         await message.reply_text(f"**__发生错误：{e}__**")
+        _task_result(task_id, f'❌ 音频提取失败：{str(e)[:80]}')
     finally:
         if os.path.exists(download_path):
             os.remove(download_path)
@@ -212,28 +236,35 @@ async def process_audio(message, url, cookies_env_var=None):
 @app.on_message(filters.command("adl"))
 async def adl_handler(client, message):
     user_id = message.from_user.id
-    if user_id in ongoing_downloads:
-        await message.reply_text("**您已有正在进行的下载，请等待完成！**")
-        return
 
     if len(message.text.split()) < 2:
         await message.reply_text("**用法：** `/adl <video-link>`\n\n请提供有效的视频链接！")
-        return    
+        return
 
     url = message.text.split()[1]
-    ongoing_downloads[user_id] = True
+    from plugins.tasks import _MAX_QUEUE, create_task, enqueue_task, get_queue_size
+    if get_queue_size(user_id) >= _MAX_QUEUE:
+        await message.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+    task = create_task(user_id, 'adl', 1, url=url, message=message)
+    if not await enqueue_task(user_id, task):
+        await message.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+    qpos = get_queue_size(user_id)
+    await message.reply_text(
+        '🎵 音频提取任务已加入队列。\n'
+        f'位置：{"执行中" if qpos <= 1 else f"队列第 {qpos - 1} 位"}\n'
+        '使用 /tasks 查看进度。')
 
-    try:
-        if "instagram.com" in url:
-            await process_audio(message, url, cookies_env_var=INSTA_COOKIES)
-        elif "youtube.com" in url or "youtu.be" in url:
-            await process_audio(message, url, cookies_env_var=YT_COOKIES)
-        else:
-            await process_audio(message, url)
-    except Exception as e:
-        await message.reply_text(f"**发生错误：** `{e}`")
-    finally:
-        ongoing_downloads.pop(user_id, None)
+
+async def run_adl(message, url, task_id=None):
+    """Cookie-aware site routing for a queued /adl task."""
+    if "instagram.com" in url:
+        await process_audio(message, url, cookies_env_var=INSTA_COOKIES, task_id=task_id)
+    elif "youtube.com" in url or "youtu.be" in url:
+        await process_audio(message, url, cookies_env_var=YT_COOKIES, task_id=task_id)
+    else:
+        await process_audio(message, url, task_id=task_id)
 
 
 async def fetch_video_info(url, ydl_opts, progress_message, check_duration_and_size):
@@ -262,10 +293,6 @@ def download_video(url, ydl_opts):
 async def dl_handler(client, message):
     user_id = message.from_user.id
 
-    if user_id in ongoing_downloads:
-        await message.reply_text("**您已有正在进行的 ytdlp 下载，请等待完成！**")
-        return
-
     parts = message.text.split()
     if len(parts) < 2:
         await message.reply_text(
@@ -280,32 +307,168 @@ async def dl_handler(client, message):
     if not url:
         await message.reply_text("**用法：** `/dl [-sub] <video-link>`")
         return
-    ongoing_downloads[user_id] = True
+
+    from plugins.tasks import _MAX_QUEUE, create_task, enqueue_task, get_queue_size
+    if get_queue_size(user_id) >= _MAX_QUEUE:
+        await message.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+
+    # getav: probe the movie JSON up-front so multi-version pages offer a
+    # selection card instead of silently auto-picking (single-version and
+    # every other site keep the direct-enqueue path).
+    getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
+    if is_getav_url(url, getav_hosts):
+        try:
+            data, _host = await asyncio.to_thread(fetch_getav_movie, url, tuple(getav_hosts))
+        except MissAVError as e:
+            await message.reply_text(f"**__getav 视频信息获取失败：{e}__**")
+            return
+        versions = list_getav_sources(data.get("videoSources") or [])
+        if not versions:
+            await message.reply_text("**__视频没有可用的播放源__**")
+            return
+        if len(versions) > 1:
+            await _send_version_card(message, user_id, url, want_subtitle, versions)
+            return
+
+    task = create_task(user_id, 'dl', 1, url=url, want_subtitle=want_subtitle, message=message)
+    if not await enqueue_task(user_id, task):
+        await message.reply_text(f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+    qpos = get_queue_size(user_id)
+    await message.reply_text(
+        '📦 下载任务已加入队列。\n'
+        f'位置：{"执行中" if qpos <= 1 else f"队列第 {qpos - 1} 位"}\n'
+        '使用 /tasks 查看进度。')
+
+
+# ─── getav version selection card ──────────────────────────────────────────────
+# /dl on a multi-version getav page stops here: the user picks a version on
+# an inline card, the callback enqueues the download with the source pinned.
+# One open prompt per user; stale prompts are answered as expired and swept.
+_GETAV_PROMPTS = {}          # uid -> prompt dict
+_GETAV_PROMPT_SEQ = 0        # token per prompt, embedded in callback data
+_GETAV_PROMPT_TTL = 600      # seconds before a card is considered abandoned
+
+
+async def _send_version_card(message, uid, url, want_subtitle, versions):
+    global _GETAV_PROMPT_SEQ
+    _GETAV_PROMPT_SEQ += 1
+    token = f'{_GETAV_PROMPT_SEQ:x}'
+    _GETAV_PROMPTS[uid] = {
+        'token': token,
+        'url': url,
+        'want_subtitle': want_subtitle,
+        'message': message,
+        'versions': versions,
+        'created_at': time.time(),
+    }
+    buttons = [
+        [InlineKeyboardButton(
+            ('⭐ ' if i == 0 else '') + label,
+            callback_data=f'gav:{token}:{i}')]
+        for i, (_src_url, _fam, label) in enumerate(versions)
+    ]
+    sub_note = '\n-sub 将烧录中文字幕（cn 版本自带字幕不重复烧录）' if want_subtitle else ''
+    await message.reply_text(
+        '🎬 **检测到多个版本，请选择要下载的版本：**\n'
+        '（⭐ 为自动推荐的默认版本；'
+ f'{_GETAV_PROMPT_TTL // 60} 分钟内有效，/stop 可取消）{sub_note}',
+        reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@app.on_callback_query(filters.regex(r'^gav:([0-9a-f]+):(\d+)$'))
+async def getav_version_callback(client, query):
+    uid = query.from_user.id
+    prompt = _GETAV_PROMPTS.get(uid)
+    token, idx_s = query.matches[0].group(1), query.matches[0].group(2)
+    if (prompt is None or prompt['token'] != token
+            or time.time() - prompt['created_at'] > _GETAV_PROMPT_TTL):
+        try:
+            await query.answer('选择已过期，请重新发送 /dl', show_alert=True)
+        except Exception:
+            pass
+        return
+    idx = int(idx_s)
+    versions = prompt['versions']
+    if idx >= len(versions):
+        await query.answer('无效的版本，请重新发送 /dl', show_alert=True)
+        return
+    source_url, _fam, label = versions[idx]
+    _GETAV_PROMPTS.pop(uid, None)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_text(f'✅ 已选择 **{label}**，正在加入队列...')
+    except Exception:
+        pass
+
+    from plugins.tasks import _MAX_QUEUE, create_task, enqueue_task, get_queue_size
+    if get_queue_size(uid) >= _MAX_QUEUE:
+        await prompt['message'].reply_text(
+            f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+    task = create_task(uid, 'dl', 1, url=prompt['url'],
+                       want_subtitle=prompt['want_subtitle'],
+                       source_url=source_url,
+                       message=prompt['message'])
+    if not await enqueue_task(uid, task):
+        await prompt['message'].reply_text(
+            f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+        return
+    qpos = get_queue_size(uid)
+    await prompt['message'].reply_text(
+        f'📦 下载任务（{label}）已加入队列。\n'
+        f'位置：{"执行中" if qpos <= 1 else f"队列第 {qpos - 1} 位"}\n'
+        '使用 /tasks 查看进度。')
+
+
+def discard_getav_prompts(uid=None):
+    """Drop open version cards (/stop wiring + sweeper entry point)."""
+    if uid is None:
+        return len(_GETAV_PROMPTS.clear() or _GETAV_PROMPTS)
+    return 1 if _GETAV_PROMPTS.pop(uid, None) is not None else 0
+
+
+async def _sweep_getav_prompts(now=None):
+    if now is None:
+        now = time.time()
+    for uid, prompt in list(_GETAV_PROMPTS.items()):
+        if now - prompt['created_at'] > _GETAV_PROMPT_TTL:
+            _GETAV_PROMPTS.pop(uid, None)
+
+
+try:
+    from plugins.tasks import register_sweep_hook
+    register_sweep_hook(_sweep_getav_prompts)
+except Exception:
+    pass  # test stubs may not expose the hook
+
+
+async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=None):
+    """Site routing for a queued /dl task (yt-dlp / missav / getav)."""
+
     missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
     getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
 
-    try:
-        if is_getav_url(url, getav_hosts):
-            await process_getav(message, url, getav_hosts, want_subtitle)
-        elif is_missav_url(url, missav_hosts):
-            await process_missav(message, url, missav_hosts)
-        elif "instagram.com" in url:
-            await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False)
-        elif "youtube.com" in url or "youtu.be" in url:
-            await process_video(message, url, YT_COOKIES, check_duration_and_size=True)
-        else:
-            if want_subtitle:
-                await message.reply_text("**__-sub 仅支持 getav 视频页，忽略该参数__**")
-            await process_video(message, url, None, check_duration_and_size=False)
-
-    except Exception as e:
-        await message.reply_text(f"**发生错误：** `{e}`")
-    finally:
-        ongoing_downloads.pop(user_id, None)
-
+    if is_getav_url(url, getav_hosts):
+        await process_getav(message, url, getav_hosts, want_subtitle,
+                            task_id=task_id, source_url=source_url)
+    elif is_missav_url(url, missav_hosts):
+        await process_missav(message, url, missav_hosts, task_id=task_id)
+    elif "instagram.com" in url:
+        await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False, task_id=task_id)
+    elif "youtube.com" in url or "youtu.be" in url:
+        await process_video(message, url, YT_COOKIES, check_duration_and_size=True, task_id=task_id)
+    else:
+        if want_subtitle:
+            await message.reply_text("**__-sub 仅支持 getav 视频页，忽略该参数__**")
+        await process_video(message, url, None, check_duration_and_size=False, task_id=task_id)
 
 async def _finalize_and_upload(message, download_path, title, thumbnail_url,
-                               progress_message, extra_meta=None):
+                               progress_message, extra_meta=None, task_id=None):
     """Probe metadata, resolve a thumbnail (download → screenshot fallback),
     then upload (splitting first when >2 GB).
 
@@ -355,13 +518,16 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
         SIZE = 2 * 1024 * 1024 * 1024
         if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
             prog = await app.send_message(chat_id, "**__开始上传...__**")
+            _report_task(task_id, '上传中（>2GB 分片）...')
             await split_and_upload_file(app, chat_id, download_path, caption)
             await prog.delete()
             await _safe_delete(progress_message)
+            _task_result(task_id, '✅ 上传完成（>2GB 分片）')
             return
 
         if os.path.exists(download_path):
             prog = await app.send_message(chat_id, "**__开始上传...__**")
+            _report_task(task_id, '上传中...')
             await app.send_video(
                 chat_id,
                 video=download_path,
@@ -376,50 +542,59 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
             )
             if prog:
                 await prog.delete()
+            _task_result(task_id, '✅ 上传完成')
         else:
             await message.reply_text("**__下载后未找到文件。出现了问题！__**")
+            _task_result(task_id, '❌ 下载后未找到文件')
     finally:
         for temp_path in (thumbnail_file, screenshot_file):
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
 
-async def process_missav(message, url, hosts):
+async def process_missav(message, url, hosts, task_id=None):
     """Download a missav.ai video page via the dedicated HLS pipeline and
     upload it back through the shared finalize/upload tail."""
-    await _process_hls_site(message, url, hosts, download_missav, "missav")
+    await _process_hls_site(message, url, hosts, download_missav, "missav", task_id=task_id)
 
 
-async def process_getav(message, url, hosts, want_subtitle=False):
+async def process_getav(message, url, hosts, want_subtitle=False, task_id=None,
+                        source_url=None):
     """Same pipeline for getav.net: movie API -> HLS -> album upload.
 
     ``want_subtitle`` (``/dl -sub``) burns the site's Chinese VTT into
-    the frame; default is a plain fast remux."""
+    the frame; default is a plain fast remux. ``source_url`` pins the
+    version chosen on the /dl selection card (None = auto-best)."""
+    extra = {"want_subtitle": want_subtitle} if want_subtitle else {}
+    if source_url:
+        extra["source_url"] = source_url
     await _process_hls_site(
-        message, url, hosts, download_getav, "getav",
-        extra_dl_kwargs={"want_subtitle": want_subtitle} if want_subtitle else None,
+        message, url, hosts, download_getav, "getav", task_id=task_id,
+        extra_dl_kwargs=extra or None,
     )
 
 
 async def _process_hls_site(message, url, hosts, downloader, site,
-                            extra_dl_kwargs=None):
+                            extra_dl_kwargs=None, task_id=None):
     logger.info(f"Received {site} link: {url}")
     sem = _get_missav_jobs_sem()
     if sem.locked():
         await message.reply_text(
             f"**__当前 {site} 下载任务已满（最多 {MISSAV_MAX_JOBS} 个），请稍后再试__**")
+        _task_result(task_id, f'❌ {site} 下载任务已满，请稍后再试')
         return
     progress_message = await message.reply_text(f"**__开始下载 {site} 视频...__**")
+    _report_task(task_id, f'{site} 下载中...')
 
     async with sem:
         await _run_hls_download(
             message, url, hosts, progress_message, downloader, site,
-            extra_dl_kwargs or {},
+            extra_dl_kwargs or {}, task_id=task_id,
         )
 
 
 async def _run_hls_download(message, url, hosts, progress_message, downloader, site,
-                            extra_dl_kwargs=None):
+                            extra_dl_kwargs=None, task_id=None):
 
 
     download_dir = os.path.join(_WORKDIR, 'downloads')
@@ -429,6 +604,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
     async def progress(done, total, stage):
         if stage == "burn" and not progress._burn_notified:
             progress._burn_notified = True
+            _report_task(task_id, '烧录中文字幕中（约 30-60 分钟）...')
             try:
                 await progress_message.edit_text(
                     "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
@@ -443,6 +619,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
             return
         progress._last_edit = time.time()
         pct = int(done * 100 / total)
+        _report_task(task_id, f'{site} 下载中 {pct}%（{done}/{total} 段）' if not final else f'{site} 下载完成，封装中...')
         try:
             await progress_message.edit_text(
                 f"**__{site} 下载中 {pct}%（{done}/{total} 段）...__**"
@@ -472,6 +649,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
         )
 
         await _safe_delete(progress_message)
+        _report_task(task_id, f'{site} 下载完成，上传相册中...')
         target_chat, sender = await _resolve_missav_delivery(message)
         try:
             await _upload_missav_album(
@@ -495,14 +673,17 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
                     app, message.chat.id, message.chat.id, download_path,
                     cover_file, caption, duration, width, height,
                 )
+        _task_result(task_id, f'✅ {site} 上传完成')
     except MissAVError as e:
         logger.warning("%s download failed: %s", site, e)
         await _safe_delete(progress_message)
         await message.reply_text(f"**__{site} 下载失败：{e}__**")
+        _task_result(task_id, f'❌ {site} 下载失败：{str(e)[:80]}')
     except Exception as e:
         logger.exception("%s download/upload failed.", site)
         await _safe_delete(progress_message)
         await message.reply_text(f"**__发生错误：{e}__**")
+        _task_result(task_id, f'❌ 错误：{str(e)[:80]}')
     finally:
         for temp_path in (download_path, cover_file):
             if temp_path and os.path.exists(temp_path):
@@ -733,7 +914,7 @@ async def _safe_delete(message):
         pass
 
 
-async def process_video(message, url, cookies, check_duration_and_size=False):
+async def process_video(message, url, cookies, check_duration_and_size=False, task_id=None):
     logger.info(f"Received link: {url}")
 
     download_dir = os.path.join(_WORKDIR, 'downloads')
@@ -757,10 +938,12 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
     }
 
     progress_message = await message.reply_text("**__开始下载...__**")
+    _report_task(task_id, '下载中...')
     logger.info("Starting the download process...")
     try:
         info_dict = await fetch_video_info(url, ydl_opts, progress_message, check_duration_and_size)
         if not info_dict:
+            _task_result(task_id, '❌ 已中止（时长/大小超限）')
             return
 
         await asyncio.to_thread(download_video, url, ydl_opts)
@@ -771,10 +954,12 @@ async def process_video(message, url, cookies, check_duration_and_size=False):
             info_dict.get('thumbnail', None),
             progress_message,
             extra_meta=info_dict,
+            task_id=task_id,
         )
     except Exception as e:
         logger.exception("An error occurred during download or upload.")
         await message.reply_text(f"**__发生错误：{e}__**")
+        _task_result(task_id, f'❌ 错误：{str(e)[:80]}')
     finally:
         cleanup_paths = {
             download_path,

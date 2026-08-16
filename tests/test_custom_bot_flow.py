@@ -30,6 +30,10 @@ class _Filters:
     @staticmethod
     def command(*args, **kwargs):
         return _Filter()
+    @staticmethod
+    def regex(pattern):
+        return _Filter()
+
 
 
 class _FakeApp:

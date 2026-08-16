@@ -18,15 +18,20 @@ class _Filter:
 
 class _Filters:
     private = _Filter()
+    regex_patterns = []          # captured so tests can assert scoping
 
     @staticmethod
     def command(*args, **kwargs):
         return _Filter()
 
     @staticmethod
-    def create(callback):
+    def regex(pattern):
+        _Filters.regex_patterns.append(pattern)
         return _Filter()
 
+    @staticmethod
+    def create(callback):
+        return _Filter()
 
 class _FakeApp:
     def on_message(self, *args, **kwargs):
@@ -106,3 +111,24 @@ def test_rename_file_uses_snapshot_settings(monkeypatch, tmp_path):
 
     assert result.endswith("/bar TAG.mp4")
     assert renamed == [(str(source), result)]
+
+def test_settings_callback_filter_scoped_to_own_buttons(monkeypatch):
+    """The settings callback handler must NOT swallow foreign callbacks.
+
+    Regression (live 2026-08-16): settings registered ``on_callback_query()``
+    with no filter — pyrogram dispatches to the first matching handler per
+    group, so the catch-all silently ate the getav version card's ``gav:``
+    callbacks (button spin stopped, nothing happened). The filter must be
+    anchored to the settings button set and reject other plugins' data.
+    """
+    import re as _re
+    _Filters.regex_patterns.clear()
+    _load_settings_module(monkeypatch)
+    patterns = [p for p in _Filters.regex_patterns if "setchat" in p]
+    assert patterns, "settings callback handler must register a scoped regex"
+    pat = _re.compile(patterns[0])
+    own = ("setchat", "setrename", "setcaption", "setreplacement",
+           "addsession", "delete", "setthumb", "logout", "reset", "remthumb")
+    assert all(pat.fullmatch(d) for d in own)
+    for foreign in ("gav:1:0", "gav:2f:12", "help_next_1", "help_prev_2"):
+        assert pat.fullmatch(foreign) is None, foreign

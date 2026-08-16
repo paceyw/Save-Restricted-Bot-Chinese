@@ -95,7 +95,7 @@ def create_task(uid, task_type, total, **params):
     task = {
         'id': tid,
         'uid': uid,
-        'type': task_type,         # 'batch_links' | 'single' | 'merge' | 'batch_count'
+        'type': task_type,         # 'batch_links' | 'single' | 'merge' | 'batch_count' | 'dl' | 'adl'
         'status': 'queued',        # 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
         'total': total,
         'current': 0,
@@ -158,6 +158,13 @@ async def _dispatch_task(uid, task):
     # Epoch is captured BEFORE the read it validates: a rotation completing
     # during the await then yields (old doc, old epoch) — a conservative
     # mismatch the helpers discard for a fresh read, never stale acceptance.
+    # dl/adl run no userbot and read no settings: skip the snapshot read.
+    if task['type'] == 'dl':
+        await _run_dl(uid, task)
+        return
+    if task['type'] == 'adl':
+        await _run_adl(uid, task)
+        return
     epoch = cred_epoch(uid)
     doc = await get_user_data(uid) or {}
     task['settings'] = filter_settings(doc)
@@ -174,7 +181,7 @@ def task_should_cancel(task_id):
     t = TASKS.get(task_id)
     return t is not None and t.get('cancel_requested', False)
 
-def task_update(task_id, current=None, success=None, progress_msg=None):
+def task_update(task_id, current=None, success=None, progress_msg=None, result=None):
     t = TASKS.get(task_id)
     if t is None:
         return
@@ -184,6 +191,8 @@ def task_update(task_id, current=None, success=None, progress_msg=None):
         t['success'] = success
     if progress_msg is not None:
         t['progress_msg'] = progress_msg
+    if result is not None:
+        t['result'] = result
 
 def request_cancel_tasks(uid):
     """Cancel all queued/running tasks for a user. Returns count."""
@@ -754,6 +763,48 @@ async def _run_batch_count(uid, task, doc, epoch):
         task['result'] = f'✅ 批量提取完成：成功 {success}/{n}'
     else:
         task['result'] = f'已取消。成功：{success}/{n}'
+
+async def _run_dl(uid, task):
+    """Execute a queued /dl video download (yt-dlp / missav / getav).
+
+    Routing and delivery live in plugins.ytdl.run_dl; this wrapper only
+    owns queue lifecycle: cancellation before start, live progress, and a
+    default result when the pipeline reported none (errors are already
+    replied to the user inside the pipeline, which re-raises nothing)."""
+    from plugins.ytdl import run_dl
+    if task_should_cancel(task['id']):
+        task['status'] = 'cancelled'
+        task['result'] = '已取消。'
+        return
+    task_update(task['id'], progress_msg='准备下载...')
+    try:
+        await run_dl(task['message'], task['url'], bool(task.get('want_subtitle')),
+                     task_id=task['id'], source_url=task.get('source_url'))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        task['result'] = f'❌ 错误：{str(e)[:100]}'
+    if not task.get('result'):
+        task['result'] = '✅ 下载完成'
+    task_update(task['id'], current=1)
+
+async def _run_adl(uid, task):
+    """Execute a queued /adl audio extraction (same lifecycle as _run_dl)."""
+    from plugins.ytdl import run_adl
+    if task_should_cancel(task['id']):
+        task['status'] = 'cancelled'
+        task['result'] = '已取消。'
+        return
+    task_update(task['id'], progress_msg='准备提取音频...')
+    try:
+        await run_adl(task['message'], task['url'], task_id=task['id'])
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        task['result'] = f'❌ 错误：{str(e)[:100]}'
+    if not task.get('result'):
+        task['result'] = '✅ 音频提取完成'
+    task_update(task['id'], current=1)
 
 async def process_one_link(*args, **kwargs):
     from plugins.deliver import process_one_link as deliver_process_one_link

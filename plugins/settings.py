@@ -76,7 +76,8 @@ async def send_settings_message(chat_id, user_id):
     await app.send_message(chat_id, MESS, reply_markup=settings_menu())
 
 
-@app.on_callback_query()
+@app.on_callback_query(filters.regex(
+    r'^(setchat|setrename|setcaption|setreplacement|addsession|delete|setthumb|logout|reset|remthumb)$'))
 async def callback_query_handler(client, query):
     user_id = query.from_user.id
     data = query.data

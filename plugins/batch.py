@@ -2,6 +2,7 @@
 # Licensed under the GNU General Public License v3.0.  
 # See LICENSE file in the repository root for full license text.
 
+import asyncio
 import time
 from pyrogram import filters
 from config import FREEMIUM_LIMIT, PREMIUM_LIMIT
@@ -95,9 +96,10 @@ async def process_cmd(c, m):
 @main_bot.on_message(filters.command(['cancel', 'stop']))
 async def cancel_cmd(c, m):
     uid = m.from_user.id
-    cancelled = request_cancel_tasks(uid)
+    from plugins.ytdl import discard_getav_prompts
+    dropped_prompts = discard_getav_prompts(uid)
     had_state = pending_flows.pop(uid, None) is not None
-    if cancelled:
+    if cancelled or dropped_prompts:
         await m.reply_text(f'已请求取消 {cancelled} 个任务。进行中的将在当前步骤完成后停止。')
     elif had_state:
         await m.reply_text('已取消。')
@@ -107,12 +109,51 @@ async def cancel_cmd(c, m):
 @main_bot.on_message(filters.command('tasks'))
 async def tasks_cmd(c, m):
     uid = m.from_user.id
-    user_tasks = get_user_tasks(uid)
-    if not user_tasks:
+    if not get_user_tasks(uid):
         await m.reply_text('📋 没有任务记录。')
         return
-    # Show last 5 tasks
-    lines = ['📋 **任务列表**（最近 5 个）\n']
+    msg = await m.reply_text(_render_tasks_view(uid))
+    # Live view: re-render until every task is terminal (or TTL / edit
+    # failures exhaust the loop). /stop /tasks 均可随时中断观察。
+    deadline = time.time() + _TASKS_VIEW_TTL
+    edit_failures = 0
+    while time.time() < deadline:
+        await asyncio.sleep(_TASKS_REFRESH_INTERVAL)
+        if not _has_active_tasks(get_user_tasks(uid)):
+            # final frame: land on the terminal state before exiting
+            try:
+                await msg.edit_text(_render_tasks_view(uid))
+            except Exception:
+                pass
+            return
+        try:
+            await msg.edit_text(_render_tasks_view(uid))
+            edit_failures = 0
+        except Exception:
+            edit_failures += 1  # deleted / flood-limited / not modified
+            if edit_failures >= 3:
+                return
+
+
+# Live /tasks view: refresh cadence and max lifetime. The loop ends early
+# once every task for the user is terminal, so idle views cost nothing.
+_TASKS_REFRESH_INTERVAL = 5
+_TASKS_VIEW_TTL = 1800
+
+_TASK_TYPE_LABELS = {
+    'batch_links': '批量提取',
+    'single': '单条提取',
+    'merge': '合并',
+    'batch_count': '批量提取',
+    'dl': '视频下载',
+    'adl': '音频提取',
+}
+
+
+def _render_tasks_view(uid):
+    """Snapshot one /tasks listing (shared by the command and its live loop)."""
+    user_tasks = get_user_tasks(uid)
+    lines = ['📋 **任务列表**（最近 5 个，每 5 秒自动刷新）\n']
     status_icons = {
         'queued': '⏳', 'running': '🔄', 'done': '✅',
         'failed': '❌', 'cancelled': '🚫',
@@ -127,11 +168,16 @@ async def tasks_cmd(c, m):
         progress = f'{t["current"]}/{t["total"]}'
         if t['progress_msg']:
             progress += f' · {t["progress_msg"]}'
-        lines.append(f'{icon} **{t["type"]}** {progress}{elapsed}')
+        label = _TASK_TYPE_LABELS.get(t['type'], t['type'])
+        lines.append(f'{icon} **{label}** {progress}{elapsed}')
         if t['result']:
             lines.append(f'   └ {t["result"][:80]}')
     lines.append(f'\n队列：{get_queue_size(uid)} 个等待')
-    await m.reply_text('\n'.join(lines))
+    return '\n'.join(lines)
+
+
+def _has_active_tasks(user_tasks):
+    return any(t['status'] in ('queued', 'running') for t in user_tasks)
 
 @main_bot.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
     'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
