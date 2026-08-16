@@ -104,7 +104,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 ### 🎬 媒体下载
 | 命令 | 说明 |
 |---|---|
-| `/dl <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点，以及 missav.ai 视频页 —— 后者走内置 HLS 提取管线，见下） |
+| `/dl [-sub] <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点，以及 missav.ai / getav.net 视频页 —— 两者走内置 HLS 提取管线，见下）。getav 加 `-sub` 把中文字幕烧录进画面（约 40 分钟重编码） |
 | `/adl <链接>` | 提取音频 |
 
 <details>
@@ -129,6 +129,17 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 - >2GB 视频：ffmpeg **关键帧分段**（`-c copy` 无损 + 每段独立时间轴 + moov 前置），每段都是可直接播放、可拖进度的 Telegram 流媒体视频，整组仍在同一条相册内（1.8GB/段目标，最多 9 段）
 - 内置资源防护：单任务 20k 段 / 20GB / 8 小时上限，私网与云元数据地址拒绝访问，跨用户最多同时 2 个 missav 任务
 - 依赖：`curl-cffi`（Chrome TLS 指纹）、`m3u8`；`MISSAV_MIRRORS` / `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` 可调
+
+</details>
+
+<details>
+<summary><b>getav.net 下载说明</b></summary>
+
+- 支持 `getav.net` 视频页链接（`[/<语言>/]videos/<番号>`，如 `/zh/videos/cjod-159`；语言前缀可省略），镜像域名可用 `GETAV_MIRRORS` 覆盖
+- 流程与 missav 相同的 HLS 管线：站点 JSON API（`/api/movies/<番号>`）取播放源 → 自动选优（中文字幕版 > 无码版 > 原版，同级选最高分辨率）→ 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4（+faststart）→ 以**一条相册消息**投递（封面 + 可直接播放的视频）
+- **中文字幕烧录为可选**（`/dl -sub <getav链接>`，标志可在链接前后）：默认 `/dl` 走秒级无损封装、不含字幕；`-sub` 时把站方精校中文字幕以字幕组风格渲染进画面（白色粗体 + 黑描边 + 柔和阴影，底部居中），经 `subtitles` 滤镜 + Noto Sans CJK SC 字体完整 libx264 重编码（veryfast/CRF19，实测 3 vCPU 约 4× 实时速度，2 小时正片约 40 分钟，峰值内存 ~0.5GB，编码线程自动留 1 核给 bot）；`cn` 版片源本身已烧录字幕不再重复；烧录失败自动回退无字幕封装。非 getav 链接带 `-sub` 忽略并提示。镜像内置 Noto Sans CJK SC 字体与 fontconfig 缓存
+- 投递路由、caption 五段式、>2GB 关键帧分段、资源防护（20k 段 / 20GB / 8 小时 / 私网地址拒绝 / 任务并发上限）全部与 missav 一致；分段并发与任务上限复用 `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS`
+- 封面取影片的 `localImg`（static.worldstatic.com 封面图），中文字幕/无码徽章依据所选播放源与字幕轨自动推导
 
 </details>
 
@@ -171,7 +182,8 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | `INSTA_COOKIES` | 空 | Instagram 下载用 cookie |
 | `JOIN_LINK` | `t.me/team_spy_pro` | 加入链接 |
 | `ADMIN_CONTACT` | — | 管理员联系方式 |
-| `PLAN_*` | 见 `config.py` | 会员方案价格/时长配置 |
+| `MISSAV_MAX_JOBS` | `2` | 同时进行的 missav 任务数上限（跨用户） |
+| `GETAV_MIRRORS` | `getav.net` | getav 镜像域名，逗号分隔；分段并发/任务上限复用 missav 配置 |
 | `BATCH_MIN_INTERVAL` | `2` | 批量/计数任务自适应间隔下限/起始值（秒）；设为 `10` 恢复旧固定间隔行为 |
 | `BATCH_INTERVAL` | `10` | 批量/计数任务自适应间隔上限（秒），FloodWait 退避封顶值 |
 | `PROGRESS_MIN_INTERVAL` | `3` | 下载/上传进度消息编辑节流（秒），100% 时必发 |
@@ -216,9 +228,8 @@ docker compose up -d --build
 │   ├── login.py         # 用户登录、会话保存、自定义 Bot 管理
 │   ├── batch.py         # /batch /single /merge /cancel /tasks 命令层
 │   ├── fetch.py         # 用户 client 缓存、消息获取、peer/linked-chat 缓存
-│   ├── tasks.py         # 任务队列（TASKS/worker/dispatch）+ 后台状态 sweeper
+│   ├── ytdl.py          # /dl /adl 命令层（yt-dlp + missav/getav HLS 管线入口）
 │   ├── deliver.py       # 媒体下载、相册/合并投递、FloodWait 重试
-│   ├── ytdl.py          # yt-dlp 音视频下载（Pyrogram 上传）
 │   ├── settings.py      # 用户个性化设置（重命名/标题/缩略图/会话）
 │   ├── premium.py       # /add 会员管理、/start 处理
 │   ├── pay.py           # 付费入口（统一提示文案）
@@ -226,9 +237,9 @@ docker compose up -d --build
 ├── utils/
 │   ├── func.py          # MongoDB 集合、文件处理、视频元数据
 │   ├── encrypt.py       # 会话加密（AES-GCM）
-│   ├── missav.py        # missav.ai HLS 下载管线（镜像轮询/packed JS/AES-128/remux，issue #13）
+│   ├── missav.py        # missav.ai / getav.net HLS 下载管线（镜像轮询/packed JS/JSON API/AES-128/remux，issue #13）
 │   └── custom_filters.py# 登录流程过滤器
-├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引 / peer 缓存 / missav 下载与路由）
+├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引 / peer 缓存 / missav 与 getav 下载及路由）
 └── templates/welcome.html
 ```
 
