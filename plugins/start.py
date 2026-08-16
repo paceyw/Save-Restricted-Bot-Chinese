@@ -60,7 +60,7 @@ async def set(_, message):
         BotCommand("add", "➕ 添加用户为会员"),
         BotCommand("rem", "➖ 移除会员"),
         BotCommand("settings", "⚙️ 个性化设置"),
-        BotCommand("dl", "🎬 下载视频"),
+        BotCommand("dl", "🎬 下载视频（getav 加 -sub 烧录中文字幕）"),
         BotCommand("adl", "🎵 提取音频"),
         BotCommand("plan", "🗓️ 查看会员方案"),
         BotCommand("pay", "💎 开通/续费会员"),
@@ -87,7 +87,8 @@ help_pages = [
         "• **/batch** — 批量提取帖子（登录后使用）\n"
         "• **/single** — 单条提取\n"
         "• **/merge** — 合并多条链接为一条消息/相册\n"
-        "• **/dl** — 下载视频\n"
+        "• **/dl** — 下载视频（YouTube/Instagram 等 yt-dlp 站点，及 missav.ai / getav.net 视频页）\n"
+        "• **/dl -sub <getav链接>** — 同上，并把 getav 中文字幕烧录进画面（约 40 分钟重编码，标志可在链接前后）\n"
         "• **/adl** — 提取音频\n"
         "• **/cancel** / **/stop** — 取消进行中的任务\n"
         "• **/tasks** — 查看任务队列状态和进度\n"

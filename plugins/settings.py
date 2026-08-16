@@ -23,7 +23,7 @@ VIDEO_EXTENSIONS = {
     'mpeg', 'mpg', '3gp'
 }
 SET_PIC = 'settings.jpg'
-MESS = '自定义文件设置...\n\n提示：任务开始执行后修改设置，对进行中的任务不生效。'
+MESS = '自定义文件设置...\n\n提示：任务开始执行后修改设置，对进行中的任务不生效。\n视频下载选项为命令级开关：getav 中文字幕烧录请在下载命令加 `-sub`（如 `/dl -sub <链接>`），无需在此设置。'
 
 active_conversations = {}
 _ACTIVE_CONVERSATION_TTL = 900

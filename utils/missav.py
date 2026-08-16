@@ -2,21 +2,26 @@
 # Licensed under the GNU General Public License v3.0.
 # See LICENSE file in the repository root for full license text.
 
-"""missav.ai downloader (issue #13).
+"""missav.ai / getav.net downloaders (issue #13 + getav follow-up).
 
-yt-dlp ships no missav extractor, so this module implements the pipeline
-directly:
+yt-dlp ships no missav/getav extractor, so this module implements the
+pipelines directly:
 
-    video page (Cloudflare) -> packed JS -> m3u8 -> HLS segments -> mp4
+    missav: video page (Cloudflare) -> packed JS -> m3u8 -> HLS segments -> mp4
+    getav:  JSON movie API -> media playlist (AES-128) -> HLS segments -> mp4
 
 Key behaviours (validated against the reference implementation in
-Alos21750/JableTV-MissAV-Downloader-GUI-2026):
+Alos21750/JableTV-MissAV-Downloader-GUI-2026 and live getav.net traffic,
+2026-08-16):
 
-* The page hides the m3u8 URL inside a Dean Edwards ``p,a,c,k,e,d`` eval
-  block that must be unpacked before extraction.
-* missav sits behind Cloudflare: we impersonate Chrome via curl_cffi when
+* missav hides the m3u8 URL inside a Dean Edwards ``p,a,c,k,e,d`` eval
+  block that must be unpacked before extraction. getav instead serves a
+  JSON API (``/api/movies/<slug>``) whose ``videoSources`` entries are
+  signed media playlists (disguised as ``index.txt``/``.woff2`` assets
+  on static.worldstatic.com) — no page scraping needed.
+* Both sit behind Cloudflare: we impersonate Chrome via curl_cffi when
   available (plain requests fallback) and rotate across mirror hosts
-  (missav.ai / .ws / .live / missav123.com).
+  (missav.ai / .ws / .live / missav123.com; getav.net).
 * HLS AES-128: a playlist key without an explicit IV uses the segment's
   media-sequence number (``EXT-X-MEDIA-SEQUENCE`` + playlist index) as a
   16-byte big-endian IV. Each segment gets a fresh cipher object because
@@ -30,6 +35,7 @@ fixtures without touching the network.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -46,17 +52,18 @@ logger = logging.getLogger(__name__)
 # ─── constants ─────────────────────────────────────────────────────────────────
 
 DEFAULT_MIRRORS = ("missav.ai", "missav.ws", "missav.live", "missav123.com")
+GETAV_DEFAULT_MIRRORS = ("getav.net",)
 
 _LANG_PREFIXES = ("cn", "en", "ja", "ko", "ms", "th")
 _CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-
+SEGMENT_RETRIES = 3        # attempts per segment before failing the job
+SEGMENT_RETRIES_RATE_LIMITED = 6   # extended budget while the CDN 429s us
 PAGE_TIMEOUT = 20          # seconds, page/playlist/key fetch
 SEGMENT_TIMEOUT = 60       # seconds, per TS segment
 SEGMENT_CONCURRENCY = 8    # parallel segment downloads
-SEGMENT_RETRIES = 3        # attempts per segment before failing the job
 MAX_SEGMENTS = 20_000      # sanity ceiling (~16h of 3s segments)
 MAX_SEGMENT_BYTES = 32 * 1024 * 1024   # a legit TS segment is a few MB
 MAX_TOTAL_BYTES = 20 * 1024 * 1024 * 1024  # per-job cumulative budget
@@ -154,6 +161,74 @@ def mirror_candidates(url, hosts=DEFAULT_MIRRORS):
             continue
         replaced = parsed._replace(scheme="https", netloc=host)
         out.append(urlunparse(replaced))
+    return out
+
+
+# ─── getav URL recognition (pure) ──────────────────────────────────────────────
+
+_GETAV_LOCALE_RE = re.compile(r"[a-z]{2}(?:-[a-z0-9]{2,8})?", re.IGNORECASE)
+
+
+def parse_getav_url(url, hosts=GETAV_DEFAULT_MIRRORS):
+    """Return {'host','lang','slug'} for a getav VIDEO page, else None.
+
+    getav video pages are ``https://getav.net/[<locale>/]videos/<slug>``
+    (e.g. ``/zh/videos/cjod-159``, ``/en/videos/fc2-ppv-1234567``; the
+    locale-less form 302s to ``/en/...``). The literal ``videos`` path
+    segment is the discriminator, so any locale getav ships is accepted;
+    listing pages (``/zh/hot``, ``/zh/videos``) and missav-style slugs
+    (``/zh/cjod-159``) are rejected. A video slug always contains a digit.
+    """
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except (ValueError, TypeError):
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+
+    host = parsed.hostname.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {h.lower() for h in hosts}:
+        return None
+
+    parts = [seg for seg in parsed.path.split("/") if seg]
+    lang = None
+    if parts and _GETAV_LOCALE_RE.fullmatch(parts[0]) and len(parts) > 1:
+        # a lone /<locale> is the site root; /videos alone is a listing
+        lang = parts[0].lower()
+        parts = parts[1:]
+    if len(parts) != 2 or parts[0].lower() != "videos":
+        return None
+
+    slug = parts[1]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9\-_]*", slug):
+        return None
+    if not any(ch.isdigit() for ch in slug):
+        return None
+
+    return {"host": host, "lang": lang, "slug": slug}
+
+
+def is_getav_url(url, hosts=GETAV_DEFAULT_MIRRORS):
+    return parse_getav_url(url, hosts) is not None
+
+
+def getav_api_candidates(url, hosts=GETAV_DEFAULT_MIRRORS):
+    """Movie-API URLs to try: ``https://<mirror>/api/movies/<slug>``.
+
+    Same rotation contract as :func:`mirror_candidates` — original host
+    first, user ports dropped (443-only), scheme forced to https.
+    """
+    info = parse_getav_url(url, hosts)
+    if not info:
+        return []
+    out = []
+    for host in dict.fromkeys([info["host"]] + [h.lower() for h in hosts]):
+        if host:
+            out.append(f"https://{host}/api/movies/{info['slug']}")
     return out
 
 
@@ -616,6 +691,183 @@ def fetch_video_page(url, hosts=DEFAULT_MIRRORS):
     raise MissAVBlockedError(BLOCKED_MSG)
 
 
+# ─── getav movie API (fetch + parse, pure where possible) ─────────────────────
+
+_GETAV_STATIC_HOST = "https://static.worldstatic.com"
+
+
+def fetch_getav_movie(url, hosts=GETAV_DEFAULT_MIRRORS):
+    """Rotate getav mirrors until one serves the movie JSON.
+
+    Returns ``(data, host)`` where ``data`` is the validated movie dict
+    (``success`` + ``data`` + non-empty ``videoSources``). Raises with
+    the same error contract as :func:`fetch_video_page` so the bot shows
+    consistent messages across sites.
+    """
+    mirror_domains = {_registered_domain(h.lower()) for h in hosts}
+    saw_404 = False
+    saw_content = False
+    for candidate in getav_api_candidates(url, hosts):
+        resp, err = _http_get(
+            candidate, headers={"User-Agent": _CHROME_UA}, timeout=PAGE_TIMEOUT,
+            max_bytes=PAGE_MAX_BYTES,
+        )
+        if resp is None:
+            logger.info("getav mirror unreachable %s: %s", candidate, err)
+            continue
+        final = urlparse(getattr(resp, "url", candidate) or candidate).hostname or ""
+        if _registered_domain(final) not in mirror_domains:
+            logger.info("getav mirror redirected off-site %s -> %s", candidate, final)
+            continue
+        if resp.status_code == 404:
+            saw_404 = True
+            continue
+        if _looks_blocked(resp, resp.text or ""):
+            logger.info("getav mirror blocked %s (status %s)", candidate, resp.status_code)
+            continue
+        saw_content = True
+        data = _parse_getav_json(resp.text or "")
+        if data is not None:
+            return data, final or urlparse(candidate).hostname
+
+    if saw_content:
+        raise MissAVError(f"影片数据解析失败（视频不存在或接口改版）: {url}")
+    if saw_404:
+        raise MissAVError(f"视频不存在或已删除: {url}")
+    raise MissAVBlockedError(BLOCKED_MSG)
+
+
+def _parse_getav_json(text):
+    """{'success':True,'data':{…,'videoSources':[…]}} -> data dict, else None."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("videoSources"), list):
+        return None
+    if not data["videoSources"]:
+        return None
+    return data
+
+
+_GETAV_FAMILY_RANK = {"cn": 3, "uc": 2, "raw": 1}
+_GETAV_TYPE_RE = re.compile(r"^(?P<fam>[a-z0-9]+)_(?P<res>\d{3,4})p$", re.IGNORECASE)
+
+
+def _getav_source_rank(source):
+    """Sort key: family (cn > uc > raw), then resolution, then priority.
+
+    ``cn`` = hardcoded Chinese-sub release, ``uc`` = uncensored — the
+    site's own player groups sources the same way and ranks uc above raw
+    (live 2026-08-16). Unknown families still rank by resolution/priority.
+    """
+    stype = (source.get("type") or "").lower()
+    m = _GETAV_TYPE_RE.match(stype)
+    fam = _GETAV_FAMILY_RANK.get(m.group("fam"), 0) if m else 0
+    res = int(m.group("res")) if m else 0
+    try:
+        prio = int(source.get("priority") or 0)
+    except (TypeError, ValueError):
+        prio = 0
+    return (fam, res, prio)
+
+
+def select_getav_source(video_sources):
+    """Best playable source: (url, family) or (None, None).
+
+    Only http(s) URLs count — a hostile/renamed source entry must never
+    be dialled blindly.
+    """
+    best = None
+    for source in video_sources:
+        if not isinstance(source, dict):
+            continue
+        url = source.get("url")
+        if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https"):
+            continue
+        if _getav_source_rank(source) > _getav_source_rank(best or {}):
+            best = source
+    if not best:
+        return None, None
+    stype = (best.get("type") or "").lower()
+    m = _GETAV_TYPE_RE.match(stype)
+    return best["url"], (m.group("fam") if m else None)
+
+
+def getav_cover_url(data):
+    """Absolute cover URL from the movie dict, or ''.
+
+    ``localImg`` is site-relative (served from static.worldstatic.com;
+    the page's own og:image is a generic site banner, useless as a
+    cover). Best-effort: the album builder falls back to a screenshot.
+    """
+    img = data.get("localImg")
+    if not isinstance(img, str) or not img.strip():
+        return ""
+    if img.startswith(("http://", "https://")):
+        return img
+    if img.startswith("/"):
+        return _GETAV_STATIC_HOST + img
+    return ""
+
+
+def extract_getav_details(data, url, family=None):
+    """Movie JSON -> caption ingredients (same shape as missav details).
+
+    ``family`` is the chosen source family ('cn'/'uc'/'raw'/None) and
+    only badges the actually downloaded stream.
+    """
+    details = {"code": "", "title": "", "actresses": [], "genres": [], "badges": []}
+
+    code = data.get("id") or (parse_getav_url(url) or {}).get("slug", "") or ""
+    details["code"] = str(code).upper()
+
+    # API title: "[中文字幕] CJOD-159 … 妃月るい" style — drop bracket
+    # badges and the leading code, keep the original (actress-bearing)
+    # title as the intro line.
+    title = str(data.get("title") or "")
+    title = re.sub(r"^\s*(?:\[[^\]]*\]\s*)+", "", title)
+    if details["code"] and title.upper().startswith(details["code"]):
+        title = title[len(details["code"]):]
+    details["title"] = title.strip()
+
+    stars = data.get("stars")
+    if isinstance(stars, list):
+        names = []
+        for star in stars:
+            name = star.get("name") if isinstance(star, dict) else None
+            name = str(name).strip() if name else ""
+            if name and name not in names:
+                names.append(name)
+        details["actresses"] = names
+
+    genres = data.get("genres")
+    if isinstance(genres, list):
+        seen = []
+        for genre in genres:
+            name = genre.get("name") if isinstance(genre, dict) else genre
+            name = str(name).strip() if name else ""
+            if name and name not in seen:
+                seen.append(name)
+        details["genres"] = seen
+
+    badges = []
+    subtitles = data.get("subtitles")
+    has_zh_sub = isinstance(subtitles, list) and any(
+        isinstance(s, dict) and str(s.get("language") or "").lower().startswith("zh")
+        for s in subtitles
+    )
+    if family == "cn" or has_zh_sub:
+        badges.append("中文字幕")
+    if family == "uc" or data.get("uc") == 1:
+        badges.append("无码")
+    details["badges"] = badges
+    return details
+
+
 # ─── ffmpeg remux ──────────────────────────────────────────────────────────────
 
 async def _run_ffmpeg(args):
@@ -631,6 +883,7 @@ async def _run_ffmpeg(args):
 
 
 async def remux_to_mp4(src, dst):
+    """Copy-remux TS -> MP4 (+faststart). Zero re-encode, seconds."""
     if not shutil.which("ffmpeg"):
         raise MissAVError("服务器缺少 ffmpeg，无法封装 MP4")
     await _run_ffmpeg(
@@ -640,6 +893,124 @@ async def remux_to_mp4(src, dst):
     )
     if not os.path.isfile(dst) or os.path.getsize(dst) == 0:
         raise MissAVError("ffmpeg 未产出有效 MP4")
+
+
+# Fansub-style rendering: white glyphs, black outline + soft shadow,
+# bottom-center, bold CJK sans — validated visually 2026-08-16.
+_SUBTITLE_FORCE_STYLE = (
+    "FontName=Noto Sans CJK SC,Bold=1,FontSize=52,"
+    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+    "BorderStyle=1,Outline=2,Shadow=1,MarginV=36,Alignment=2"
+)
+BURN_PRESET = "veryfast"   # x264 speed preset: ~4x realtime on 3 vCPU
+BURN_CRF = 19              # visually lossless tier for a re-encode
+
+
+def _escape_filter_path(path):
+    """Escape a path for use inside a filtergraph argument."""
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _burn_threads():
+    """Encode threads: leave one core for the bot itself."""
+    return max(2, min(8, (os.cpu_count() or 3) - 1))
+
+
+async def burn_subtitles_to_mp4(src, dst, subtitle_path):
+    """Re-encode TS -> MP4 with Chinese subtitles rendered INTO the frame.
+
+    Full libx264 re-encode (the only way to burn subs): measured on the
+    3-vCPU box, veryfast/CRF19 runs ~4x realtime (~36 min for a 2.5h
+    movie), peak RSS ~0.5GB. The subtitles filter matches cues against
+    the 0-based frame timeline, which is exactly how getav's player
+    authors its VTTs, so no offset correction is needed.
+    """
+    if not shutil.which("ffmpeg"):
+        raise MissAVError("服务器缺少 ffmpeg，无法烧录字幕")
+    vf = (
+        f"subtitles={_escape_filter_path(subtitle_path)}"
+        f":force_style='{_SUBTITLE_FORCE_STYLE}'"
+    )
+    await _run_ffmpeg([
+        "ffmpeg", "-y", "-loglevel", "error", "-i", src,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", str(BURN_CRF),
+        "-threads", str(_burn_threads()),
+        "-c:a", "copy", "-movflags", "+faststart", dst,
+    ])
+    if not os.path.isfile(dst) or os.path.getsize(dst) == 0:
+        raise MissAVError("ffmpeg 未产出有效 MP4")
+
+
+_GETAV_SUB_LANG_RANK = {"zh": 3, "zh-hans": 3, "zhtw": 2, "zh-hant": 2}
+
+
+def select_getav_subtitle(data):
+    """Best Chinese subtitle entry from the movie JSON, or None.
+
+    getav ships site-polished VTTs (the player's 精校字幕): simplified
+    ``zh`` beats ``zhtw``, then verified > qualityScore. Only vtt/srt
+    formats with an http(s) filePath qualify.
+    """
+    subs = data.get("subtitles")
+    if not isinstance(subs, list):
+        return None
+    best = None
+    best_key = None
+    for sub in subs:
+        if not isinstance(sub, dict):
+            continue
+        lang = str(sub.get("language") or "").lower()
+        rank = _GETAV_SUB_LANG_RANK.get(lang)
+        if rank is None:
+            continue
+        fmt = str(sub.get("format") or "").lower()
+        if fmt not in ("vtt", "srt"):
+            continue
+        url = sub.get("filePath")
+        if not isinstance(url, str) or urlparse(url).scheme not in ("http", "https"):
+            continue
+        try:
+            quality = int(sub.get("qualityScore") or 0)
+        except (TypeError, ValueError):
+            quality = 0
+        key = (rank, bool(sub.get("isVerified")), quality)
+        if best_key is None or key > best_key:
+            best, best_key = sub, key
+    return best
+
+
+def _fetch_getav_subtitle(sub_entry, pinned_domain, dest_dir):
+    """Download + validate the chosen VTT to a temp file; None on any problem.
+
+    Best-effort by design: subtitle problems must never fail the video.
+    Host-pinned to the same CDN domain as the video playlist; body is
+    capped and must look like a real WebVTT/SRT.
+    """
+    url = sub_entry.get("filePath")
+    if not _host_allowed(url, pinned_domain):
+        logger.info("getav subtitle host rejected: %s", urlparse(url).hostname)
+        return None
+    resp, err = _http_get(url, headers={"Referer": f"https://getav.net/"},
+                          timeout=PAGE_TIMEOUT, max_bytes=PAGE_MAX_BYTES)
+    if resp is None or resp.status_code != 200 or not resp.content:
+        logger.info("getav subtitle fetch failed: %s", err or getattr(resp, "status_code", "?"))
+        return None
+    text = resp.text or ""
+    if "-->" not in text:
+        logger.info("getav subtitle has no cues, skipped")
+        return None
+    fd, path = _tempfile.mkstemp(prefix="getav_sub_", suffix=".vtt", dir=dest_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return path
 
 
 # ─── orchestration ─────────────────────────────────────────────────────────────
@@ -673,13 +1044,17 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory, heade
     across the job; exceeding MAX_TOTAL_BYTES aborts the whole download.
     """
     last_err = None
-    for attempt in range(1, SEGMENT_RETRIES + 1):
+    max_attempts = SEGMENT_RETRIES
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
         if not _host_allowed(seg_url, pinned_domain):
             raise MissAVError(f"片段 {index} 地址域校验失败: {urlparse(seg_url).hostname}")
         resp, err = await asyncio.to_thread(
             _http_get, seg_url, headers, SEGMENT_TIMEOUT, MAX_SEGMENT_BYTES
         )
-        if resp is not None and resp.status_code == 200:
+        status = getattr(resp, "status_code", None)
+        if resp is not None and status == 200:
             data = resp.content
             if not data:
                 last_err = f"segment {index}: empty body"
@@ -699,19 +1074,25 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory, heade
                 budget[0] += len(data)
                 return path
         else:
-            last_err = f"segment {index}: HTTP {getattr(resp, 'status_code', err)}"
-        if attempt < SEGMENT_RETRIES:
-            await asyncio.sleep(min(2 ** attempt, 8))
+            last_err = f"segment {index}: HTTP {status if status is not None else err}"
+            if status == 429 and max_attempts < SEGMENT_RETRIES_RATE_LIMITED:
+                # a CDN rate-limit is sustained, not transient: switch to
+                # the long-backoff budget instead of failing the whole job
+                max_attempts = SEGMENT_RETRIES_RATE_LIMITED
+        if attempt < max_attempts:
+            cap = 60 if status == 429 else 8
+            await asyncio.sleep(min(2 ** attempt, cap))
     raise MissAVError(f"片段 {index} 下载失败: {last_err}")
 
 
-async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
-                          concurrency=SEGMENT_CONCURRENCY, progress=None):
-    """Download a missav video page to ``dest_path`` (.mp4).
+async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
+                             concurrency=SEGMENT_CONCURRENCY, progress=None,
+                             subtitle_path=None):
+    """Shared missav/getav tail: m3u8 -> guarded segments -> merged mp4.
 
-    ``progress`` is an optional async callable ``(done, total, stage)``
-    invoked after each segment and at merge time. Returns page metadata
-    {'title','thumbnail','segments','host'}.
+    ``info`` is {'title','thumbnail'}, ``details`` the caption
+    ingredients (already parsed by the caller). Returns
+    {'title','thumbnail','segments','host','details'}.
 
     Resource guards: segment count, cumulative bytes, total duration and
     free disk are all checked before/while downloading, so a hostile
@@ -725,17 +1106,14 @@ async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
     if shutil.disk_usage(dest_dir).free < MIN_FREE_DISK:
         raise MissAVError("磁盘剩余空间不足，请稍后重试或联系管理员清理")
 
-    page_html, host = await asyncio.to_thread(fetch_video_page, url, tuple(hosts))
-    await _report(0, 1, "page")
-
-    info = extract_page_info(page_html)
-    m3u8_url = extract_m3u8_url(page_html)
-    if not m3u8_url:
-        raise MissAVError("未找到 m3u8 地址（页面改版或视频不存在）")
-    headers = {"Referer": f"https://{host}/", "Origin": f"https://{host}"}
+    # Referer only: real HLS players send it for hotlink-protected CDNs,
+    # while a browser only sends Origin on CORS requests — worldstatic's
+    # signed per-segment paths 404 when an Origin header rides along
+    # (observed live 2026-08-16: seg-N 404 with Origin, 200 without).
+    headers = {"Referer": f"https://{referer_host}/"}
 
     # Pin the CDN domain: every later hop (variant/key/segment) must stay
-    # on the registered domain the page itself declared.
+    # on the registered domain the playlist URL itself declared.
     m3u8_host = urlparse(m3u8_url).hostname or ""
     pinned_domain = _registered_domain(m3u8_host)
     if not _host_allowed(m3u8_url, pinned_domain):
@@ -819,13 +1197,101 @@ async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
                             break
                         out.write(chunk)
 
-        await remux_to_mp4(merged, dest_path)
+        if subtitle_path:
+            await _report(0, 1, "burn")
+            try:
+                await burn_subtitles_to_mp4(merged, dest_path, subtitle_path)
+            except MissAVError:
+                # a broken subtitle/font must never lose the video itself
+                logger.warning("字幕烧录失败，回退无字幕封装", exc_info=True)
+                await remux_to_mp4(merged, dest_path)
+        else:
+            await remux_to_mp4(merged, dest_path)
         return {
-            "title": info["title"],
-            "thumbnail": info["thumbnail"],
+            "title": info.get("title") or "",
+            "thumbnail": info.get("thumbnail") or "",
             "segments": total,
-            "host": host,
-            "details": extract_video_details(page_html, url),
+            "host": referer_host,
+            "details": details,
         }
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
+                          concurrency=SEGMENT_CONCURRENCY, progress=None):
+    """Download a missav video page to ``dest_path`` (.mp4).
+
+    ``progress`` is an optional async callable ``(done, total, stage)``
+    invoked after the page fetch, per segment and at merge time. Returns
+    page metadata {'title','thumbnail','segments','host','details'}.
+    """
+    page_html, host = await asyncio.to_thread(fetch_video_page, url, tuple(hosts))
+    if progress:
+        await progress(0, 1, "page")
+
+    info = extract_page_info(page_html)
+    m3u8_url = extract_m3u8_url(page_html)
+    if not m3u8_url:
+        raise MissAVError("未找到 m3u8 地址（页面改版或视频不存在）")
+    return await _download_hls_core(
+        m3u8_url, dest_path, host, info,
+        extract_video_details(page_html, url),
+        concurrency=concurrency, progress=progress,
+    )
+
+
+async def download_getav(url, dest_path, *, hosts=GETAV_DEFAULT_MIRRORS,
+                         concurrency=SEGMENT_CONCURRENCY, progress=None,
+                         want_subtitle=False):
+    """Download a getav.net video page to ``dest_path`` (.mp4).
+
+    Same contract as :func:`download_missav`: the movie JSON API is
+    fetched instead of an HTML page, the best ``videoSources`` entry
+    (cn > uc > raw family, then resolution) becomes the playlist, and
+    the shared guarded HLS core does the rest.
+
+    ``want_subtitle`` (the bot's ``/dl -sub`` flag) opts IN to burning
+    the site's polished Chinese VTT into the frame — a full libx264
+    re-encode (~40 min of CPU for a feature film), so the default is a
+    plain fast remux. The ``cn`` source family already carries burned-in
+    subs and never re-burns. Subtitle problems degrade to a plain
+    video, never a failed download.
+    """
+    data, host = await asyncio.to_thread(fetch_getav_movie, url, tuple(hosts))
+    if progress:
+        await progress(0, 1, "page")
+
+    source_url, family = select_getav_source(data.get("videoSources") or [])
+    if not source_url:
+        raise MissAVError("视频没有可用的播放源")
+    info = {
+        "title": str(data.get("title") or ""),
+        "thumbnail": getav_cover_url(data),
+    }
+
+    subtitle_path = None
+    sub_entry = None
+    if want_subtitle and family != "cn":
+        sub_entry = select_getav_subtitle(data)
+    if sub_entry:
+        # pin subtitles to the video CDN's registered domain (same rule
+        # the HLS core applies to playlists/keys/segments)
+        pinned = _registered_domain(urlparse(source_url).hostname or "")
+        subtitle_path = await asyncio.to_thread(
+            _fetch_getav_subtitle, sub_entry, pinned,
+            os.path.dirname(os.path.abspath(dest_path)),
+        )
+    try:
+        return await _download_hls_core(
+            source_url, dest_path, host, info,
+            extract_getav_details(data, url, family),
+            concurrency=concurrency, progress=progress,
+            subtitle_path=subtitle_path,
+        )
+    finally:
+        if subtitle_path:
+            try:
+                os.remove(subtitle_path)
+            except OSError:
+                pass

@@ -104,6 +104,7 @@ def ytdl(monkeypatch):
     config.INSTA_COOKIES = ""
     config.YT_COOKIES = ""
     config.MISSAV_MIRRORS = None
+    config.GETAV_MIRRORS = None
     config.MISSAV_SEGMENT_CONCURRENCY = 8
     config.PROGRESS_MIN_INTERVAL = 3
     config.MISSAV_MAX_JOBS = 2
@@ -118,15 +119,19 @@ def ytdl(monkeypatch):
 
 
 def _drive(ytdl, monkeypatch, text):
-    calls = {"missav": [], "video": []}
+    calls = {"missav": [], "getav": [], "video": []}
 
     async def fake_missav(message, url, hosts):
         calls["missav"].append(url)
+
+    async def fake_getav(message, url, hosts, want_subtitle=False):
+        calls["getav"].append((url, want_subtitle))
 
     async def fake_video(message, url, cookies, check_duration_and_size=False):
         calls["video"].append(url)
 
     monkeypatch.setattr(ytdl, "process_missav", fake_missav)
+    monkeypatch.setattr(ytdl, "process_getav", fake_getav)
     monkeypatch.setattr(ytdl, "process_video", fake_video)
     msg = _FakeMessage(text)
     asyncio.run(ytdl.dl_handler(None, msg))
@@ -142,6 +147,45 @@ def test_missav_url_routed_to_process_missav(ytdl, monkeypatch):
 def test_missav_mirror_domain_routed(ytdl, monkeypatch):
     calls = _drive(ytdl, monkeypatch, "/dl https://missav.ws/sone-543")
     assert calls["missav"] == ["https://missav.ws/sone-543"]
+
+
+
+def test_getav_url_routed_to_process_getav(ytdl, monkeypatch):
+    calls = _drive(ytdl, monkeypatch, "/dl https://getav.net/zh/videos/cjod-159")
+    assert calls["getav"] == [("https://getav.net/zh/videos/cjod-159", False)]
+    assert calls["missav"] == []
+    assert calls["video"] == []
+
+
+def test_getav_sub_flag_opts_into_subtitle(ytdl, monkeypatch):
+    # flag before the link
+    calls = _drive(ytdl, monkeypatch, "/dl -sub https://getav.net/zh/videos/cjod-159")
+    assert calls["getav"] == [("https://getav.net/zh/videos/cjod-159", True)]
+    # flag after the link
+    calls = _drive(ytdl, monkeypatch, "/dl https://getav.net/zh/videos/cjod-159 -sub")
+    assert calls["getav"] == [("https://getav.net/zh/videos/cjod-159", True)]
+
+
+def test_sub_flag_ignored_for_non_getav(ytdl, monkeypatch):
+    calls = _drive(ytdl, monkeypatch, "/dl -sub https://youtube.com/watch?v=x")
+    assert calls["getav"] == []
+    assert calls["video"] == ["https://youtube.com/watch?v=x"]
+
+
+def test_getav_locale_less_and_www_routed(ytdl, monkeypatch):
+    calls = _drive(ytdl, monkeypatch, "/dl https://getav.net/videos/cjod-159")
+    assert calls["getav"] == [("https://getav.net/videos/cjod-159", False)]
+    calls = _drive(ytdl, monkeypatch, "/dl https://www.getav.net/en/videos/fc2-ppv-1234567")
+    assert calls["getav"] == [("https://www.getav.net/en/videos/fc2-ppv-1234567", False)]
+
+
+def test_getav_listing_urls_fall_through_to_generic(ytdl, monkeypatch):
+    # /zh/videos is a listing; /zh/hot likewise; missav-style slug is not getav
+    for url in ("https://getav.net/zh/videos", "https://getav.net/zh/hot",
+                "https://getav.net/zh/cjod-159"):
+        calls = _drive(ytdl, monkeypatch, f"/dl {url}")
+        assert calls["getav"] == [], url
+        assert calls["video"] == [url]
 
 
 def test_youtube_and_generic_routing_unchanged(ytdl, monkeypatch):

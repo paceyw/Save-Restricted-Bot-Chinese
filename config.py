@@ -72,6 +72,11 @@ MISSAV_SEGMENT_CONCURRENCY = min(32, max(1, int(os.getenv("MISSAV_SEGMENT_CONCUR
 # cross-user cap on simultaneous missav jobs (disk/bandwidth guard)
 MISSAV_MAX_JOBS = max(1, int(os.getenv("MISSAV_MAX_JOBS", "2")))
 
+# ─── GETAV（missav 同款管线）──────────────────────────────────────────────────
+# getav 镜像域名逗号分隔；留空使用内置 getav.net。分段并发与任务上限复用
+# MISSAV_SEGMENT_CONCURRENCY / MISSAV_MAX_JOBS（同一 HLS 管线、同一磁盘带宽预算）。
+GETAV_MIRRORS = [h.strip() for h in os.getenv("GETAV_MIRRORS", "").split(",") if h.strip()] or None
+
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")

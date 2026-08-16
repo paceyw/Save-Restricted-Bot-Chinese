@@ -28,9 +28,12 @@ from pyrogram.types import InputMediaPhoto, InputMediaVideo
 from utils.func import get_video_metadata, screenshot, touch_file
 from utils.missav import (
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
+    GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
     MissAVError,
     build_caption,
+    download_getav,
     download_missav,
+    is_getav_url,
     is_missav_url,
 )
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +41,7 @@ import aiohttp
 import aiofiles
 import shutil
 from config import (
+    GETAV_MIRRORS,
     INSTA_COOKIES,
     MISSAV_MAX_JOBS,
     MISSAV_MIRRORS,
@@ -262,22 +266,36 @@ async def dl_handler(client, message):
         await message.reply_text("**您已有正在进行的 ytdlp 下载，请等待完成！**")
         return
 
-    if len(message.text.split()) < 2:
-        await message.reply_text("**用法：** `/dl <video-link>`\n\n请提供有效的视频链接！")
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply_text(
+            "**用法：** `/dl <video-link>`\n"
+            "getav 中文字幕烧录：`/dl -sub <getav链接>`（耗时约 40 分钟）\n\n"
+            "请提供有效的视频链接！")
         return
 
-    url = message.text.split()[1]
+    # /dl [-sub] <url> — flag may appear before or after the link
+    want_subtitle = "-sub" in parts[1:]
+    url = next((p for p in parts[1:] if p != "-sub"), "")
+    if not url:
+        await message.reply_text("**用法：** `/dl [-sub] <video-link>`")
+        return
     ongoing_downloads[user_id] = True
     missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
 
     try:
-        if is_missav_url(url, missav_hosts):
+        if is_getav_url(url, getav_hosts):
+            await process_getav(message, url, getav_hosts, want_subtitle)
+        elif is_missav_url(url, missav_hosts):
             await process_missav(message, url, missav_hosts)
         elif "instagram.com" in url:
             await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False)
         elif "youtube.com" in url or "youtu.be" in url:
             await process_video(message, url, YT_COOKIES, check_duration_and_size=True)
         else:
+            if want_subtitle:
+                await message.reply_text("**__-sub 仅支持 getav 视频页，忽略该参数__**")
             await process_video(message, url, None, check_duration_and_size=False)
 
     except Exception as e:
@@ -369,24 +387,55 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
 async def process_missav(message, url, hosts):
     """Download a missav.ai video page via the dedicated HLS pipeline and
     upload it back through the shared finalize/upload tail."""
-    logger.info(f"Received missav link: {url}")
+    await _process_hls_site(message, url, hosts, download_missav, "missav")
+
+
+async def process_getav(message, url, hosts, want_subtitle=False):
+    """Same pipeline for getav.net: movie API -> HLS -> album upload.
+
+    ``want_subtitle`` (``/dl -sub``) burns the site's Chinese VTT into
+    the frame; default is a plain fast remux."""
+    await _process_hls_site(
+        message, url, hosts, download_getav, "getav",
+        extra_dl_kwargs={"want_subtitle": want_subtitle} if want_subtitle else None,
+    )
+
+
+async def _process_hls_site(message, url, hosts, downloader, site,
+                            extra_dl_kwargs=None):
+    logger.info(f"Received {site} link: {url}")
     sem = _get_missav_jobs_sem()
     if sem.locked():
         await message.reply_text(
-            f"**__当前 missav 下载任务已满（最多 {MISSAV_MAX_JOBS} 个），请稍后再试__**")
+            f"**__当前 {site} 下载任务已满（最多 {MISSAV_MAX_JOBS} 个），请稍后再试__**")
         return
-    progress_message = await message.reply_text("**__开始下载 missav 视频...__**")
+    progress_message = await message.reply_text(f"**__开始下载 {site} 视频...__**")
 
     async with sem:
-        await _run_missav_download(message, url, hosts, progress_message)
+        await _run_hls_download(
+            message, url, hosts, progress_message, downloader, site,
+            extra_dl_kwargs or {},
+        )
 
 
-async def _run_missav_download(message, url, hosts, progress_message):
+async def _run_hls_download(message, url, hosts, progress_message, downloader, site,
+                            extra_dl_kwargs=None):
+
+
     download_dir = os.path.join(_WORKDIR, 'downloads')
     os.makedirs(download_dir, exist_ok=True)
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
 
     async def progress(done, total, stage):
+        if stage == "burn" and not progress._burn_notified:
+            progress._burn_notified = True
+            try:
+                await progress_message.edit_text(
+                    "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
+                )
+            except Exception:
+                pass
+            return
         if stage != "segments" or total <= 0:
             return
         final = done >= total
@@ -396,23 +445,25 @@ async def _run_missav_download(message, url, hosts, progress_message):
         pct = int(done * 100 / total)
         try:
             await progress_message.edit_text(
-                f"**__missav 下载中 {pct}%（{done}/{total} 段）...__**"
+                f"**__{site} 下载中 {pct}%（{done}/{total} 段）...__**"
             )
         except Exception:
             pass  # message deleted / flood-limited: progress display is best-effort
 
     progress._last_edit = 0.0
+    progress._burn_notified = False
     cover_file = None
 
     try:
-        info = await download_missav(
+        info = await downloader(
             url,
             download_path,
             hosts=hosts,
             concurrency=MISSAV_SEGMENT_CONCURRENCY,
             progress=progress,
+            **(extra_dl_kwargs or {}),
         )
-        caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or 'missav 视频'}**"
+        caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or f'{site} 视频'}**"
 
         k = await get_video_metadata(download_path)
         duration, width, height = k['duration'], k['width'], k['height']
@@ -432,24 +483,24 @@ async def _run_missav_download(message, url, hosts, progress_message):
                 raise  # no alternate route to try
             # channel send failed (custom bot not a member / no rights):
             # fall back to the main bot, then to the requesting chat
-            logger.warning("missav channel delivery failed (%s); retrying via main bot", e)
+            logger.warning("%s channel delivery failed (%s); retrying via main bot", site, e)
             try:
                 await _upload_missav_album(
                     app, target_chat, message.chat.id, download_path,
                     cover_file, caption, duration, width, height,
                 )
             except Exception as e2:
-                logger.warning("missav main-bot delivery failed too (%s); sending to user chat", e2)
+                logger.warning("%s main-bot delivery failed too (%s); sending to user chat", site, e2)
                 await _upload_missav_album(
                     app, message.chat.id, message.chat.id, download_path,
                     cover_file, caption, duration, width, height,
                 )
     except MissAVError as e:
-        logger.warning("missav download failed: %s", e)
+        logger.warning("%s download failed: %s", site, e)
         await _safe_delete(progress_message)
-        await message.reply_text(f"**__missav 下载失败：{e}__**")
+        await message.reply_text(f"**__{site} 下载失败：{e}__**")
     except Exception as e:
-        logger.exception("missav download/upload failed.")
+        logger.exception("%s download/upload failed.", site)
         await _safe_delete(progress_message)
         await message.reply_text(f"**__发生错误：{e}__**")
     finally:
@@ -525,7 +576,10 @@ async def _split_video_parts(video_path, duration, part_size=int(1.8 * 1024 * 10
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", video_path,
-            "-map", "0", "-c", "copy",
+            # v+a only: embedded mov_text subtitle tracks must not ride
+            # into segment parts (mov_text + segment muxer is fragile;
+            # >2GB getav parts ship without the soft-subs on purpose)
+            "-map", "0:v", "-map", "0:a", "-c", "copy",
             "-f", "segment",
             "-segment_times", ",".join(str(t) for t in times),
             "-reset_timestamps", "1",

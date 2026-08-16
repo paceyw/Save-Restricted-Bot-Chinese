@@ -693,3 +693,59 @@ def test_build_caption_trims_to_telegram_limit():
 
 def test_build_caption_empty_details():
     assert missav.build_caption({}) == ""
+
+
+def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
+    """A CDN 429 must escalate to the long-backoff budget, not fail fast."""
+    calls = {"n": 0}
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            return FakeResp(429), None
+        return FakeResp(content=b"x" * 188), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    path = asyncio.run(missav._download_one_segment(
+        7, "https://surrit.com/seg-7.ts", str(tmp_path), None, None,
+        {}, "surrit.com", [0]))
+    assert path.endswith("000007.ts")
+    assert calls["n"] == 5                       # 4x 429 then success
+    assert sleeps == [2, 4, 8, 16]               # escalating, 429 cap 60s
+
+
+def test_segment_429_exhausts_extended_budget(monkeypatch, tmp_path):
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(missav, "_http_get",
+                        lambda *a, **k: (FakeResp(429), None))
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav.MissAVError, match="HTTP 429"):
+        asyncio.run(missav._download_one_segment(
+            0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
+            {}, "surrit.com", [0]))
+
+
+def test_segment_404_still_fails_fast(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        return FakeResp(404), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav.MissAVError, match="HTTP 404"):
+        asyncio.run(missav._download_one_segment(
+            0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
+            {}, "surrit.com", [0]))
+    assert calls["n"] == missav.SEGMENT_RETRIES  # no escalation on 404
