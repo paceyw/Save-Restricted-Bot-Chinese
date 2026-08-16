@@ -378,6 +378,9 @@ def test_download_missav_failing_segment_cancels_siblings(monkeypatch, tmp_path)
     media_pl = MEDIA  # needs seg-0.ts + seg-1.ts
     calls = {"n": 0}
 
+    async def fake_sleep(s):
+        pass  # 502 escalates to the deep budget: no real backoff in tests
+
     def fake_get(url, headers=None, timeout=None, max_bytes=None):
         if url.endswith("sone-543"):
             return FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")), None
@@ -387,12 +390,13 @@ def test_download_missav_failing_segment_cancels_siblings(monkeypatch, tmp_path)
             return FakeResp(text=media_pl), None
         if url.endswith("seg-0.ts"):
             calls["n"] += 1
-            return FakeResp(status=502), None  # always fails -> 3 retries then error
+            return FakeResp(status=502), None  # always fails -> deep budget
         if url.endswith("enc.key"):
             return FakeResp(content=b"k" * 16), None
         return FakeResp(content=b"x" * 32), None
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(
         missav, "remux_to_mp4",
         lambda src, dst: asyncio.sleep(0, result=None),
@@ -401,7 +405,8 @@ def test_download_missav_failing_segment_cancels_siblings(monkeypatch, tmp_path)
     dest = tmp_path / "out.mp4"
     with pytest.raises(missav.MissAVError, match="片段 0 下载失败"):
         asyncio.run(missav.download_missav("https://missav.ai/sone-543", str(dest)))
-    assert calls["n"] == missav.SEGMENT_RETRIES  # retry budget respected
+    # 502 is a gateway brownout: the deep 8-attempt budget applies
+    assert calls["n"] == missav.SEGMENT_RETRIES_SERVER_ERROR
     assert not dest.exists()
     # failure path must not leak segment temp dirs next to the output
     leftovers = [p.name for p in tmp_path.iterdir()]
@@ -749,3 +754,165 @@ def test_segment_404_still_fails_fast(monkeypatch, tmp_path):
             0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
             {}, "surrit.com", [0]))
     assert calls["n"] == missav.SEGMENT_RETRIES  # no escalation on 404
+
+
+def test_segment_502_gets_deep_backoff_budget(monkeypatch, tmp_path):
+    """A gateway brownout (502/503/504) must ride out with the deepest
+    budget, not kill the job after 3 fast retries (live 2026-08-16:
+    worldstatic 502s lasted 1-2 minutes mid-download)."""
+    calls = {"n": 0}
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            return FakeResp(502), None
+        return FakeResp(content=b"x" * 188), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    path = asyncio.run(missav._download_one_segment(
+        9, "https://static.worldstatic.com/seg-9.ts", str(tmp_path), None, None,
+        {}, "static.worldstatic.com", [0]))
+    assert path.endswith("000009.ts")
+    assert calls["n"] == 5                       # 4x 502 then success
+    assert sleeps == [2, 4, 8, 16]               # escalating, 502 cap 60s
+
+
+def test_segment_502_exhausts_deep_budget(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        return FakeResp(502), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav.MissAVError, match="HTTP 502"):
+        asyncio.run(missav._download_one_segment(
+            0, "https://static.worldstatic.com/seg-0.ts", str(tmp_path), None, None,
+            {}, "static.worldstatic.com", [0]))
+    assert calls["n"] == missav.SEGMENT_RETRIES_SERVER_ERROR  # 8 attempts
+
+
+def test_segment_connection_error_keeps_fast_budget(monkeypatch, tmp_path):
+    """Network errors (status None) are not gateway brownouts: fast budget."""
+    calls = {"n": 0}
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        return None, "connection reset"
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav.MissAVError, match="connection reset"):
+        asyncio.run(missav._download_one_segment(
+            0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
+            {}, "surrit.com", [0]))
+    assert calls["n"] == missav.SEGMENT_RETRIES  # fast budget, no escalation
+
+
+# ─── page-level transient retries (curl-28 stall / gateway brownout) ─────────
+
+def test_http_get_retry_transients_then_success(monkeypatch):
+    """None (stall/timeout) and 502/503/504 retry; success returns as-is."""
+    calls = {"n": 0}
+    sleeps = []
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, "curl: (28) Operation too slow"
+        if calls["n"] == 2:
+            return FakeResp(502), None
+        return FakeResp(content=b"ok"), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.time, "sleep", lambda s: sleeps.append(s))
+    resp, err = missav._http_get_retry("https://surrit.com/x")
+    assert resp is not None and resp.content == b"ok" and err is None
+    assert calls["n"] == 3
+    assert sleeps == [3, 8]
+
+
+def test_http_get_retry_exhausts_budget(monkeypatch):
+    calls = {"n": 0}
+    sleeps = []
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        return None, "curl: (28) stall"
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.time, "sleep", lambda s: sleeps.append(s))
+    resp, err = missav._http_get_retry("https://surrit.com/x")
+    assert resp is None and "curl" in err
+    assert calls["n"] == missav.PAGE_RETRIES
+    assert sleeps == list(missav.PAGE_RETRY_BACKOFF)
+
+
+def test_http_get_retry_403_fails_fast(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        return FakeResp(403), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.time, "sleep", lambda s: pytest.fail("no sleep on 403"))
+    resp, err = missav._http_get_retry("https://surrit.com/x")
+    assert resp.status_code == 403
+    assert calls["n"] == 1
+
+
+def test_playlist_stall_retries_then_download_succeeds(monkeypatch, tmp_path):
+    """Live regression (2026-08-16): a curl-28 stall on the m3u8 fetch used
+    to kill the job instantly; it must ride the retry budget instead."""
+    key = os.urandom(16)
+    media_sequence = 5
+    parts = [os.urandom(188 * 40), os.urandom(188 * 40)]
+
+    def enc_part(i, data):
+        iv = (i + media_sequence).to_bytes(16, "big")
+        return _aes_crypt(_pkcs7(data), key, iv, encrypt=True)
+
+    served = {
+        "https://missav.ai/sone-543": FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER),
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=MEDIA),
+        "https://surrit.com/vid/1080/enc.key": FakeResp(content=key),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=enc_part(0, parts[0])),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=enc_part(1, parts[1])),
+    }
+    master_stalls = {"n": 0}
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("master.m3u8"):
+            master_stalls["n"] += 1
+            if master_stalls["n"] <= 2:            # CDN brownout window
+                return None, "curl: (28) Operation too slow"
+        resp = served.get(url)
+        return (resp, None) if resp else (FakeResp(404), None)
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.time, "sleep", lambda s: None)
+
+    async def fake_remux(src, dst):
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            fo.write(fi.read())
+
+    monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
+
+    dest = tmp_path / "out.mp4"
+    missav.asyncio.run(missav.download_missav("https://missav.ai/sone-543", str(dest)))
+    assert dest.read_bytes() == b"".join(parts)
+    assert master_stalls["n"] == 3               # stalled twice, third attempt OK

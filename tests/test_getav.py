@@ -207,6 +207,47 @@ def test_extract_getav_details_family_badges():
     assert d["badges"] == ["无码"]
 
 
+def test_extract_getav_details_prefers_zh_overlay():
+    d = missav.extract_getav_details(
+        details_movie(
+            titleZh="[无码/中文字幕] CJOD-159 肛门和蜜穴双穴中出OK 贪求快感的淫乱女仆 妃月琉衣 | GetAV",
+            starsZh=["妃月琉衣"]),
+        "https://getav.net/zh/videos/cjod-159", family="cn")
+    assert d["title"] == "肛门和蜜穴双穴中出OK 贪求快感的淫乱女仆 妃月琉衣"
+    # zh actress first, Japanese star kept as secondary
+    assert d["actresses"] == ["妃月琉衣", "妃月るい"]
+
+
+def test_augment_getav_zh_parses_page(monkeypatch):
+    served = {
+        "https://getav.net/zh/videos/cjod-159": FakeResp(text=(
+            "<title>[无码/中文字幕] CJOD-159 肛门和蜜穴 妃月琉衣 | GetAV</title>"
+            '<meta name="description" content="CJOD-159 肛门和蜜穴。主演：妃月琉衣、小明。支持手机播放"/>'
+        )),
+    }
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None:
+            (served.get(url) or FakeResp(404), None))
+    data = details_movie()
+    missav._augment_getav_zh(data, "https://getav.net/zh/videos/cjod-159",
+                             ("getav.net",), "getav.net")
+    assert data["titleZh"] == "[无码/中文字幕] CJOD-159 肛门和蜜穴 妃月琉衣"
+    assert data["starsZh"] == ["妃月琉衣", "小明"]
+    assert "肛门和蜜穴" in data["descriptionZh"]
+
+
+def test_augment_getav_zh_best_effort(monkeypatch):
+    # page down / blocked: API fields stay untouched, no exception
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (None, "timeout"))
+    data = details_movie()
+    missav._augment_getav_zh(data, "https://getav.net/zh/videos/cjod-159",
+                             ("getav.net",), "getav.net")
+    assert "titleZh" not in data and "starsZh" not in data
+
+
 def test_extract_getav_details_degrades():
     d = missav.extract_getav_details({}, "https://getav.net/zh/videos/cjod-159")
     assert d["code"] == "CJOD-159"               # slug fallback, uppercased
@@ -253,14 +294,21 @@ def test_fetch_getav_movie_404(monkeypatch):
 
 
 def test_fetch_getav_movie_all_blocked(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(missav.time, "sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (None, "conn reset"))
     with pytest.raises(missav.MissAVBlockedError):
         missav.fetch_getav_movie("https://getav.net/zh/videos/cjod-159")
+    # conn-reset is transient: the retry budget applies before giving up
+    assert sleeps == list(missav.PAGE_RETRY_BACKOFF)
 
 
 def test_fetch_getav_movie_rotates_blocked_mirror(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(missav.time, "sleep", lambda s: sleeps.append(s))
+
     def fake_get(url, headers=None, timeout=None, max_bytes=None):
         if "getav.net" in url:
             return FakeResp(status=503, text="just a moment"), None
@@ -269,6 +317,8 @@ def test_fetch_getav_movie_rotates_blocked_mirror(monkeypatch):
     data, host = missav.fetch_getav_movie(
         "https://getav.net/zh/videos/cjod-159", ("getav.net", "getav2.net"))
     assert host == "getav2.net"
+    # 503 is transient: retried to exhaustion on mirror 1, then rotation
+    assert sleeps == list(missav.PAGE_RETRY_BACKOFF)
 
 
 def test_fetch_getav_movie_redirect_offsite_rejected(monkeypatch):
@@ -506,7 +556,10 @@ def test_burn_subtitles_args(monkeypatch, tmp_path):
     assert "-c:a" in args and args[args.index("-c:a") + 1] == "copy"
     assert "+faststart" in args and str(missav.BURN_CRF) in args
     style = vf.split("force_style='")[1]
-    assert "Noto Sans CJK SC" in style and "Outline=2" in style  # fansub look
+    assert "Noto Sans CJK SC" in style            # fansub look
+    assert "FontSize=13" in style                 # ≈4.5% of frame height
+    assert "Outline=1" in style and "Shadow=0.5" in style
+    assert "MarginV=10" in style                  # ≈3.5% above bottom
 
 
 def test_burn_subtitles_escapes_filter_path(monkeypatch, tmp_path):
@@ -542,6 +595,99 @@ def test_burn_subtitles_real_smoke(tmp_path):
     dst = tmp_path / "out.mp4"
     asyncio.run(missav.burn_subtitles_to_mp4(str(src), str(dst), str(sub)))
     assert dst.exists() and dst.stat().st_size > 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+@pytest.mark.parametrize("height", [360, 720])
+def test_burn_subtitle_size_scales_with_resolution(tmp_path, height):
+    """The style must render as a fixed FRACTION of frame height.
+
+    Burns a two-line cue onto a plain black clip (so any bright pixel is
+    subtitle ink), extracts the mid-cue frame as raw gray, and measures
+    the row bands of white pixels:
+      - exactly 2 bands → the two cue lines are visibly separated
+        (line spacing, not glued/overlapping),
+      - band height ≈ 4.5% of the frame height (was 18% with FontSize=52),
+      - band height halves at 360p vs 720p → resolution-proportional.
+    Pairs with test_burn_subtitle_proportionality_ratio below.
+    """
+    import subprocess
+    width = height * 16 // 9
+    src = tmp_path / f"in_{height}.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", f"color=c=black:s={width}x{height}:d=1:r=10",
+         "-c:v", "libx264", "-preset", "ultrafast", str(src)], check=True)
+    sub = tmp_path / "two.vtt"
+    sub.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nLINE ONE\nLINE TWO\n")
+    dst = tmp_path / f"out_{height}.mp4"
+    asyncio.run(missav.burn_subtitles_to_mp4(str(src), str(dst), str(sub)))
+
+    frame = tmp_path / f"frame_{height}.gray"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-ss", "0.5", "-i", str(dst),
+         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", str(frame)],
+        check=True)
+    rows = frame.read_bytes()
+    bands = []
+    start = None
+    for y in range(height):
+        bright = sum(1 for x in range(width) if rows[y * width + x] > 200)
+        if bright >= 3 and start is None:
+            start = y
+        elif bright < 3 and start is not None:
+            bands.append((start, y - start))
+            start = None
+    if start is not None:
+        bands.append((start, height - start))
+
+    assert len(bands) == 2, f"two cue lines must be separate bands, got {bands}"
+    band_h = max(h for _y, h in bands)
+    gap = bands[1][0] - (bands[0][0] + bands[0][1])
+    assert gap >= 1, "no visible gap between the two subtitle lines"
+    # glyph em ≈ 4.5% of height; caps/latin ink ≈ 0.55-0.85 em
+    assert height * 0.02 <= band_h <= height * 0.07, \
+        f"band {band_h}px is not ~4.5% of {height}px frame"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_burn_subtitle_proportionality_ratio(tmp_path):
+    """Glyph pixels must scale with resolution: 720p band ≈ 2x the 360p one."""
+    import subprocess
+    sizes = {}
+    for height in (360, 720):
+        width = height * 16 // 9
+        src = tmp_path / f"r_in_{height}.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"color=c=black:s={width}x{height}:d=1:r=10",
+             "-c:v", "libx264", "-preset", "ultrafast", str(src)], check=True)
+        sub = tmp_path / "r.vtt"
+        sub.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nLINE ONE\n")
+        dst = tmp_path / f"r_out_{height}.mp4"
+        asyncio.run(missav.burn_subtitles_to_mp4(str(src), str(dst), str(sub)))
+        frame = tmp_path / f"r_frame_{height}.gray"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-ss", "0.5", "-i", str(dst),
+             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", str(frame)],
+            check=True)
+        rows = frame.read_bytes()
+        band_h = 0
+        run_start = None
+        for y in range(height):
+            bright = sum(1 for x in range(width) if rows[y * width + x] > 200)
+            if bright >= 3 and run_start is None:
+                run_start = y
+            elif bright < 3 and run_start is not None:
+                band_h = max(band_h, y - run_start)
+                run_start = None
+        if run_start is not None:
+            band_h = max(band_h, height - run_start)
+        assert band_h > 0
+        sizes[height] = band_h
+    ratio = sizes[720] / sizes[360]
+    assert 1.6 <= ratio <= 2.4, \
+        f"subtitle pixels must scale with resolution, got {sizes} (ratio {ratio:.2f})"
 
 
 def _hls_fixture(with_subtitle, tmp_path, monkeypatch):
@@ -716,3 +862,56 @@ def test_download_getav_cn_family_skips_subtitle(monkeypatch, tmp_path):
     asyncio.run(missav.download_getav(
         "https://getav.net/zh/videos/cjod-159", str(tmp_path / "out.mp4")))
     assert calls == [("remux", None)]
+
+
+def test_list_getav_sources_labels_and_order():
+    sources = [
+        {"type": "raw_1080p", "url": "https://cdn/raw1080", "priority": 25},
+        {"type": "uc_720p", "url": "https://cdn/uc720", "priority": 40},
+        {"type": "cn_1080p", "url": "https://cdn/cn1080", "priority": 30},
+        {"type": "broken", "url": "javascript:x"},
+    ]
+    listed = missav.list_getav_sources(sources)
+    assert listed == [
+        ("https://cdn/cn1080", "cn", "中文字幕版 1080p"),
+        ("https://cdn/uc720", "uc", "无码版 720p"),
+        ("https://cdn/raw1080", "raw", "原版 1080p"),
+    ]
+    assert missav.list_getav_sources([]) == []
+
+
+def test_download_getav_pins_chosen_source(monkeypatch, tmp_path):
+    """source_url (the /dl card pick) must override auto-best selection."""
+    key = b"k" * 16
+    iv = bytes.fromhex("0e92570270b04c4e4f0efc6eae7db5f2")
+    parts = [os.urandom(188 * 40)]
+    # TWO sources: auto-best would be cn_1080 @ /cdn/best/, the user pins
+    # the raw_480p @ /cdn/a/ playlist (the only one actually served).
+    movie = movie_json(sources=(
+        ("cn_1080p", "https://static.worldstatic.com/cdn/best/index.txt", 99),
+        ("raw_480p", "https://static.worldstatic.com/cdn/a/index.txt", 10),
+    ))
+    served = {
+        "https://getav.net/api/movies/cjod-159": FakeResp(text=movie),
+        "https://static.worldstatic.com/cdn/a/index.txt": FakeResp(
+            text=MEDIA_PL.replace("#EXTINF:6.000000,\nseg-0.woff2\n#EXTINF:6.000000,\nseg-1.woff2\n",
+                                  "#EXTINF:6.000000,\nseg-0.woff2\n")),
+        "https://static.worldstatic.com/cdn/a/glyph.key": FakeResp(content=key),
+        "https://static.worldstatic.com/cdn/a/seg-0.woff2": FakeResp(
+            content=_aes_crypt(_pkcs7(parts[0]), key, iv)),
+    }
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (served.get(url) or FakeResp(404), None))
+
+    async def fake_remux(src, dst):
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            fo.write(fi.read())
+
+    monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
+    dest = tmp_path / "out.mp4"
+    asyncio.run(missav.download_getav(
+        "https://getav.net/zh/videos/cjod-159", str(dest),
+        source_url="https://static.worldstatic.com/cdn/a/index.txt"))
+    assert dest.read_bytes() == parts[0]        # pinned playlist downloaded,
+    # not the auto-best one (which would 404 and fail the whole download)

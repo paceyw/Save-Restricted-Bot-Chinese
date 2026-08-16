@@ -126,3 +126,11 @@ networks:
     internal: true
   egress:
     name: save-restricted-content-bot-v3_egress
+    # IPv6 egress: the VPS's IPv4 route to worldstatic (missav/getav CDN)
+    # is per-connection shaped to ~130KB/s (live 2026-08-16), while IPv6
+    # does 10-45MB/s. Docker 27+ NAT66s the ULA via the host's global v6.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.23.0.0/16
+        - subnet: fd00:cafe:2::/64
