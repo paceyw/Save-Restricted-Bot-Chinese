@@ -40,7 +40,7 @@ from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaPhoto, InputMediaVideo,
 )
-from utils.func import get_video_metadata, screenshot, touch_file
+from utils.func import get_video_metadata, screenshot, touch_file, task_downloads_dir
 from utils.missav import (
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
@@ -611,8 +611,14 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
                             extra_dl_kwargs=None, task_id=None):
 
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
+    # Task-scoped scratch dir (plan §5.2): the whole download lives in
+    # downloads/task_<id>/ and the worker's finally-rmtree removes the dir
+    # even if this coroutine dies mid-upload.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
 
     async def progress(done, total, stage):
@@ -932,8 +938,14 @@ async def _safe_delete(message):
 async def process_video(message, url, cookies, check_duration_and_size=False, task_id=None):
     logger.info(f"Received link: {url}")
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
+    # Task-scoped scratch dir (plan §5.2): the whole download lives in
+    # downloads/task_<id>/ and the worker's finally-rmtree removes the dir
+    # even if this coroutine dies mid-upload.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
     logger.info(f"Generated random download path: {download_path}")
 

@@ -86,6 +86,10 @@ FFMPEG_BURN_THREADS = int(os.getenv("FFMPEG_BURN_THREADS", "0"))
 # 单次烧录墙钟超时秒数：0 = 不限时；超时会 kill ffmpeg 并走既有的"回退无字幕封装"路径
 BURN_TIMEOUT_S = max(0, int(os.getenv("BURN_TIMEOUT_S", "10800")))
 
+# ─── DISK WATERMARK (任务准入，Phase 2 §5.2) ────────────────────────────────────
+# 运行卷剩余空间低于该值时拒绝新任务（已运行任务不受影响），避免半完成的错误投递
+DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "10"))
+
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")

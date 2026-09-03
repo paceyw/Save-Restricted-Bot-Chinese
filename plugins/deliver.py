@@ -17,7 +17,8 @@ from shared_client import app as main_bot, _WORKDIR
 from utils.caption import restructure_caption
 from utils.func import (
     apply_text_rules, screenshot, thumbnail, get_video_metadata,
-    ensure_audio_track, touch_file, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
+    ensure_audio_track, touch_file, task_downloads_dir,
+    VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
 )
 from plugins.fetch import (
     fetch_origin, get_msg, resolve_linked_chat, upd_dlg, premium_userbot,
@@ -174,9 +175,15 @@ async def _send_album_item(sender, tcid, im, rtmid):
                                        reply_to_message_id=rtmid)
     return await sender.send_document(tcid, im.media, caption=cap, reply_to_message_id=rtmid)
 
-async def _send_album_items(sender, tcid, media, rtmid):
+async def _send_album_items(sender, tcid, media, rtmid, lease_files=None):
     sent = 0
     for im in media:
+        if lease_files:
+            # Refresh every pending file's mtime each round (plan §5.2): a
+            # long FloodWait on item N must not let the stale-sweeper reap
+            # items N+1.. while they wait for their turn.
+            for ff in lease_files:
+                touch_file(ff)
         flood_seen = False
 
         async def send_item():
@@ -251,7 +258,8 @@ def _valid_download(path, expected_size=0):
     return actual_size > 0 and (not expected_size or actual_size == expected_size)
 
 
-async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
+async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st,
+                               downloads_dir=None):
     """Download one message's media and wrap it as an InputMedia for grouping.
 
     Returns (input_media, [local_files_to_cleanup]); (None, []) when the
@@ -273,11 +281,14 @@ async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
         ext = os.path.splitext(one.audio.file_name or '')[1] or '.mp3'
     else:
         ext = os.path.splitext(one.document.file_name or '')[1]
+    base_dir = downloads_dir or os.path.join(_WORKDIR, 'downloads')
     f = None
     for attempt in range(2):
+        # ns-resolution name inside a task-scoped dir: unique under any
+        # concurrency (plan §5.2 — second-resolution names could collide)
         f = await u.download_media(
             one,
-            file_name=os.path.join(_WORKDIR, 'downloads', f'{tag}_{uid}_{int(time.time())}_{idx}{ext}'),
+            file_name=os.path.join(base_dir, f'{tag}_{uid}_{time.time_ns()}_{idx}{ext}'),
             progress=prog, progress_args=(main_bot, did, p_id, st),
         )
         if _valid_download(f, expected_size):
@@ -313,8 +324,8 @@ async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
                 thumb_path = await u.download_media(
                     thumb.file_id,
                     file_name=os.path.join(
-                        _WORKDIR, 'downloads',
-                        f'{tag}_thumb_{uid}_{int(time.time())}_{idx}.jpg',
+                        base_dir,
+                        f'{tag}_thumb_{uid}_{time.time_ns()}_{idx}.jpg',
                     ),
                 )
                 if not _valid_download(thumb_path, getattr(thumb, 'file_size', 0) or 0):
@@ -336,7 +347,7 @@ async def _download_media_item(u, one, uid, idx, tag, main_bot, did, p_id, st):
         return InputMediaAudio(f, duration=one.audio.duration), files
     return InputMediaDocument(f), files
 
-async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
+async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings, task_id=None):
     """Forward an album 1:1 — grouping, order, caption and tags preserved.
 
     Fast path: server-side copy_media_group (works for unrestricted chats).
@@ -348,6 +359,12 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
     sender = c if deliver_via_bot else (u or c)
     did = int(d)
     p = await main_bot.send_message(did, f'正在处理相册（{len(msgs)} 项）...')
+    # Task-scoped scratch dir (plan §5.2): the worker's finally-rmtree
+    # removes everything at once, so upload-phase aborts cannot leak.
+    task_dir = (
+        task_downloads_dir(task_id) if task_id
+        else os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
+    )
 
     # ``oc`` (override caption) replaces the original text entirely; the
     # /settings default caption (user_cap) is still appended below.
@@ -405,7 +422,10 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
     try:
         for idx, one in enumerate(msgs):
             await main_bot.edit_message_text(did, p.id, f'正在下载 {idx + 1}/{len(msgs)}...')
-            im, ifiles = await _download_media_item(u, one, uid, idx, 'album', main_bot, did, p.id, st)
+            im, ifiles = await _download_media_item(
+                u, one, uid, idx, 'album', main_bot, did, p.id, st,
+                downloads_dir=task_dir,
+            )
             if im is None:
                 continue
             media.append(im)
@@ -430,28 +450,36 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
     # so a long group upload is not mistaken for stale corpses by the sweeper.
     for ff in files:
         touch_file(ff)
-    upload_error = None
     try:
-        await sender.send_media_group(tcid, media, reply_to_message_id=rtmid)
-    except TypeError as e:
-        if 'keyword-only argument' in str(e):
-            # pyrofork 2.3.69 breaks parsing the SendMultiMedia response AFTER
-            # the RPC already succeeded — the album is already delivered.
-            # Treat the parse bug as success.
-            print(f'send_media_group response parse bug (treating as success): {e}')
-        else:
+        upload_error = None
+        try:
+            await sender.send_media_group(tcid, media, reply_to_message_id=rtmid)
+        except TypeError as e:
+            if 'keyword-only argument' in str(e):
+                # pyrofork 2.3.69 breaks parsing the SendMultiMedia response AFTER
+                # the RPC already succeeded — the album is already delivered.
+                # Treat the parse bug as success.
+                print(f'send_media_group response parse bug (treating as success): {e}')
+            else:
+                upload_error = str(e)
+        except Exception as e:
             upload_error = str(e)
-    except Exception as e:
-        upload_error = str(e)
 
-    if upload_error:
+        if not upload_error:
+            for f in files:
+                if os.path.exists(f):
+                    os.remove(f)
+            await _safe_cleanup(main_bot.delete_messages(did, p.id))
+            return f'✅ 相册已发送（{len(media)} 项）'
+
         err = upload_error
         # Telegram rejects some groups (e.g. MEDIA_EMPTY when a no-audio-track
         # video is treated as an animation and mixed into an album). Sending the
         # items individually still delivers the good ones — partial success
         # beats total failure.
         print(f'send_media_group failed ({err}), falling back to per-item sends')
-        sent = await _send_album_items(sender, tcid, media, rtmid)
+        sent = await _send_album_items(
+            sender, tcid, media, rtmid, lease_files=files)
         for f in files:
             if os.path.exists(f):
                 os.remove(f)
@@ -464,14 +492,18 @@ async def process_album(c, u, msgs, d, lt, uid, i, oc=None, *, settings):
             hint = ''
         await main_bot.edit_message_text(did, p.id, f'相册上传失败：{err[:60]} {hint}')
         return f'❌ 相册上传失败：{err[:60]}'
+    except asyncio.CancelledError:
+        # Cancellation mid-upload must not leak the already-downloaded items;
+        # except-Exception paths above all clean up before returning.
+        for ff in files:
+            if os.path.exists(ff):
+                try:
+                    os.remove(ff)
+                except OSError:
+                    pass
+        raise
 
-    for f in files:
-        if os.path.exists(f):
-            os.remove(f)
-    await _safe_cleanup(main_bot.delete_messages(did, p.id))
-    return f'✅ 相册已发送（{len(media)} 项）'
-
-async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
+async def process_merged(c, u, msgs, d, uid, oc=None, *, settings, task_id=None):
     """Merge multiple fetched messages into ONE delivery.
 
     All media (photo/video/audio/document) across every message is re-uploaded
@@ -485,6 +517,11 @@ async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
     sender = c if deliver_via_bot else (u or c)
     did = int(d)
     p = await main_bot.send_message(did, f'正在合并 {len(msgs)} 条消息...')
+    # Task-scoped scratch dir (plan §5.2): see process_album.
+    task_dir = (
+        task_downloads_dir(task_id) if task_id
+        else os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
+    )
 
     # Partition into media items and text pieces; media captions count as text.
     media_msgs = []
@@ -533,7 +570,8 @@ async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
                 nonlocal flood_seen
                 try:
                     return await _download_media_item(
-                        u, one, uid, idx, 'merge', main_bot, did, p.id, st
+                        u, one, uid, idx, 'merge', main_bot, did, p.id, st,
+                        downloads_dir=task_dir,
                     )
                 except FloodWait as e:
                     flood_seen = True
@@ -592,53 +630,65 @@ async def process_merged(c, u, msgs, d, uid, oc=None, *, settings):
 
     await main_bot.edit_message_text(did, p.id, f'正在上传（{len(media)} 项）...')
     sent_items = 0
-    for start in range(0, len(media), 10):
-        chunk = media[start:start + 10]
-        # No progress hook on send_media_group — refresh mtimes per chunk so
-        # slow chunked uploads stay above the stale-sweep watermark.
-        for im in chunk:
-            touch_file(getattr(im, 'media', None))
-        flood_seen = False
+    try:
+        for start in range(0, len(media), 10):
+            chunk = media[start:start + 10]
+            # No progress hook on send_media_group — refresh mtimes per chunk so
+            # slow chunked uploads stay above the stale-sweep watermark.
+            for im in chunk:
+                touch_file(getattr(im, 'media', None))
+            flood_seen = False
 
-        async def send_group():
-            nonlocal flood_seen
+            async def send_group():
+                nonlocal flood_seen
+                try:
+                    return await sender.send_media_group(
+                        tcid, chunk, reply_to_message_id=rtmid
+                    )
+                except FloodWait:
+                    flood_seen = True
+                    raise
+
             try:
-                return await sender.send_media_group(
-                    tcid, chunk, reply_to_message_id=rtmid
+                await with_flood_retry(
+                    send_group,
+                    context=f'send_media_group chunk {start}',
+                    max_retries=2,
                 )
-            except FloodWait:
-                flood_seen = True
-                raise
-
-        try:
-            await with_flood_retry(
-                send_group,
-                context=f'send_media_group chunk {start}',
-                max_retries=2,
-            )
-            sent_items += len(chunk)
-            continue
-        except TypeError as e:
-            if flood_seen:
-                print(f'Retry send_media_group failed on chunk {start}: {e}')
-            elif 'keyword-only argument' in str(e):
-                # pyrofork parse bug: the RPC already succeeded — the album is
-                # already delivered, only response parsing failed.
                 sent_items += len(chunk)
                 continue
-            else:
-                print(f'send_media_group failed on chunk {start}: {e}')
-        except Exception as e:
-            if flood_seen:
-                print(f'Retry send_media_group failed on chunk {start}: {e}')
-            else:
-                print(f'send_media_group failed on chunk {start} ({e}), falling back to per-item')
-        # Per-item fallback for whatever the group attempt above could not send.
-        sent_items += await _send_album_items(sender, tcid, chunk, rtmid)
+            except TypeError as e:
+                if flood_seen:
+                    print(f'Retry send_media_group failed on chunk {start}: {e}')
+                elif 'keyword-only argument' in str(e):
+                    # pyrofork parse bug: the RPC already succeeded — the album is
+                    # already delivered, only response parsing failed.
+                    sent_items += len(chunk)
+                    continue
+                else:
+                    print(f'send_media_group failed on chunk {start}: {e}')
+            except Exception as e:
+                if flood_seen:
+                    print(f'Retry send_media_group failed on chunk {start}: {e}')
+                else:
+                    print(f'send_media_group failed on chunk {start} ({e}), falling back to per-item')
+            # Per-item fallback for whatever the group attempt above could not send.
+            sent_items += await _send_album_items(
+                sender, tcid, chunk, rtmid, lease_files=files)
 
-    for ff in files:
-        if os.path.exists(ff):
-            os.remove(ff)
+        for ff in files:
+            if os.path.exists(ff):
+                os.remove(ff)
+    except asyncio.CancelledError:
+        # Cancellation mid-upload must not leak the already-downloaded items
+        # (plan §5.2); the normal paths above remove files before returning.
+        for ff in files:
+            if os.path.exists(ff):
+                try:
+                    os.remove(ff)
+                except OSError:
+                    pass
+        raise
 
     if standalone_text:
         try:
@@ -766,7 +816,9 @@ async def _download_prepared_msg(prep):
         # pyrofork download_media resolves relative names against PARENT_DIR
         # (Path(sys.argv[0]).parent = /app, read-only image layer), ignoring the
         # client workdir. Pass an absolute path under the writable volume.
-        download_path = os.path.join(_WORKDIR, 'downloads', c_name)
+        downloads_dir = getattr(prep, 'downloads_dir', None) or os.path.abspath(
+            os.path.join(_WORKDIR, 'downloads'))
+        download_path = os.path.join(downloads_dir, c_name)
         prep.download_path = download_path
         # Download with the client that fetched the message: bot_fetched is the
         # prepare-time snapshot of (public link + fetch_origin False), i.e. the
@@ -791,7 +843,7 @@ async def _download_prepared_msg(prep):
         raise
 
 
-async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
+async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings, task_id=None):
     """Prepare one message without sending delivered content.
 
     The returned pair is ``(result, prepared)``.  Terminal failures return a
@@ -801,7 +853,12 @@ async def prepare_msg(c, u, m, d, lt, uid, i, oc=None, *, settings):
     :func:`finish_prepared_msg`.
     """
     prep = None
-    downloads_dir = os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
+    # Task-scoped scratch dir (plan §5.2): one rmtree removes everything a
+    # task downloaded, so cancellation or a crash mid-upload cannot leak.
+    if task_id:
+        downloads_dir = task_downloads_dir(task_id)
+    else:
+        downloads_dir = os.path.abspath(os.path.join(_WORKDIR, 'downloads'))
     try:
         tcid, rtmid, deliver_via_bot = await resolve_delivery(d, settings)
         did = int(d)
@@ -1146,12 +1203,14 @@ def _ok(res):
 
 
 async def process_one_link(
-    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings,
+    task_id=None,
 ):
     """Fetch and deliver one t.me link (expanding albums), with one FloodWait retry."""
     return await with_flood_retry(
         lambda: _process_one_link(
-            ubot, uc, i, s, lt, d, uid, oc, comment_id, settings=settings
+            ubot, uc, i, s, lt, d, uid, oc, comment_id, settings=settings,
+            task_id=task_id,
         ),
         context=f'{i}/{s}',
         max_retries=2,
@@ -1159,7 +1218,8 @@ async def process_one_link(
 
 
 async def prepare_one_link(
-    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings,
+    task_id=None,
 ):
     """Prepare one link into a :class:`_PreparedLink` without delivery sends.
 
@@ -1204,6 +1264,7 @@ async def prepare_one_link(
             uid=uid,
             oc=oc,
             settings=settings,
+            task_id=task_id,
         )
     result, prepared = await prepare_msg(
         ubot,
@@ -1215,6 +1276,7 @@ async def prepare_one_link(
         src_chat,
         oc,
         settings=settings,
+        task_id=task_id,
     )
     if prepared is None:
         return result, None
@@ -1234,6 +1296,7 @@ async def finish_one_link(prepared_link):
             prepared_link.src_chat,
             prepared_link.oc,
             settings=prepared_link.settings,
+            task_id=getattr(prepared_link, 'task_id', None),
         )
     if prepared_link.kind == 'single':
         return await finish_prepared_msg(prepared_link.prepared)
@@ -1241,7 +1304,8 @@ async def finish_one_link(prepared_link):
 
 
 async def _process_one_link(
-    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings
+    ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings,
+    task_id=None,
 ):
     """Compose :func:`prepare_one_link` and :func:`finish_one_link`."""
     result, prepared_link = await prepare_one_link(
@@ -1255,6 +1319,7 @@ async def _process_one_link(
         oc,
         comment_id,
         settings=settings,
+        task_id=task_id,
     )
     if prepared_link is None:
         return result

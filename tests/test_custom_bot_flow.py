@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re as _re
 import importlib.util
 import sys
@@ -142,6 +143,22 @@ def batch_module(monkeypatch):
     func.thumbnail = None
     func.get_video_metadata = None
     func.touch_file = lambda *_a, **_k: None
+
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     func.ensure_audio_track = None
     func.VIDEO_EXTENSIONS = set()
     func.AUDIO_EXTENSIONS = set()
@@ -1507,7 +1524,7 @@ def test_dispatch_snapshots_settings_once_for_single_message_chain(batch_module)
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             ubot, uc, message, d, lt, uid, i, oc, settings=settings
         )
@@ -1563,7 +1580,7 @@ def test_dispatch_chain_fails_loudly_on_any_extra_users_read(batch_module):
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             ubot, uc, message, d, lt, uid, i, oc, settings=settings
         )
@@ -1775,7 +1792,7 @@ def test_task_chain_performs_exactly_one_real_find_one(batch_module, monkeypatch
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             DeliveryClient(), DeliveryClient(), message, d, lt, uid, i, oc,
             settings=settings,

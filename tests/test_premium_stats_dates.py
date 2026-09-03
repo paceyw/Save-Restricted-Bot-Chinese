@@ -86,11 +86,22 @@ def premium_stats_modules(monkeypatch):
 
     func = types.ModuleType('utils.func')
     # 2026-09-01 12:00 UTC + 5:30 IST == 2026-09-01 17:30 IST.
-    expiry = datetime(2026, 9, 1, 12, 0, 0)
+    # Future-relative expiry: a fixed date becomes a time bomb the day
+    # after it passes (the plan reads as expired and every render test
+    # fails). 30 days out keeps the plan active forever.
+    from datetime import timedelta as _td
+    from datetime import timezone as _tz
+    # naive UTC, matching the production comparison (subscription_end vs
+    # datetime.utcnow()) — aware datetimes would raise on comparison
+    expiry = datetime.now(_tz.utc).replace(microsecond=0, tzinfo=None) + _td(days=30)
+    expected_expiry = (
+        expiry + _td(hours=5, minutes=30)
+    ).strftime('%d-%b-%Y %I:%M:%S %p')
     state = {
         'expiry': expiry,
         'premium': True,
         'collection': None,
+        'expected': expected_expiry,
     }
 
     async def add_premium_user(user_id, value, unit):
@@ -150,36 +161,36 @@ def premium_stats_modules(monkeypatch):
 
 
 def test_add_premium_renders_expiry_date(premium_stats_modules):
-    premium, _, app, _ = premium_stats_modules
+    premium, _, app, state = premium_stats_modules
     message, replies = _fake_message(7, '/add 123456 1 days')
 
     asyncio.run(premium.add_premium_handler(None, message))
 
     assert len(replies) == 1
-    assert '01-Sep-2026 05:30:00 PM (IST)' in replies[0]
+    assert f'{state['expected']} (IST)' in replies[0]
     # The owner notification to the target renders the same timestamp.
     assert app.sent == [(123456, app.sent[0][1])]
-    assert '01-Sep-2026 05:30:00 PM (IST)' in app.sent[0][1]
+    assert f'{state['expected']} (IST)' in app.sent[0][1]
 
 
 def test_status_renders_expiry_date(premium_stats_modules):
-    _, stats, _, _ = premium_stats_modules
+    _, stats, _, state = premium_stats_modules
     message, replies = _fake_message(42, '/status')
 
     asyncio.run(stats.status_handler(None, message))
 
     assert len(replies) == 1
-    assert '高级会员有效期至 01-Sep-2026 05:30:00 PM (IST)' in replies[0]
+    assert f'高级会员有效期至 {state['expected']} (IST)' in replies[0]
 
 
 def test_myplan_renders_expiry_date(premium_stats_modules):
-    _, stats, _, _ = premium_stats_modules
+    _, stats, _, state = premium_stats_modules
     message, replies = _fake_message(42, '/myplan')
 
     asyncio.run(stats.myplan_handler(None, message))
 
     assert len(replies) == 1
-    assert '有效期至：01-Sep-2026 05:30:00 PM (IST)' in replies[0]
+    assert f'有效期至：{state['expected']} (IST)' in replies[0]
 
 
 def test_myplan_without_plan_shows_pay_notice(premium_stats_modules):
@@ -194,7 +205,7 @@ def test_myplan_without_plan_shows_pay_notice(premium_stats_modules):
 
 
 def test_transfer_gift_message_renders_expiry_date(premium_stats_modules):
-    _, stats, app, _ = premium_stats_modules
+    _, stats, app, state = premium_stats_modules
     message, replies = _fake_message(42, '/transfer 123456')
 
     asyncio.run(stats.transfer_premium_handler(None, message))
@@ -205,6 +216,6 @@ def test_transfer_gift_message_renders_expiry_date(premium_stats_modules):
     # audit message (same timestamp, no suffix) — both strftime sites pinned.
     assert len(app.sent) == 2
     assert app.sent[0][0] == 123456
-    assert '01-Sep-2026 05:30:00 PM (IST)' in app.sent[0][1]
+    assert f'{state['expected']} (IST)' in app.sent[0][1]
     assert app.sent[1][0] == 7
-    assert '到期时间：01-Sep-2026 05:30:00 PM' in app.sent[1][1]
+    assert f'到期时间：{state['expected']}' in app.sent[1][1]
