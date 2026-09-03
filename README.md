@@ -220,13 +220,13 @@ docker compose up -d --build
 ## 📁 项目结构
 
 ```
-├── main.py              # 启动入口：加载共享客户端 + 动态加载 plugins/
+├── main.py              # 启动入口：共享客户端 + 插件加载 + 进程内健康服务（/、/healthz）
 ├── shared_client.py     # Pyrogram（主 Bot + 可选用户账号）客户端
 ├── docker-compose.yml   # 一体化部署（mongo + mongo-init + bot）
 ├── docker/              # 容器入口与运行时清理脚本
 ├── Dockerfile           # 机器人镜像（python:3.10-slim + ffmpeg）
 ├── config.py            # 从环境变量读取配置；PAY_NOTICE 统一提示文案
-├── app.py               # Flask 健康检查页（端口 5000）
+├── utils/health.py      # aiohttp 进程内健康/欢迎页服务（替代独立 Flask 进程）
 ├── plugins/
 │   ├── start.py         # /start /help /plan /terms /set 菜单
 │   ├── login.py         # 用户登录、会话保存、自定义 Bot 管理

@@ -21,5 +21,5 @@ RUN pip3 install wheel
 RUN pip3 install --no-cache-dir -U -r requirements.txt
 COPY . .
 EXPOSE 5000
-
-CMD flask run -h 0.0.0.0 -p 5000 & python3 main.py
+# Startup source of truth is docker-compose's entrypoint (bot-entrypoint.sh),
+# which runs /app/main.py — the health server rides in the same process.

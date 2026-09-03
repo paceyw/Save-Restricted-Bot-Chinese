@@ -7,18 +7,17 @@ set -u
 # media still write to /data. Idempotent: refresh on every start.
 ln -sfn /app/plugins /data/plugins
 
-flask_pid=""
 bot_pid=""
 cleanup_pid=""
 
 shutdown_children() {
   trap - TERM INT
-  for pid in "$flask_pid" "$bot_pid" "$cleanup_pid"; do
+  for pid in "$bot_pid" "$cleanup_pid"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill -TERM "$pid" 2>/dev/null || true
     fi
   done
-  for pid in "$flask_pid" "$bot_pid" "$cleanup_pid"; do
+  for pid in "$bot_pid" "$cleanup_pid"; do
     if [ -n "$pid" ]; then
       wait "$pid" 2>/dev/null || true
     fi
@@ -32,16 +31,15 @@ on_signal() {
 
 trap on_signal TERM INT
 
-python -m flask --app /app/app.py run --host 0.0.0.0 --port 5000 &
-flask_pid=$!
-
+# The welcome page (/) and /healthz are served in-process by main.py's aiohttp
+# HealthServer — the standalone Flask process is gone.
 python /app/main.py &
 bot_pid=$!
 
 ( while sleep 3600; do /usr/local/bin/cleanup-runtime.sh /data || true; done ) &
 cleanup_pid=$!
 
-wait -n "$flask_pid" "$bot_pid"
+wait -n "$bot_pid" "$cleanup_pid"
 status=$?
 shutdown_children
 exit "$status"
