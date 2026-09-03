@@ -198,6 +198,10 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 | `MISSAV_MIRRORS` | 内置列表 | missav 镜像域名，逗号分隔；留空用 `missav.ai/.ws/.live` + `missav123.com` |
 | `MISSAV_SEGMENT_CONCURRENCY` | `8` | missav 分段下载并发数（1–32） |
 | `MISSAV_MAX_JOBS` | `2` | 同时进行的 missav 任务数上限（跨用户） |
+| `BURN_CONCURRENCY` | `1` | 字幕烧录（libx264 重编码，峰值约 0.5GB）同时进行的任务数上限，独立于 MISSAV_MAX_JOBS |
+| `FFMPEG_BURN_THREADS` | `0` | 烧录编码线程数；`0` 为自动（按 CPU 数取 2–8） |
+| `BURN_TIMEOUT_S` | `10800` | 单次烧录墙钟超时（秒）；超时终止 ffmpeg 并回退无字幕封装，`0` 不限时 |
+| `DISK_FREE_MIN_GB` | `10` | 任务准入磁盘水位（GB）：运行卷剩余低于该值时拒绝新任务（进行中的任务不受影响） |
 
 > ⚠️ **安全**：`config.py` 中 `MASTER_KEY`/`IV_KEY` 的默认值仅用于演示。生产部署务必通过环境变量覆盖为随机值，否则任何人都能解密你的用户会话。
 
