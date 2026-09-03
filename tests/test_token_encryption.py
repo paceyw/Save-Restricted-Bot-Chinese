@@ -96,6 +96,9 @@ def batch_module(monkeypatch):
     config.MERGE_INTERVAL = 0.01
     config.CHANNEL_INTERVAL = 0.01
     config.UPLOAD_INTERVAL = 0.01
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     config.MAX_FLOOD_RETRIES = 1
     monkeypatch.setitem(sys.modules, "config", config)
 

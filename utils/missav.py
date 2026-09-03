@@ -46,7 +46,6 @@ import tempfile as _tempfile
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from config import BURN_CONCURRENCY, BURN_TIMEOUT_S, FFMPEG_BURN_THREADS
-import m3u8
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger(__name__)
@@ -1222,6 +1221,9 @@ async def _resolve_media_playlist(m3u8_url, headers, pinned_domain):
         )
         if resp is None or resp.status_code != 200:
             raise MissAVError(f"m3u8 获取失败: {err or getattr(resp, 'status_code', '?')}")
+        # m3u8 loads lazily (plan §5.4): only the missav/getav HLS path needs
+        # it, keeping idle import weight off every other bot command.
+        import m3u8
         playlist = m3u8.loads(resp.text or "")
         variant_uri = select_variant_uri(playlist)
         if not variant_uri:

@@ -12,7 +12,19 @@
 # License: MIT License
 # ---------------------------------------------------
 
-import yt_dlp
+def _require_yt_dlp():
+    """Import yt_dlp on first use (plan §5.4).
+
+    yt_dlp and its dependency tree are the heaviest imports in the bot and
+    only /dl and /adl site paths need them. Lazy loading keeps idle RSS down
+    and, if the install is broken, degrades only yt-dlp-backed commands at
+    task time instead of killing plugin load — and with it the whole bot
+    startup (main.py does not isolate per-plugin import failures).
+    """
+    import yt_dlp
+    return yt_dlp
+
+
 import os
 import tempfile
 import time
@@ -54,8 +66,6 @@ from config import (
     PROGRESS_MIN_INTERVAL,
     YT_COOKIES,
 )
-from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
-from mutagen.mp3 import MP3
  
 logger = logging.getLogger(__name__)
  
@@ -132,7 +142,7 @@ async def download_thumbnail_async(url, path):
  
 async def extract_audio_async(ydl_opts, url):
     def sync_extract():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
     return await asyncio.get_event_loop().run_in_executor(thread_pool, sync_extract)
  
@@ -178,6 +188,10 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
         if os.path.exists(download_path):
             def edit_metadata():
                 nonlocal thumbnail_path
+                # mutagen only serves MP3 tagging (plan §5.4): load it here
+                # so /dl video tasks and idle startup never pay for it.
+                from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
+                from mutagen.mp3 import MP3
                 audio_file = MP3(download_path, ID3=ID3)
                 try:
                     audio_file.add_tags()
@@ -268,7 +282,7 @@ async def run_adl(message, url, task_id=None):
 
 
 async def fetch_video_info(url, ydl_opts, progress_message, check_duration_and_size):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=False)
 
         if check_duration_and_size:
@@ -285,7 +299,7 @@ async def fetch_video_info(url, ydl_opts, progress_message, check_duration_and_s
         return info_dict
 
 def download_video(url, ydl_opts):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 

@@ -73,6 +73,9 @@ def deliver_env(monkeypatch, tmp_path):
 
     config = types.ModuleType('config')
     config.LOG_GROUP = 0
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     config.MAX_FLOOD_RETRIES = 2
     config.UPLOAD_INTERVAL = 0
     config.PROGRESS_MIN_INTERVAL = 3.0
