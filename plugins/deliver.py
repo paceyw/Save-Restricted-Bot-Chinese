@@ -20,6 +20,7 @@ from utils.func import (
     ensure_audio_track, touch_file, task_downloads_dir,
     VIDEO_EXTENSIONS, AUDIO_EXTENSIONS,
 )
+from plugins.settings import rename_file
 from plugins.fetch import (
     fetch_origin, get_msg, resolve_linked_chat, upd_dlg, premium_userbot,
 )
@@ -1153,9 +1154,15 @@ async def finish_prepared_msg(prep):
             if sent:
                 return 'Sent directly.'
             if error and 'PEER_ID_INVALID' in error:
-                return (
-                    '发送失败：目标聊天不可用。请在 /settings 设置正确的 '
-                    '-100... 聊天 ID，并将 /setbot 机器人加入该频道且设为管理员。'
+                # The BOT cannot resolve the target, but this send never
+                # reached the wire, so retrying is duplicate-safe. The
+                # download fallback re-sends via prep.sender, which is the
+                # user client unless the user pinned bot delivery — that
+                # path can still succeed (bot-first public fetch routes
+                # far more traffic here than the old user-fetch default).
+                print(
+                    'Direct send rejected with PEER_ID_INVALID '
+                    f'for chat {prep.did}, falling back to re-upload'
                 )
             print(f'Direct send failed ({error}), falling back to re-upload')
             result = await _download_prepared_msg(prep)

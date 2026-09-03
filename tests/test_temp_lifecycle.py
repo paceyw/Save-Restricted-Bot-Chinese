@@ -110,6 +110,9 @@ def test_cleanup_stale_downloads_sweeps_files_then_empty_dirs(func_module):
     now = time.time()
     os.utime(dead / "b.mp4", (now - 2 * 3600, now - 2 * 3600))  # stale: 2h
     os.utime(live / "a.mp4", (now, now))  # active lease
+    # husk must be an OLD dir too: fresh dirs are never reap candidates
+    # (race guard for task dirs whose first file has not landed yet)
+    os.utime(dead, (now - 2 * 3600, now - 2 * 3600))
 
     asyncio.run(func_module.cleanup_stale_downloads(max_age_min=60))
 
@@ -117,6 +120,76 @@ def test_cleanup_stale_downloads_sweeps_files_then_empty_dirs(func_module):
     assert not (dead / "b.mp4").exists()  # stale file removed
     assert not dead.exists()  # empty husk removed
     assert live.exists()  # non-empty dir survives
+
+
+def test_cleanup_stale_downloads_never_reaps_fresh_empty_task_dir(func_module):
+    """Race guard (review round 1): a task dir created moments ago whose
+    first file has not landed yet (caller awaiting network) must survive
+    the sweep regardless of invocation timing."""
+    downloads = Path(func_module.task_downloads_dir("t", create=False)).parent
+    downloads.mkdir(exist_ok=True)
+    fresh = downloads / "task_fresh_empty"
+    fresh.mkdir()
+    # fresh mtime (just created) — no aging needed
+    assert fresh.exists(), "fresh empty task dir must not be reaped"
+
+
+def test_direct_send_peer_invalid_falls_back_to_reupload(deliver_env):
+    """PEER_ID_INVALID must fall back to download+re-upload (review round 1):
+    bot-first public fetch made this the common path when the bot cannot
+    resolve the target; the user-client sender can still deliver."""
+    deliver = deliver_env.deliver
+    calls = {"direct": 0, "download": 0, "upload": 0}
+
+    async def fake_send_direct(c, m, tcid, ft=None, rtmid=None):
+        calls["direct"] += 1
+        return False, "PEER_ID_INVALID: the peer id being used is invalid"
+
+    deliver.send_direct = fake_send_direct
+
+    class _Recorder:
+        async def download_media(self, msg, file_name=None, progress=None,
+                                 progress_args=None):
+            calls["download"] += 1
+            Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+            Path(file_name).write_bytes(b"payload")
+            return file_name
+
+        async def send_document(self, chat, document, caption=None, thumb=None,
+                                progress=None, progress_args=None,
+                                reply_to_message_id=None):
+            calls["upload"] += 1
+            return SimpleNamespace(id=1)
+
+    deliver.main_bot = _Bot()
+
+    class _Msg:
+        video = None
+        video_note = None
+        voice = None
+        sticker = None
+        audio = None
+        photo = None
+        document = SimpleNamespace(file_id="f1", file_name=None,
+                                   file_size=6)
+        media = True
+        caption = None
+
+    prep = deliver._PreparedMsg(
+        'direct',
+        c=_Recorder(), u=None, m=_Msg(), d="42", lt="public", uid=42,
+        i="chan", oc=None, settings=dict(_SETTINGS), tcid=42, rtmid=None,
+        ft=None, sender=_Recorder(), did=42, bot_fetched=True,
+        f=None, p=None, st=None, th=None,
+        downloads_dir=str(deliver_env.tmp / "downloads"),
+    )
+
+    result = asyncio.run(deliver.finish_prepared_msg(prep))
+    assert calls["direct"] == 1
+    assert calls["download"] == 1, "PEER_ID_INVALID must retry via download"
+    assert calls["upload"] == 1, "re-upload must be attempted"
+    assert result == "Done."
+
 
 
 def test_disk_free_ok_threshold(func_module, monkeypatch):
@@ -202,6 +275,10 @@ def deliver_env(monkeypatch, tmp_path):
 
     func_stub.task_downloads_dir = _task_dir
     monkeypatch.setitem(sys.modules, "utils.func", func_stub)
+
+    settings_stub = types.ModuleType("plugins.settings")
+    settings_stub.rename_file = None
+    monkeypatch.setitem(sys.modules, "plugins.settings", settings_stub)
 
     fetch_stub = types.ModuleType("plugins.fetch")
     fetch_stub.fetch_origin = {}

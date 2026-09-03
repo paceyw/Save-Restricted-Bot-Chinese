@@ -44,6 +44,15 @@ class _FakeApp:
 
         return decorator
 
+    async def send_message(self, chat, text, *args, **kwargs):
+        return types.SimpleNamespace(id=1)
+
+    async def edit_message_text(self, chat, mid, text, *args, **kwargs):
+        return None
+
+    async def delete_messages(self, chat, mids, *args, **kwargs):
+        return None
+
 
 class _FakeReply:
     def __init__(self, text):
@@ -402,6 +411,19 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
         return text
 
     class FailingBot:
+        def __init__(self):
+            self.downloaded = None
+
+        async def download_media(self, msg, file_name=None, **kwargs):
+            # the harness _WORKDIR (/persistent) is fictional: hand back a
+            # real temp file, as pyrogram would return the resolved path
+            import tempfile, pathlib
+            fd, path = tempfile.mkstemp(suffix=".jpg")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"photo")
+            self.downloaded = path
+            return path
+
         async def send_photo(self, *args, **kwargs):
             raise RuntimeError("PEER_ID_INVALID")
 
@@ -418,6 +440,11 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
     )
     module.get_user_data_key = get_key
     module.process_text_with_rules = process_text
+    # the fallback path now runs deeper than the old early return: give the
+    # deliver module callable metadata helpers for the re-upload phase
+    deliver_mod = sys.modules["plugins.deliver"]
+    deliver_mod.thumbnail = lambda uid: None
+    deliver_mod.get_video_metadata = None
 
     result = asyncio.run(
         module.process_msg(
@@ -432,7 +459,11 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
         )
     )
 
-    assert result.startswith("发送失败：")
+    # PEER_ID_INVALID now falls back to download+re-upload (review round 1);
+    # when the re-upload ALSO fails with PEER_ID_INVALID the result is the
+    # upload-failure string with the bot-permission hint — never a fake
+    # direct-send success.
+    assert result.startswith("上传失败：")
     assert "Sent directly" not in result
 
 

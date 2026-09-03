@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import re
+import secrets
 import time
 import inspect
 from config import BATCH_INTERVAL, CHANNEL_INTERVAL, MERGE_INTERVAL
@@ -90,11 +91,18 @@ def _has_active_task(uid):
 
 
 
+# Per-boot nonce: task ids feed filesystem paths (utils.func.task_downloads_dir).
+# uid+time+seq alone are NOT unique across process restarts — a worker restart
+# within the same second could reuse a dead task's id and mix its orphan files
+# into the new task's scratch dir (review round 1).
+_BOOT_NONCE = secrets.token_hex(3)
+
+
 def create_task(uid, task_type, total, **params):
     """Create a task descriptor and register it in TASKS."""
     global _TASK_SEQ
     _TASK_SEQ += 1
-    tid = f'task_{uid}_{int(time.time())}_{_TASK_SEQ}'
+    tid = f'task_{uid}_{int(time.time())}_{_BOOT_NONCE}{_TASK_SEQ:03d}'
     task = {
         'id': tid,
         'uid': uid,
@@ -134,6 +142,16 @@ async def _task_worker(uid):
     queue = USER_QUEUES[uid]
     while True:
         task = await queue.get()
+        # A cancellation requested while queued wins over every other
+        # terminal state — including the disk refusal below (review round 1:
+        # /stop on a queued task must report cancelled, not failed/disk-full).
+        if task.get('cancel_requested'):
+            task['status'] = 'cancelled'
+            task['result'] = '已取消。'
+            task['finished_at'] = time.time()
+            _prune_task_history(uid)
+            queue.task_done()
+            continue
         # Disk watermark (plan §5.2): refuse NEW tasks while free space is
         # under the floor; already-running tasks keep their bytes.
         ok, free_gb = disk_free_ok()

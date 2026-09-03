@@ -299,6 +299,10 @@ def real_pipeline_env(monkeypatch, tmp_path):
     plugins = types.ModuleType("plugins")
     plugins.__path__ = [str(Path(__file__).resolve().parents[1] / "plugins")]
     monkeypatch.setitem(sys.modules, "plugins", plugins)
+    settings_stub = types.ModuleType("plugins.settings")
+    settings_stub.rename_file = None
+    monkeypatch.setitem(sys.modules, "plugins.settings", settings_stub)
+
     fetch = types.ModuleType("plugins.fetch")
     fetch.fetch_origin = {}
     fetch.get_msg = None

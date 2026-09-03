@@ -361,7 +361,24 @@ async def cleanup_stale_downloads(max_age_min=60):
         return
 
     cutoff = time.time() - (max_age_min * 60)
+    # Snapshot STALE dir candidates BEFORE deleting any file (file removal
+    # refreshes the parent dir's mtime). A dir qualifies by AGE, not by
+    # current emptiness: after stale files are deleted, os.rmdir drops the
+    # now-empty ones and safely no-ops on any dir still holding live files.
+    # Fresh dirs — including a task dir whose first file has not landed yet
+    # while the caller awaits network — are never candidates, no matter who
+    # invokes this sweeper or when (plan §5.2 lease/mtime protection).
+    stale_dirs = []
     removed = 0
+    for root, dirs, _files in os.walk(downloads, followlinks=False):
+        for d in dirs:
+            path = os.path.join(root, d)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    stale_dirs.append(path)
+            except OSError:
+                pass
+
     for root, _, filenames in os.walk(downloads, followlinks=False):
         for filename in filenames:
             path = os.path.join(root, filename)
@@ -372,15 +389,13 @@ async def cleanup_stale_downloads(max_age_min=60):
             except Exception:
                 pass
     logger.info("Removed %d stale downloads", removed)
-    # Task-scoped subdirs (plan §5.2): after stale files are gone, drop the
-    # empty husks bottom-up. os.rmdir only removes empty dirs, so an active
-    # task dir with live files is never touched.
-    for root, dirs, _files in os.walk(downloads, topdown=False, followlinks=False):
-        for d in dirs:
-            try:
-                os.rmdir(os.path.join(root, d))
-            except OSError:
-                pass
+    # Task-scoped subdirs (plan §5.2): drop the pre-snapshotted stale dirs
+    # that are now empty.
+    for path in stale_dirs:
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
 
 def task_downloads_dir(task_id, create=True):
     """Per-task scratch dir under downloads/ (plan §5.2).
