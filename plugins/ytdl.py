@@ -638,6 +638,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
             hosts=hosts,
             concurrency=MISSAV_SEGMENT_CONCURRENCY,
             progress=progress,
+            task_id=task_id,
             **(extra_dl_kwargs or {}),
         )
         caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or f'{site} 视频'}**"

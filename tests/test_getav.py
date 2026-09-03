@@ -17,6 +17,11 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1]
 
+# utils.missav imports config (transcode budget knobs); config hard-requires
+# these keys at import time, so default them for hermetic test runs.
+os.environ.setdefault("MASTER_KEY", "missav-test-master")
+os.environ.setdefault("IV_KEY", "missav-test-iv")
+
 spec = importlib.util.spec_from_file_location("missav_mod", SRC / "utils" / "missav.py")
 missav = importlib.util.module_from_spec(spec)
 sys.modules["missav_mod"] = missav
@@ -538,7 +543,7 @@ def test_fetch_getav_subtitle_degrades(monkeypatch, tmp_path, resp):
 def test_burn_subtitles_args(monkeypatch, tmp_path):
     calls = []
 
-    async def fake_run(args):
+    async def fake_run(args, timeout_s=None):
         calls.append(args)
 
     sub = str(tmp_path / "zh.vtt")
@@ -565,7 +570,7 @@ def test_burn_subtitles_args(monkeypatch, tmp_path):
 def test_burn_subtitles_escapes_filter_path(monkeypatch, tmp_path):
     captured = {}
 
-    async def fake_run(args):
+    async def fake_run(args, timeout_s=None):
         captured["vf"] = args[args.index("-vf") + 1]
 
     monkeypatch.setattr(missav.shutil, "which", lambda name: "/usr/bin/ffmpeg")
@@ -727,7 +732,7 @@ def _hls_fixture(with_subtitle, tmp_path, monkeypatch):
         with open(src, "rb") as fi, open(dst, "wb") as fo:
             fo.write(fi.read())
 
-    async def fake_burn(src, dst, subtitle_path):
+    async def fake_burn(src, dst, subtitle_path, task_id=None):
         calls.append(("burn", subtitle_path))
         await _copy(src, dst)
 
@@ -795,7 +800,7 @@ def test_download_getav_failed_burn_retries_plain(monkeypatch, tmp_path):
     # burn fails -> core falls back to the plain remux and still delivers
     parts, calls = _hls_fixture(True, tmp_path, monkeypatch)
 
-    async def failing_burn(src, dst, subtitle_path):
+    async def failing_burn(src, dst, subtitle_path, task_id=None):
         calls.append(("burn", subtitle_path))
         raise missav.MissAVError("ffmpeg 烧录失败: boom")
 
@@ -849,7 +854,7 @@ def test_download_getav_cn_family_skips_subtitle(monkeypatch, tmp_path):
         lambda url, headers=None, timeout=None, max_bytes=None: (served.get(url) or FakeResp(404), None))
     calls = []
 
-    async def fake_burn(src, dst, subtitle_path):
+    async def fake_burn(src, dst, subtitle_path, task_id=None):
         calls.append(("burn", subtitle_path))
 
     async def fake_remux(src, dst):
