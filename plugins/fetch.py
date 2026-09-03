@@ -24,6 +24,30 @@ _CLIENT_IDLE_TTL = 1800
 _LRU_MAXSIZE = 1000
 _PEER_CACHE_TTL = 24 * 3600
 _PEER_CACHE_MAX = 500
+logger = logging.getLogger(__name__)
+# Bot clients on MTProto share the free-account 2 GiB file budget; only a
+# (premium) user session can re-download bigger files when needed.
+_BOT_FILE_BYTE_LIMIT = 2 * 1024 * 1024 * 1024
+
+
+def _needs_user_fetch(xm):
+    """True when a bot-side fetch of this public message cannot back its
+    download fallback, so the user client must own the fetch instead.
+
+    Albums: if server-side copy_media_group is rejected, the fallback
+    re-downloads every item with the user client — download_media is bound
+    to the fetching client's file context, so a bot-fetched group would be
+    unreadable there. Oversized single media: the bot cannot re-download
+    >2 GiB if the (zero-byte) direct send is rejected by Telegram.
+    """
+    if getattr(xm, 'media_group_id', None):
+        return True
+    for attr in ('video', 'audio', 'document'):
+        media = getattr(xm, attr, None)
+        if (getattr(media, 'file_size', 0) or 0) > _BOT_FILE_BYTE_LIMIT:
+            return True
+    return False
+
 class _BoundedLRU(OrderedDict):
     """Ordered mapping with a hard upper bound and access-order refresh."""
 
@@ -215,12 +239,17 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
             return None
 
         if lt == 'public':
+            # Bot-first (plan §5.1 direct-send coverage): a bot-context fetch
+            # makes delivery file_id-direct — zero local bytes. The user
+            # client stays the fetcher for messages whose download fallback
+            # needs user-side bytes (albums, >2 GiB media): _needs_user_fetch
+            # skips the bot result WITHOUT recording fetch_origin so the user
+            # attempt below still sets it correctly.
             clients = []
-            if u:
-                clients.append(('user', u, False))
             if c and c is not u:
                 clients.append(('bot', c, True))
-
+            if u:
+                clients.append(('user', u, False))
             for label, client, fetched_by_bot in clients:
                 try:
                     xm = await client.get_messages(i, d)
@@ -231,6 +260,8 @@ async def get_msg(c, u, i, d, lt, uid, comment_id=None):
                     continue
 
                 if xm and not getattr(xm, 'empty', False):
+                    if fetched_by_bot and u is not None and _needs_user_fetch(xm):
+                        continue
                     # fetch_origin is looked up downstream by numeric chat id
                     # (msg.chat.id) — record both keys: for public links
                     # ``i`` is the username, which would never match.
