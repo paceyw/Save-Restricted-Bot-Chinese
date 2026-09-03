@@ -139,8 +139,10 @@ async def _task_worker(uid):
         ok, free_gb = disk_free_ok()
         if not ok:
             task['status'] = 'failed'
+            # exact free-space figures stay in server logs, not user results
+            print(f'Task {task["id"]} refused: disk watermark reached ({free_gb:.1f}GB free)')
             task['result'] = (
-                f'❌ 磁盘空间不足（剩余 {free_gb:.1f}GB），已拒绝新任务，'
+                '❌ 服务器磁盘空间不足，已拒绝新任务，'
                 '请稍后重试或联系管理员清理'
             )
             task['finished_at'] = time.time()

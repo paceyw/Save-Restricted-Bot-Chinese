@@ -159,9 +159,18 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
             temp_cookie_file.write(cookies)
             temp_cookie_path = temp_cookie_file.name
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
-    random_filename = os.path.join(download_dir, f"@team_spy_pro_{message.from_user.id}")
+    # Task-scoped scratch dir (plan §5.2, review finding): the fixed
+    # @team_spy_pro_<uid>.mp3 path leaked on cancellation/crash because the
+    # worker's task-dir net could not see it. Falls back to the shared
+    # downloads dir for direct (non-queued) calls.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
+    random_filename = os.path.join(
+        download_dir, f"@team_spy_pro_{message.from_user.id}_{get_random_string()}"
+    )
     download_path = f"{random_filename}.mp3"
     thumbnail_path = None
 

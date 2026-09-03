@@ -382,19 +382,27 @@ async def cleanup_stale_downloads(max_age_min=60):
             except OSError:
                 pass
 
-
 def task_downloads_dir(task_id, create=True):
     """Per-task scratch dir under downloads/ (plan §5.2).
 
     Task ids are unique by construction (uid + timestamp + per-boot seq), so
     concurrent flows can never collide inside one dir, and the whole dir is
-    one rmtree away from a guaranteed no-leftover cleanup.
+    one rmtree away from a guaranteed no-leftover cleanup. Ids are validated
+    defensively: only [A-Za-z0-9_-] may reach the filesystem path, so no
+    future caller can smuggle traversal characters through.
     """
     from shared_client import _WORKDIR
-    path = os.path.join(_WORKDIR, 'downloads', f'task_{task_id}')
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id))
+    path = os.path.join(_WORKDIR, 'downloads', f'task_{safe_id}')
     if create:
         os.makedirs(path, exist_ok=True)
     return path
+def cleanup_task_downloads(task_id):
+    """Remove a finished task's scratch dir. Idempotent and never raises —
+    the last-resort net above every per-file cleanup path, so cancellation
+    or a crash mid-upload cannot leak the dir."""
+    path = task_downloads_dir(task_id, create=False)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def cleanup_task_downloads(task_id):
