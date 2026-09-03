@@ -6,6 +6,7 @@ set -u
 # persistent working dir so the relative lookup resolves while sessions and temp
 # media still write to /data. Idempotent: refresh on every start.
 ln -sfn /app/plugins /data/plugins
+mkdir -p /data/logs
 
 bot_pid=""
 cleanup_pid=""

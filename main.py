@@ -8,6 +8,14 @@ import os
 import signal
 import sys
 
+from utils.logging_setup import setup_logging
+
+setup_logging()
+
+import logging
+
+logger = logging.getLogger(__name__)
+
 from shared_client import app, start_client, userbot
 from utils.func import init_db_indexes
 from utils.health import HealthServer
@@ -38,12 +46,11 @@ async def _stop_if_connected(instance, method_name):
             connected = await connected
         if not connected:
             return
-
         result = getattr(instance, method_name)()
         if inspect.isawaitable(result):
             await result
     except Exception as e:
-        print(f"Error stopping client: {e}")
+        logger.warning("error stopping client: %s", e)
 
 
 async def stop_clients():
@@ -59,6 +66,7 @@ async def main():
     event; the finally block then stops the health server and both Telegram
     clients before the process exits.
     """
+    logger.info("bot main starting")
     await init_db_indexes()
 
     health = HealthServer(port=int(os.environ.get("PORT", "5000")))
@@ -75,16 +83,19 @@ async def main():
     try:
         await load_and_run_plugins()
         await stop.wait()
-        print("Shutting down...")
+        logger.info("shutdown signal received")
     finally:
         await health.stop()
         await stop_clients()
 
 
 if __name__ == "__main__":
-    print("Starting clients ...")
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("interrupted from keyboard")
     except Exception as e:
-        print(e)
+        logger.exception("fatal error in main loop: %s", e)
         sys.exit(1)
+    finally:
+        logger.info("process exiting")
