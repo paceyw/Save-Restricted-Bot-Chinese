@@ -599,6 +599,33 @@ def select_variant_uri(playlist):
     return max(variants, key=rank).uri
 
 
+def select_subtitle_media(playlist):
+    """Best EXT-X-MEDIA subtitle track URI from a master playlist, or None.
+
+    Preference: a zh/chinese-named track > the default=YES track > the
+    first track. Entries without a URI are skipped.
+    """
+    entries = [
+        media for media in (playlist.media or [])
+        if str(getattr(media, "type", "") or "").upper() == "SUBTITLES"
+        and getattr(media, "uri", None)
+    ]
+    if not entries:
+        return None
+
+    def _is_zh(media):
+        text = f"{getattr(media, 'name', '') or ''} {getattr(media, 'language', '') or ''}".lower()
+        return "zh" in text or "chinese" in text or "中文" in text
+
+    for media in entries:
+        if _is_zh(media):
+            return media.uri
+    for media in entries:
+        if str(getattr(media, "default", "") or "").upper() == "YES":
+            return media.uri
+    return entries[0].uri
+
+
 def playlist_encryption(playlist):
     """Return {'method','uri','iv'} for the first AES key, or None."""
     for key in playlist.keys or []:
@@ -610,6 +637,97 @@ def playlist_encryption(playlist):
         if method == "AES-128":
             return {"method": method, "uri": key.uri, "iv": getattr(key, "iv", None)}
     return None
+
+
+# ─── WebVTT track merging (issue #18, pure) ────────────────────────────────────
+
+_VTT_TS = r"\d{1,3}:\d{1,2}(?::\d{1,2})?[.,]\d{1,3}"
+_VTT_TIMING_RE = re.compile(
+    rf"(?P<start>{_VTT_TS})\s*-->\s*(?P<end>{_VTT_TS})", re.IGNORECASE)
+_VTT_TS_RE = re.compile(rf"^({ _VTT_TS })$")
+_VTT_MAP_RE = re.compile(
+    r"X-TIMESTAMP-MAP\s*=\s*LOCAL:([^,\s]+)\s*,\s*MPEGTS:(-?\d+)", re.IGNORECASE)
+
+
+def _parse_vtt_ts(text):
+    """VTT timestamp (MM:SS.mmm or HH:MM:SS.mmm) -> seconds, else None."""
+    m = _VTT_TS_RE.match(text.strip())
+    if not m:
+        return None
+    parts = m.group(1).replace(",", ".").split(":")
+    h, mm, ss = (["0"] * (3 - len(parts))) + parts
+    return int(h) * 3600 + int(mm) * 60 + float(ss)
+
+
+def _vtt_segment_offset(body):
+    """Per-segment shift (seconds) from the X-TIMESTAMP-MAP header, else 0.
+
+    HLS WebVTT cues are segment-relative: absolute = cue + MPEGTS/90000
+    - LOCAL. The header sits in the segment's first lines.
+    """
+    m = _VTT_MAP_RE.search(body[:4096])
+    if not m:
+        return 0.0
+    local = _parse_vtt_ts(m.group(1))
+    if local is None:
+        return 0.0
+    return int(m.group(2)) / 90000.0 - local
+
+
+def _iter_vtt_cues(body):
+    """Yield (start_s, end_s, payload) for every cue block in a VTT body."""
+    lines = body.splitlines()
+    i, total = 0, len(lines)
+    while i < total:
+        m = _VTT_TIMING_RE.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        start, end = _parse_vtt_ts(m.group("start")), _parse_vtt_ts(m.group("end"))
+        if start is None or end is None:
+            i += 1
+            continue
+        i += 1
+        payload = []
+        while i < total and lines[i].strip():
+            payload.append(lines[i])
+            i += 1
+        yield start, end, "\n".join(payload)
+
+
+def _fmt_vtt_ts(seconds):
+    """Seconds -> HH:MM:SS.mmm (clamped at zero)."""
+    total_ms = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(total_ms, 3_600_000)
+    mm, rem = divmod(rem, 60_000)
+    ss, ms = divmod(rem, 1000)
+    return f"{h:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
+
+
+def merge_vtt_segments(bodies):
+    """Concatenate HLS WebVTT segments into one WEBVTT document.
+
+    Each segment's ``X-TIMESTAMP-MAP`` is honoured (MPEGTS/90000 - LOCAL
+    shifts that segment's cues onto the absolute timeline) and cues that
+    repeat EXACTLY across segment boundaries are emitted once. Output
+    keeps first-seen order and normalizes timestamps to HH:MM:SS.mmm.
+    """
+    out = ["WEBVTT"]
+    seen = set()
+    for body in bodies:
+        if not body or not body.strip():
+            continue
+        offset = _vtt_segment_offset(body)
+        for start, end, payload in _iter_vtt_cues(body):
+            a = max(0.0, start + offset)
+            b = max(0.0, end + offset)
+            key = (round(a * 1000), round(b * 1000), payload)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.extend(["", f"{_fmt_vtt_ts(a)} --> {_fmt_vtt_ts(b)}", payload])
+    out.append("")
+    return "\n".join(out)
 
 
 def segment_iv(key_iv, index, media_sequence):
@@ -1365,11 +1483,139 @@ def _fetch_getav_subtitle(sub_entry, pinned_domain, dest_dir):
     return path
 
 
+def find_getav_subtitle_for_code(code, dest_dir):
+    """Best-effort official getav VTT for a missav video code; None on any miss.
+
+    When the missav HLS master carries no subtitle track, getav.net often
+    hosts the same release with a site-polished Chinese VTT. Build the
+    movie-API URL from the bare code, accept the payload ONLY when its
+    id/title strongly contains the code (never burn another title's
+    subs), then reuse the getav subtitle pipeline. Silent: subtitles are
+    never a download prerequisite.
+    """
+    code = (code or "").strip()
+    if not code:
+        return None
+    for api_url in getav_api_candidates(f"https://getav.net/zh/videos/{code}"):
+        try:
+            resp, err = _http_get(
+                api_url, headers={"User-Agent": _CHROME_UA},
+                timeout=PAGE_TIMEOUT, max_bytes=PAGE_MAX_BYTES,
+            )
+        except Exception:
+            return None
+        if resp is None or resp.status_code != 200:
+            logger.info("getav code-subtitle api miss %s: %s",
+                        api_url, err or getattr(resp, "status_code", "?"))
+            continue
+        data = _parse_getav_json(resp.text or "")
+        if data is None:
+            continue
+        haystack = f"{data.get('id') or ''} {data.get('title') or ''}".upper()
+        if code.upper() not in haystack:
+            logger.info("getav code-subtitle mismatch: %s not in %s", code, haystack[:80])
+            continue
+        sub = select_getav_subtitle(data)
+        if not sub:
+            continue
+        # pin like download_getav: subtitle lives on the video CDN's domain
+        source_url, _fam = select_getav_source(data.get("videoSources") or [])
+        if not source_url:
+            continue
+        pinned = _registered_domain(urlparse(source_url).hostname or "")
+        return _fetch_getav_subtitle(sub, pinned, dest_dir)
+    return None
+
+
+async def _fetch_subtitle_track(subtitle_uri, headers, pinned_domain, dest_dir):
+    """Download + merge an HLS WebVTT subtitle track into one .vtt file.
+
+    Returns the temp file path, or None on ANY problem — subtitles are
+    strictly best-effort and must never fail the video. The track stays
+    host-pinned like playlists/keys/segments and every body is
+    byte-capped at the page budget.
+    """
+    try:
+        url = subtitle_uri
+        vtt_bodies = None
+        for _ in range(MAX_PLAYLIST_HOPS):
+            if not _host_allowed(url, pinned_domain):
+                logger.info("subtitle track host rejected: %s", urlparse(url).hostname)
+                return None
+            resp, err = await asyncio.to_thread(
+                _http_get, url, headers, PAGE_TIMEOUT, PAGE_MAX_BYTES
+            )
+            if resp is None or resp.status_code != 200 or not (resp.text or "").strip():
+                logger.info("subtitle playlist fetch failed: %s",
+                            err or getattr(resp, "status_code", "?"))
+                return None
+            text = resp.text or ""
+            if text.lstrip().startswith("WEBVTT") and "-->" in text:
+                vtt_bodies = [text]  # track URI pointed straight at a VTT body
+                break
+            import m3u8
+            playlist = m3u8.loads(text)
+            if playlist.segments:
+                if len(playlist.segments) > MAX_SEGMENTS:
+                    return None
+                vtt_bodies = []
+                spent = 0
+                for seg in playlist.segments:
+                    seg_url = _absolute(url, seg.uri)
+                    if not _host_allowed(seg_url, pinned_domain):
+                        return None
+                    seg_resp, seg_err = await asyncio.to_thread(
+                        _http_get, seg_url, headers, PAGE_TIMEOUT, PAGE_MAX_BYTES
+                    )
+                    if seg_resp is None or seg_resp.status_code != 200:
+                        logger.info("subtitle segment failed (%s), dropping track",
+                                    seg_err or getattr(seg_resp, "status_code", "?"))
+                        return None
+                    body = seg_resp.text or ""
+                    spent += len(body)
+                    if spent > PAGE_MAX_BYTES:
+                        return None
+                    vtt_bodies.append(body)
+                break
+            nxt = select_variant_uri(playlist)
+            if not nxt:
+                return None
+            url = _absolute(url, nxt)
+        if not vtt_bodies:
+            return None
+        merged = merge_vtt_segments(vtt_bodies)
+        if "-->" not in merged:
+            return None
+        fd, path = _tempfile.mkstemp(prefix="missav_sub_", suffix=".vtt", dir=dest_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(merged)
+        except BaseException:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+        return path
+    except Exception:
+        logger.info("subtitle track fetch failed", exc_info=True)
+        return None
+
+
 # ─── orchestration ─────────────────────────────────────────────────────────────
 
 async def _resolve_media_playlist(m3u8_url, headers, pinned_domain):
-    """Follow variant playlists (bounded, host-pinned) to the media playlist."""
+    """Follow variant playlists (bounded, host-pinned) to the media playlist.
+
+    Returns ``(playlist, playlist_url, master_url, subtitle_uri)``:
+    ``master_url`` is the variant-level playlist a subtitle track was
+    read from (None when the first load was already a media playlist)
+    and ``subtitle_uri`` the selected ``EXT-X-MEDIA`` subtitles URI made
+    absolute (None when the master declares no usable track).
+    """
     url = m3u8_url
+    master_url = None
+    subtitle_uri = None
     for _ in range(MAX_PLAYLIST_HOPS):
         if not _host_allowed(url, pinned_domain):
             raise MissAVError(f"m3u8 地址域校验失败: {urlparse(url).hostname}")
@@ -1382,11 +1628,15 @@ async def _resolve_media_playlist(m3u8_url, headers, pinned_domain):
         # it, keeping idle import weight off every other bot command.
         import m3u8
         playlist = m3u8.loads(resp.text or "")
+        sub_uri = select_subtitle_media(playlist)
+        if sub_uri:
+            master_url = url
+            subtitle_uri = _absolute(url, sub_uri)
         variant_uri = select_variant_uri(playlist)
         if not variant_uri:
             if not playlist.segments:
                 raise MissAVError("m3u8 无有效片段（可能被拦截或改版）")
-            return playlist, url
+            return playlist, url, master_url, subtitle_uri
         url = _absolute(url, variant_uri)
     raise MissAVError("m3u8 嵌套层级过深，疑似改版")
 
@@ -1445,7 +1695,8 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
 
 async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
                              concurrency=SEGMENT_CONCURRENCY, progress=None,
-                             subtitle_path=None, task_id=None):
+                             subtitle_path=None, want_site_subtitle=False,
+                             task_id=None):
     """Shared missav/getav tail: m3u8 -> guarded segments -> merged mp4.
 
     ``info`` is {'title','thumbnail'}, ``details`` the caption
@@ -1455,6 +1706,11 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
     Resource guards: segment count, cumulative bytes, total duration and
     free disk are all checked before/while downloading, so a hostile
     playlist cannot exhaust the host.
+
+    ``want_site_subtitle`` (missav ``-sub``) pulls the master's
+    EXT-X-MEDIA subtitle track and burns it; with no track in the HLS it
+    falls back to the official getav VTT matched by code. External
+    ``subtitle_path`` (getav flow) always wins and skips both.
     """
     async def _report(done, total, stage):
         if progress:
@@ -1477,7 +1733,22 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
     if not _host_allowed(m3u8_url, pinned_domain):
         raise MissAVError(f"m3u8 地址非法: {m3u8_host}")
 
-    playlist, playlist_url = await _resolve_media_playlist(m3u8_url, headers, pinned_domain)
+    playlist, playlist_url, master_url, subtitle_uri = await _resolve_media_playlist(
+        m3u8_url, headers, pinned_domain
+    )
+    subtitle_track_path = None
+    if subtitle_path is None and want_site_subtitle:
+        if subtitle_uri:
+            subtitle_track_path = await _fetch_subtitle_track(
+                subtitle_uri, headers, pinned_domain, dest_dir
+            )
+        if subtitle_track_path is None:
+            # no (usable) HLS track: try the official getav VTT by code
+            code = (details or {}).get("code") or ""
+            if code:
+                subtitle_track_path = await asyncio.to_thread(
+                    find_getav_subtitle_for_code, code, dest_dir
+                )
     segments = playlist.segments
     if len(segments) > MAX_SEGMENTS:
         raise MissAVError(f"片段数超上限 ({len(segments)} > {MAX_SEGMENTS})，疑似异常数据")
@@ -1555,10 +1826,11 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
                             break
                         out.write(chunk)
 
-        if subtitle_path:
+        burn_sub = subtitle_path or subtitle_track_path
+        if burn_sub:
             await _report(0, 1, "burn")
             try:
-                await burn_subtitles_to_mp4(merged, dest_path, subtitle_path, task_id=task_id)
+                await burn_subtitles_to_mp4(merged, dest_path, burn_sub, task_id=task_id)
             except MissAVError:
                 # a broken subtitle/font must never lose the video itself
                 logger.warning("字幕烧录失败，回退无字幕封装", exc_info=True)
@@ -1574,16 +1846,26 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
         }
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        if subtitle_track_path:
+            try:
+                os.remove(subtitle_track_path)
+            except OSError:
+                pass
 
 
 async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
                           concurrency=SEGMENT_CONCURRENCY, progress=None,
-                          task_id=None):
+                          want_subtitle=False, task_id=None):
     """Download a missav video page to ``dest_path`` (.mp4).
-
     ``progress`` is an optional async callable ``(done, total, stage)``
     invoked after the page fetch, per segment and at merge time. Returns
     page metadata {'title','thumbnail','segments','host','details'}.
+
+    ``want_subtitle`` (the bot's ``/dl -sub`` flag) opts IN to burning
+    the page's HLS subtitle track — or, when the HLS carries none, the
+    official getav VTT matched by code. A full libx264 re-encode, so the
+    default is a plain fast remux; subtitle problems degrade to a plain
+    video, never a failed download.
     """
     page_html, host = await asyncio.to_thread(fetch_video_page, url, tuple(hosts))
     if progress:
@@ -1597,7 +1879,7 @@ async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
         m3u8_url, dest_path, host, info,
         extract_video_details(page_html, url),
         concurrency=concurrency, progress=progress,
-        task_id=task_id,
+        want_site_subtitle=want_subtitle, task_id=task_id,
     )
 
 async def download_getav(url, dest_path, *, hosts=GETAV_DEFAULT_MIRRORS,

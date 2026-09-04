@@ -7,6 +7,7 @@ stubbed remux, and the missing-ffmpeg guard is exercised for real.
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -229,6 +230,325 @@ def test_discover_missav_variants_unreachable_falls_back(monkeypatch):
     found = asyncio.run(
         missav.discover_missav_variants("https://missav.ai/sone-543"))
     assert found == [("raw", "https://missav.ai/sone-543", "原版")]
+
+
+# ─── subtitle track + VTT merge (issue #18) ────────────────────────────────────
+
+MASTER_SUBS_ZH = """#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="subs/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="中文",DEFAULT=NO,AUTOSELECT=YES,URI="subs/zh.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,SUBTITLES="subs"
+1080/prog.m3u8
+"""
+
+
+def test_select_subtitle_media_prefers_zh_name():
+    pl = m3u8_load(MASTER_SUBS_ZH)
+    assert missav.select_subtitle_media(pl) == "subs/zh.m3u8"
+
+
+def test_select_subtitle_media_falls_back_to_default():
+    text = MASTER_SUBS_ZH.replace(
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="中文",'
+        'DEFAULT=NO,AUTOSELECT=YES,URI="subs/zh.m3u8"\n', "")
+    pl = m3u8_load(text)
+    assert missav.select_subtitle_media(pl) == "subs/en.m3u8"
+
+
+def test_select_subtitle_media_any_when_unlabeled():
+    text = (
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",URI="subs/en.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Français",URI="subs/fr.m3u8"\n'
+        "#EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES=\"subs\"\nprog.m3u8\n"
+    )
+    pl = m3u8_load(text)
+    assert missav.select_subtitle_media(pl) == "subs/en.m3u8"
+
+
+def test_select_subtitle_media_skips_uri_less_entries():
+    text = (
+        '#EXTM3U\n'
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,NAME="bare"\n'
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,NAME="real",URI="subs/real.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES="subs"\nprog.m3u8\n'
+    )
+    assert missav.select_subtitle_media(m3u8_load(text)) == "subs/real.m3u8"
+
+
+def test_select_subtitle_media_none_on_plain_master():
+    assert missav.select_subtitle_media(m3u8_load(MASTER)) is None
+
+
+VTT_SEG_A = (
+    "WEBVTT\n"
+    "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000\n"
+    "\n"
+    "00:00.000 --> 00:02.500\n"
+    "こんにちは\n"
+    "\n"
+    "00:03.000 --> 00:04.000\n"
+    "第二句\n"
+)
+VTT_SEG_B = (
+    "WEBVTT\n"
+    "X-TIMESTAMP-MAP=LOCAL:00:00.000,MPEGTS:900000\n"
+    "\n"
+    "00:00.000 --> 00:02.500\n"
+    "こんにちは\n"
+    "\n"
+    "00:59.800 --> 01:00.200\n"
+    "最後\n"
+)
+
+
+def test_merge_vtt_segments_applies_map_dedupes_and_formats():
+    out = missav.merge_vtt_segments([VTT_SEG_A, VTT_SEG_B])
+    assert out.startswith("WEBVTT")
+    # MPEGTS 900000 = +10s shift onto the absolute timeline
+    assert "00:00:10.000 --> 00:00:12.500\nこんにちは" in out
+    assert "00:00:13.000 --> 00:00:14.000\n第二句" in out
+    # MM:SS.mmm LOCAL values land on HH:MM:SS.mmm output
+    assert "00:01:09.800 --> 00:01:10.200\n最後" in out
+    # the exact boundary duplicate is emitted once
+    assert out.count("こんにちは") == 1
+
+
+def test_merge_vtt_segments_handles_hour_format_and_unmapped():
+    a = "WEBVTT\n\n00:00:59.500 --> 00:01:01.000\nHello"
+    b = "WEBVTT\n\n0:59.500 --> 1:01.000\nHello"  # 1-digit MM:SS.mmm, no map
+    out = missav.merge_vtt_segments([a, b])
+    assert out.count("Hello") == 1  # same absolute cue, deduped across formats
+    assert "00:00:59.500 --> 00:01:01.000" in out
+
+
+def _concat_aware_remux(src, dst):
+    """Test double for the remux seam: concatenates ffconcat-listed parts,
+    falls back to a byte copy for plain media files (pre-contract input)."""
+    async def _run():
+        with open(src, "rb") as fi:
+            head = fi.read(8)
+        if head.lstrip() == b"ffconcat":
+            chunks = []
+            with open(src, "r", encoding="utf-8") as fl:
+                for line in fl:
+                    line = line.strip()
+                    if line.startswith("file '") and line.endswith("'"):
+                        with open(line[6:-1], "rb") as fs:
+                            chunks.append(fs.read())
+            data = b"".join(chunks)
+        else:
+            with open(src, "rb") as fi:
+                data = fi.read()
+        with open(dst, "wb") as fo:
+            fo.write(data)
+    return _run()
+
+
+MASTER_WITH_SUBS = """#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="中文",DEFAULT=YES,AUTOSELECT=YES,URI="subs/zh.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,SUBTITLES="subs"
+1080/prog.m3u8
+"""
+
+SUBS_PLAYLIST = """#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXTINF:6.0,
+zh-0.vtt
+#EXTINF:6.0,
+zh-1.vtt
+#EXT-X-ENDLIST
+"""
+
+
+def test_download_missav_want_subtitle_burns_site_track(monkeypatch, tmp_path):
+    key = os.urandom(16)
+    media_sequence = 5
+    parts = [os.urandom(188 * 40), os.urandom(188 * 40)]
+
+    def enc_part(i, data):
+        iv = (i + media_sequence).to_bytes(16, "big")
+        return _aes_crypt(_pkcs7(data), key, iv, encrypt=True)
+
+    served = {
+        "https://missav.ai/sone-543": FakeResp(
+            text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER_WITH_SUBS),
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=MEDIA),
+        "https://surrit.com/vid/1080/enc.key": FakeResp(content=key),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=enc_part(0, parts[0])),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=enc_part(1, parts[1])),
+        "https://surrit.com/vid/subs/zh.m3u8": FakeResp(text=SUBS_PLAYLIST),
+        "https://surrit.com/vid/subs/zh-0.vtt": FakeResp(text=VTT_SEG_A),
+        "https://surrit.com/vid/subs/zh-1.vtt": FakeResp(text=VTT_SEG_B),
+    }
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        resp = served.get(url)
+        return (resp, None) if resp is not None else (FakeResp(status=404), None)
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+
+    burned = {}
+
+    async def fake_burn(src, dst, subtitle_path, task_id=None):
+        burned["vtt"] = Path(subtitle_path).read_text(encoding="utf-8")
+        with open(dst, "wb") as fo:
+            fo.write(b"burned")
+
+    monkeypatch.setattr(missav, "burn_subtitles_to_mp4", fake_burn)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
+
+    dest = tmp_path / "out.mp4"
+    meta = asyncio.run(missav.download_missav(
+        "https://missav.ai/sone-543", str(dest), want_subtitle=True))
+    assert dest.read_bytes() == b"burned"
+    vtt = burned["vtt"]
+    assert vtt.startswith("WEBVTT")
+    assert "00:00:10.000 --> 00:00:12.500" in vtt
+    assert "00:01:09.800 --> 00:01:10.200" in vtt
+    assert vtt.count("こんにちは") == 1
+    assert meta["segments"] == 2
+    # subtitle temp file cleaned up next to the output
+    assert [p.name for p in tmp_path.iterdir()] == ["out.mp4"]
+
+
+def test_download_missav_want_subtitle_getav_fallback(monkeypatch, tmp_path):
+    clear = MEDIA.replace('#EXT-X-KEY:METHOD=AES-128,URI="enc.key"\n', "")
+    official_vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n公式中字\n"
+    served = {
+        "https://missav.ai/sone-543": FakeResp(
+            text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER),  # no track
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=clear),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=b"a" * 90),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=b"b" * 90),
+        "https://getav.net/api/movies/SONE-543": FakeResp(text=json.dumps({
+            "success": True,
+            "data": {
+                "id": "sone-543",
+                "title": "SONE-543 すごい作品",
+                "videoSources": [
+                    {"type": "raw_1080p",
+                     "url": "https://static.worldstatic.com/raw.m3u8"}],
+                "subtitles": [
+                    {"language": "zh", "format": "vtt",
+                     "filePath": "https://static.worldstatic.com/sub.vtt"}],
+            },
+        })),
+        "https://static.worldstatic.com/sub.vtt": FakeResp(text=official_vtt, content=official_vtt.encode()),
+    }
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        resp = served.get(url)
+        return (resp, None) if resp is not None else (FakeResp(status=404), None)
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+
+    burned = {}
+
+    async def fake_burn(src, dst, subtitle_path, task_id=None):
+        burned["vtt"] = Path(subtitle_path).read_text(encoding="utf-8")
+        with open(dst, "wb") as fo:
+            fo.write(b"burned")
+
+    monkeypatch.setattr(missav, "burn_subtitles_to_mp4", fake_burn)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
+
+    dest = tmp_path / "out.mp4"
+    asyncio.run(missav.download_missav(
+        "https://missav.ai/sone-543", str(dest), want_subtitle=True))
+    assert dest.read_bytes() == b"burned"
+    assert burned["vtt"] == official_vtt
+    assert [p.name for p in tmp_path.iterdir()] == ["out.mp4"]
+
+
+def test_download_missav_want_subtitle_getav_miss_remuxes_plain(monkeypatch, tmp_path):
+    clear = MEDIA.replace('#EXT-X-KEY:METHOD=AES-128,URI="enc.key"\n', "")
+    parts = [b"a" * 90, b"b" * 90]
+    served = {
+        "https://missav.ai/sone-543": FakeResp(
+            text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER),
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=clear),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=parts[0]),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=parts[1]),
+        # getav API 404: no official subtitle either
+    }
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (
+            (served[url], None) if url in served else (FakeResp(status=404), None)))
+
+    async def unexpected_burn(src, dst, subtitle_path, task_id=None):
+        raise AssertionError("must not burn when nothing was found")
+
+    monkeypatch.setattr(missav, "burn_subtitles_to_mp4", unexpected_burn)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
+
+    dest = tmp_path / "out.mp4"
+    asyncio.run(missav.download_missav(
+        "https://missav.ai/sone-543", str(dest), want_subtitle=True))
+    assert dest.read_bytes() == b"".join(parts)
+
+
+def test_find_getav_subtitle_hit(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url == "https://getav.net/api/movies/SONE-543":
+            return FakeResp(text=json.dumps({
+                "success": True,
+                "data": {
+                    "id": "sone-543", "title": "SONE-543 作品",
+                    "videoSources": [{"type": "raw_1080p",
+                                      "url": "https://static.worldstatic.com/v.m3u8"}],
+                    "subtitles": [{"language": "zh", "format": "vtt",
+                                   "filePath": "https://static.worldstatic.com/zh.vtt"}],
+                }})), None
+        if url == "https://static.worldstatic.com/zh.vtt":
+                return FakeResp(text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n公式\n",
+                                content=b"WEBVTT cue body"), None
+        raise AssertionError(f"unexpected fetch {url}")
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    path = missav.find_getav_subtitle_for_code("SONE-543", str(tmp_path))
+    assert path and "公式" in Path(path).read_text(encoding="utf-8")
+    assert os.path.dirname(path) == str(tmp_path)
+
+
+def test_find_getav_subtitle_api_miss(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("/api/movies/SONE-543"):
+            return FakeResp(status=404), None
+        raise AssertionError(f"subtitle must not be fetched after API miss: {url}")
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert missav.find_getav_subtitle_for_code("SONE-543", str(tmp_path)) is None
+
+
+def test_find_getav_subtitle_code_mismatch_rejected(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("/api/movies/SONE-543"):
+            return FakeResp(text=json.dumps({
+                "success": True,
+                "data": {"id": "stars-999", "title": "别的片",
+                         "videoSources": [{"type": "raw_1080p",
+                                           "url": "https://static.worldstatic.com/v.m3u8"}],
+                         "subtitles": [{"language": "zh", "format": "vtt",
+                                        "filePath": "https://static.worldstatic.com/zh.vtt"}]},
+            })), None
+        raise AssertionError(f"another title's subs must never be fetched: {url}")
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert missav.find_getav_subtitle_for_code("SONE-543", str(tmp_path)) is None
+
+
+def test_find_getav_subtitle_bad_code_no_http(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        raise AssertionError(f"no HTTP for a bad code: {url}")
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert missav.find_getav_subtitle_for_code("", str(tmp_path)) is None
+    assert missav.find_getav_subtitle_for_code("../etc/passwd", str(tmp_path)) is None
 
 
 # ─── packed JS ─────────────────────────────────────────────────────────────────
