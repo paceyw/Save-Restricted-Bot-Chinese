@@ -469,7 +469,7 @@ def extract_m3u8_url(html):
 
     Primary match is ``source=…``; fallback is any m3u8 URL in the block.
     """
-    for script in re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL):
+    for script in re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.IGNORECASE):
         if "eval(function" not in script or "m3u8" not in script:
             continue
         unpacked = unpack_packed_js(script)
