@@ -15,6 +15,10 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1]
 
+# utils.missav imports config (transcode budget knobs); config hard-requires
+# these keys at import time, so default them for hermetic test runs.
+os.environ.setdefault("MASTER_KEY", "missav-test-master")
+os.environ.setdefault("IV_KEY", "missav-test-iv")
 spec = importlib.util.spec_from_file_location("missav_mod", SRC / "utils" / "missav.py")
 missav = importlib.util.module_from_spec(spec)
 sys.modules["missav_mod"] = missav

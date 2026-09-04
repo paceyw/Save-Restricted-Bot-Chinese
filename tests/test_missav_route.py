@@ -151,6 +151,21 @@ def ytdl(monkeypatch):
     func.get_video_metadata = None
     func.screenshot = None
     func.touch_file = None
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     config = types.ModuleType("config")

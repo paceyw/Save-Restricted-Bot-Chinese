@@ -1,4 +1,5 @@
 import asyncio
+import os
 import importlib
 import sys
 import time
@@ -240,6 +241,9 @@ def real_pipeline_env(monkeypatch, tmp_path):
 
     config = types.ModuleType("config")
     config.LOG_GROUP = 0
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     config.MAX_FLOOD_RETRIES = 2
     config.UPLOAD_INTERVAL = 0
     config.PROGRESS_MIN_INTERVAL = 0.0
@@ -268,6 +272,22 @@ def real_pipeline_env(monkeypatch, tmp_path):
     func.get_video_metadata = None
     func.ensure_audio_track = None
     func.touch_file = lambda *_args, **_kwargs: None
+
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     func.VIDEO_EXTENSIONS = set()
     func.AUDIO_EXTENSIONS = set()
     func.get_user_data = lambda _uid: None
@@ -279,6 +299,10 @@ def real_pipeline_env(monkeypatch, tmp_path):
     plugins = types.ModuleType("plugins")
     plugins.__path__ = [str(Path(__file__).resolve().parents[1] / "plugins")]
     monkeypatch.setitem(sys.modules, "plugins", plugins)
+    settings_stub = types.ModuleType("plugins.settings")
+    settings_stub.rename_file = None
+    monkeypatch.setitem(sys.modules, "plugins.settings", settings_stub)
+
     fetch = types.ModuleType("plugins.fetch")
     fetch.fetch_origin = {}
     fetch.get_msg = None
@@ -671,7 +695,12 @@ def test_real_batch_links_pipeline_delivers_photos_and_cleans(real_pipeline_env)
 
     downloads_dir = env.workdir / "downloads"
     assert downloads_dir.exists()
-    assert list(downloads_dir.iterdir()) == []
+    # batch task: files are gone per-message; the task-dir husk is removed
+    # by the worker's finally (cleanup_task_downloads) — mirror that net here
+    task_dir = downloads_dir / f'task_{task["id"]}'
+    assert list(task_dir.iterdir()) == [] if task_dir.exists() else True
+    env.tasks.cleanup_task_downloads(task["id"])
+    assert not task_dir.exists()
     sent_progress_ids = [message.id for _chat, _text, message in env.main_bot.sent]
     deleted_progress_ids = [message_id for _chat, message_id in env.main_bot.deleted]
     assert sent_progress_ids == deleted_progress_ids
@@ -711,7 +740,12 @@ def test_real_batch_links_cancel_aborts_completed_prefetch(real_pipeline_env):
     assert all(not Path(record["path"]).exists() for record in env.uc.downloads)
     downloads_dir = env.workdir / "downloads"
     assert downloads_dir.exists()
-    assert list(downloads_dir.iterdir()) == []
+    # batch task: files are gone per-message; the task-dir husk is removed
+    # by the worker's finally (cleanup_task_downloads) — mirror that net here
+    task_dir = downloads_dir / f'task_{task["id"]}'
+    assert list(task_dir.iterdir()) == [] if task_dir.exists() else True
+    env.tasks.cleanup_task_downloads(task["id"])
+    assert not task_dir.exists()
     sent_progress_ids = [message.id for _chat, _text, message in env.main_bot.sent]
     deleted_progress_ids = [message_id for _chat, message_id in env.main_bot.deleted]
     assert sent_progress_ids == deleted_progress_ids

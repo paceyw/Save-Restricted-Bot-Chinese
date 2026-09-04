@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re as _re
 import importlib.util
 import sys
@@ -42,6 +43,15 @@ class _FakeApp:
             return function
 
         return decorator
+
+    async def send_message(self, chat, text, *args, **kwargs):
+        return types.SimpleNamespace(id=1)
+
+    async def edit_message_text(self, chat, mid, text, *args, **kwargs):
+        return None
+
+    async def delete_messages(self, chat, mids, *args, **kwargs):
+        return None
 
 
 class _FakeReply:
@@ -127,6 +137,9 @@ def batch_module(monkeypatch):
     config.MERGE_INTERVAL = 0.01
     config.CHANNEL_INTERVAL = 0.01
     config.UPLOAD_INTERVAL = 0.01
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     config.MAX_FLOOD_RETRIES = 1
     monkeypatch.setitem(sys.modules, "config", config)
 
@@ -139,6 +152,22 @@ def batch_module(monkeypatch):
     func.thumbnail = None
     func.get_video_metadata = None
     func.touch_file = lambda *_a, **_k: None
+
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     func.ensure_audio_track = None
     func.VIDEO_EXTENSIONS = set()
     func.AUDIO_EXTENSIONS = set()
@@ -382,6 +411,19 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
         return text
 
     class FailingBot:
+        def __init__(self):
+            self.downloaded = None
+
+        async def download_media(self, msg, file_name=None, **kwargs):
+            # the harness _WORKDIR (/persistent) is fictional: hand back a
+            # real temp file, as pyrogram would return the resolved path
+            import tempfile, pathlib
+            fd, path = tempfile.mkstemp(suffix=".jpg")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"photo")
+            self.downloaded = path
+            return path
+
         async def send_photo(self, *args, **kwargs):
             raise RuntimeError("PEER_ID_INVALID")
 
@@ -398,6 +440,11 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
     )
     module.get_user_data_key = get_key
     module.process_text_with_rules = process_text
+    # the fallback path now runs deeper than the old early return: give the
+    # deliver module callable metadata helpers for the re-upload phase
+    deliver_mod = sys.modules["plugins.deliver"]
+    deliver_mod.thumbnail = lambda uid: None
+    deliver_mod.get_video_metadata = None
 
     result = asyncio.run(
         module.process_msg(
@@ -412,7 +459,11 @@ def test_process_msg_does_not_report_direct_send_success_on_error(batch_module):
         )
     )
 
-    assert result.startswith("发送失败：")
+    # PEER_ID_INVALID now falls back to download+re-upload (review round 1);
+    # when the re-upload ALSO fails with PEER_ID_INVALID the result is the
+    # upload-failure string with the bot-permission hint — never a fake
+    # direct-send success.
+    assert result.startswith("上传失败：")
     assert "Sent directly" not in result
 
 
@@ -1504,7 +1555,7 @@ def test_dispatch_snapshots_settings_once_for_single_message_chain(batch_module)
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             ubot, uc, message, d, lt, uid, i, oc, settings=settings
         )
@@ -1560,7 +1611,7 @@ def test_dispatch_chain_fails_loudly_on_any_extra_users_read(batch_module):
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             ubot, uc, message, d, lt, uid, i, oc, settings=settings
         )
@@ -1772,7 +1823,7 @@ def test_task_chain_performs_exactly_one_real_find_one(batch_module, monkeypatch
         caption=None,
     )
 
-    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings):
+    async def process_one_link(ubot, uc, i, s, lt, d, uid, oc=None, comment_id=None, *, settings, task_id=None):
         return await module.process_msg(
             DeliveryClient(), DeliveryClient(), message, d, lt, uid, i, oc,
             settings=settings,

@@ -12,7 +12,19 @@
 # License: MIT License
 # ---------------------------------------------------
 
-import yt_dlp
+def _require_yt_dlp():
+    """Import yt_dlp on first use (plan §5.4).
+
+    yt_dlp and its dependency tree are the heaviest imports in the bot and
+    only /dl and /adl site paths need them. Lazy loading keeps idle RSS down
+    and, if the install is broken, degrades only yt-dlp-backed commands at
+    task time instead of killing plugin load — and with it the whole bot
+    startup (main.py does not isolate per-plugin import failures).
+    """
+    import yt_dlp
+    return yt_dlp
+
+
 import os
 import tempfile
 import time
@@ -28,8 +40,9 @@ from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaPhoto, InputMediaVideo,
 )
-from utils.func import get_video_metadata, screenshot, touch_file
+from utils.func import get_video_metadata, screenshot, touch_file, task_downloads_dir
 from utils.missav import (
+    _hashtag,
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
     MissAVError,
@@ -54,8 +67,6 @@ from config import (
     PROGRESS_MIN_INTERVAL,
     YT_COOKIES,
 )
-from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
-from mutagen.mp3 import MP3
  
 logger = logging.getLogger(__name__)
  
@@ -89,7 +100,7 @@ def _task_result(task_id, result):
     task_update(task_id, progress_msg='', result=result)
 
 
-UPLOAD_HEADER = "╭─────────────────────╮\n│      **__上传中__**\n├─────────────────────"
+UPLOAD_HEADER = "╭───────────────────────────\n│ **__⬆️ 上传中__**\n├───────────────────────────"
  
 def d_thumbnail(thumbnail_url, save_path, timeout=(5, 20), max_bytes=10 * 1024 * 1024):
     try:
@@ -132,7 +143,7 @@ async def download_thumbnail_async(url, path):
  
 async def extract_audio_async(ydl_opts, url):
     def sync_extract():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
     return await asyncio.get_event_loop().run_in_executor(thread_pool, sync_extract)
  
@@ -149,9 +160,18 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
             temp_cookie_file.write(cookies)
             temp_cookie_path = temp_cookie_file.name
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
-    random_filename = os.path.join(download_dir, f"@team_spy_pro_{message.from_user.id}")
+    # Task-scoped scratch dir (plan §5.2, review finding): the fixed
+    # @team_spy_pro_<uid>.mp3 path leaked on cancellation/crash because the
+    # worker's task-dir net could not see it. Falls back to the shared
+    # downloads dir for direct (non-queued) calls.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
+    random_filename = os.path.join(
+        download_dir, f"@team_spy_pro_{message.from_user.id}_{get_random_string()}"
+    )
     download_path = f"{random_filename}.mp3"
     thumbnail_path = None
 
@@ -178,6 +198,10 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
         if os.path.exists(download_path):
             def edit_metadata():
                 nonlocal thumbnail_path
+                # mutagen only serves MP3 tagging (plan §5.4): load it here
+                # so /dl video tasks and idle startup never pay for it.
+                from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
+                from mutagen.mp3 import MP3
                 audio_file = MP3(download_path, ID3=ID3)
                 try:
                     audio_file.add_tags()
@@ -268,7 +292,7 @@ async def run_adl(message, url, task_id=None):
 
 
 async def fetch_video_info(url, ydl_opts, progress_message, check_duration_and_size):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=False)
 
         if check_duration_and_size:
@@ -285,7 +309,7 @@ async def fetch_video_info(url, ydl_opts, progress_message, check_duration_and_s
         return info_dict
 
 def download_video(url, ydl_opts):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with _require_yt_dlp().YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
 
@@ -467,6 +491,88 @@ async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=Non
             await message.reply_text("**__-sub 仅支持 getav 视频页，忽略该参数__**")
         await process_video(message, url, None, check_duration_and_size=False, task_id=task_id)
 
+def build_ytdlp_caption(info, title, width=0, height=0, duration=0,
+                        filesize=0, max_len=1024):
+    """Caption for generic yt-dlp sites (xvideos & friends), mirroring the
+    missav five-block skeleton with the metadata yt-dlp actually exposes:
+
+        **title**\n\n<uploader | 1080p | 12:34 | 129 MB>\n\n标签：#tag #tag\n类别：#cat
+
+    tags/categories become hashtags (deduped, capped at 10 each); blocks
+    with no data are omitted; overlong captions trim hashtag tails then
+    hard-truncate. Falls back to the legacy bold title when info is empty
+    (identical to the pre-2026-09-04 behavior).
+    """
+    title = (title or "").strip()
+    if not isinstance(info, dict):
+        info = {}
+
+    def pick_str(key):
+        value = info.get(key)
+        return str(value).strip() if isinstance(value, (str, int)) and str(value).strip() else ""
+
+    uploader = pick_str("uploader") or pick_str("channel") or pick_str("uploader_id")
+    res = f"{height}p" if height and height > 0 else ""
+    if duration and duration > 0:
+        mins, secs = divmod(int(duration), 60)
+        hours, mins = divmod(mins, 60)
+        dur = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
+    else:
+        dur = ""
+    size = f"{filesize / (1024 * 1024):.0f} MB" if filesize and filesize > 0 else ""
+
+    info_bits = [b for b in (uploader, res, dur, size) if b]
+    info_line = " | ".join(info_bits)
+
+    def hashtags(key, cap=10):
+        raw = info.get(key) or []
+        if isinstance(raw, str):
+            raw = [raw]
+        seen, out = set(), []
+        for item in raw[:50]:
+            tag = _hashtag(str(item))
+            if tag and tag.lower() not in seen:
+                seen.add(tag.lower())
+                out.append(tag)
+            if len(out) >= cap:
+                break
+        return out
+
+    tags = hashtags("tags")
+    cats = hashtags("categories")
+
+    blocks = []
+    if title:
+        blocks.append(f"**{title[:500]}**")
+    if info_line:
+        blocks.append(info_line)
+    tag_lines = []
+    if tags:
+        tag_lines.append("标签：" + " ".join(tags))
+    if cats:
+        tag_lines.append("类别：" + " ".join(cats))
+    if tag_lines:
+        blocks.append("\n".join(tag_lines))
+    if not blocks:
+        return f"**{title[:500]}**" if title else ""
+
+    rendered = "\n\n".join(blocks)
+    # trim hashtag tails first, then hard-truncate
+    while len(rendered) > max_len and tag_lines:
+        for i in reversed(range(len(tag_lines))):
+            parts = tag_lines[i].split(" ")
+            if len(parts) > 2:
+                tag_lines[i] = " ".join(parts[:-1])
+                break
+        else:
+            break
+        if tag_lines[-1] and len(tag_lines[-1].split(" ")) <= 1 and len(tag_lines) > 1:
+            tag_lines.pop()
+        blocks[-1] = "\n".join(tag_lines)
+        rendered = "\n\n".join(blocks)
+    return rendered[:max_len]
+
+
 async def _finalize_and_upload(message, download_path, title, thumbnail_url,
                                progress_message, extra_meta=None, task_id=None):
     """Probe metadata, resolve a thumbnail (download → screenshot fallback),
@@ -476,6 +582,12 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
     ``download_path``.
     """
     chat_id = message.chat.id
+    # Delivery routing (2026-09-04 xvideos incident): generic yt-dlp sites
+    # used to upload straight to the requesting private chat, ignoring the
+    # user's designated channel. Route through the same resolver the
+    # missav/getav path uses: settings chat -> LOG_GROUP -> requesting chat,
+    # channel targets served by the /setbot custom bot when available.
+    target_chat, sender = await _resolve_delivery(message)
     download_dir = os.path.dirname(download_path)
     extra = extra_meta or {}
     thumbnail_file = None
@@ -511,15 +623,23 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
                     os.chdir(previous_cwd)
             screenshot_file = THUMB
 
-        # clamp remote titles: Telegram captions cap at 1024 chars and a
-        # hostile og:title must not fail the upload after the full download
-        caption = f"**{title[:500]}**"
+        # five-block caption from the page's own metadata (tags/categories
+        # as hashtags); clamped internally to Telegram's 1024-char caption
+        # limit so a hostile og:title cannot fail the upload post-download
+        filesize = os.path.getsize(download_path) if os.path.exists(download_path) else 0
+        caption = build_ytdlp_caption(
+            extra, title, width=width, height=height,
+            duration=duration, filesize=filesize,
+        )
         # Telegram bot API single-file limit is 2 GB; larger files are split.
         SIZE = 2 * 1024 * 1024 * 1024
-        if os.path.exists(download_path) and os.path.getsize(download_path) > SIZE:
+        if filesize > SIZE:
             prog = await app.send_message(chat_id, "**__开始上传...__**")
             _report_task(task_id, '上传中（>2GB 分片）...')
-            await split_and_upload_file(app, chat_id, download_path, caption)
+            await split_and_upload_file(
+                sender, target_chat, download_path, caption,
+                progress_client=app, progress_chat=chat_id,
+            )
             await prog.delete()
             await _safe_delete(progress_message)
             _task_result(task_id, '✅ 上传完成（>2GB 分片）')
@@ -528,8 +648,12 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
         if os.path.exists(download_path):
             prog = await app.send_message(chat_id, "**__开始上传...__**")
             _report_task(task_id, '上传中...')
-            await app.send_video(
-                chat_id,
+            if target_chat != chat_id:
+                logger.info(
+                    "site download delivering to target %s via %s",
+                    target_chat, getattr(sender, 'name', sender))
+            await sender.send_video(
+                target_chat,
                 video=download_path,
                 caption=caption,
                 duration=duration,
@@ -597,8 +721,14 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
                             extra_dl_kwargs=None, task_id=None):
 
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
+    # Task-scoped scratch dir (plan §5.2): the whole download lives in
+    # downloads/task_<id>/ and the worker's finally-rmtree removes the dir
+    # even if this coroutine dies mid-upload.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
 
     async def progress(done, total, stage):
@@ -638,6 +768,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
             hosts=hosts,
             concurrency=MISSAV_SEGMENT_CONCURRENCY,
             progress=progress,
+            task_id=task_id,
             **(extra_dl_kwargs or {}),
         )
         caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or f'{site} 视频'}**"
@@ -650,7 +781,7 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
 
         await _safe_delete(progress_message)
         _report_task(task_id, f'{site} 下载完成，上传相册中...')
-        target_chat, sender = await _resolve_missav_delivery(message)
+        target_chat, sender = await _resolve_delivery(message)
         try:
             await _upload_missav_album(
                 sender, target_chat, message.chat.id, download_path,
@@ -882,8 +1013,10 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
             shutil.rmtree(os.path.dirname(video_paths[0]), ignore_errors=True)
 
 
-async def _resolve_missav_delivery(message):
-    """Pick the missav delivery target/sender, mirroring resolve_delivery:
+async def _resolve_delivery(message):
+    """Pick the delivery target/sender for site downloads (was missav-only):
+
+    per-user settings chat -> LOG_GROUP -> the requesting chat. Channel
     per-user settings chat -> LOG_GROUP -> the requesting chat. Channel
     targets are served by the user's /setbot bot when available (same
     membership rules as the fetch flow), else the main bot."""
@@ -917,8 +1050,14 @@ async def _safe_delete(message):
 async def process_video(message, url, cookies, check_duration_and_size=False, task_id=None):
     logger.info(f"Received link: {url}")
 
-    download_dir = os.path.join(_WORKDIR, 'downloads')
-    os.makedirs(download_dir, exist_ok=True)
+    # Task-scoped scratch dir (plan §5.2): the whole download lives in
+    # downloads/task_<id>/ and the worker's finally-rmtree removes the dir
+    # even if this coroutine dies mid-upload.
+    if task_id:
+        download_dir = task_downloads_dir(task_id)
+    else:
+        download_dir = os.path.join(_WORKDIR, 'downloads')
+        os.makedirs(download_dir, exist_ok=True)
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
     logger.info(f"Generated random download path: {download_path}")
 
@@ -973,13 +1112,23 @@ async def process_video(message, url, cookies, check_duration_and_size=False, ta
             os.remove(temp_cookie_path)
 
 
-async def split_and_upload_file(app, sender, file_path, caption):
+async def split_and_upload_file(upload_client, upload_chat, file_path, caption,
+                                progress_client=None, progress_chat=None):
+    """Split >2GB files into playable parts and send each to upload_chat.
+
+    ``upload_client`` may be the user's /setbot bot when the target is a
+    channel; progress messages go to progress_chat (default: same chat) via
+    progress_client so the user's private chat stays clean when delivering
+    to a channel.
+    """
+    pclient = progress_client or upload_client
+    pchat = progress_chat if progress_chat is not None else upload_chat
     if not os.path.exists(file_path):
-        await app.send_message(sender, "❌ 未找到文件！")
+        await pclient.send_message(pchat, "❌ 未找到文件！")
         return
 
     file_size = os.path.getsize(file_path)
-    start = await app.send_message(sender, f"ℹ️ 文件大小：{file_size / (1024 * 1024):.2f} MB")
+    start = await pclient.send_message(pchat, f"ℹ️ 文件大小：{file_size / (1024 * 1024):.2f} MB")
     PART_SIZE = int(1.9 * 1024 * 1024 * 1024)
     CHUNK_SIZE = 8 * 1024 * 1024
 
@@ -1003,9 +1152,9 @@ async def split_and_upload_file(app, sender, file_path, caption):
 
                 edit = None
                 try:
-                    edit = await app.send_message(sender, f"⬆️ 正在上传第 {part_number + 1} 部分...")
+                    edit = await pclient.send_message(pchat, f"⬆️ 正在上传第 {part_number + 1} 部分...")
                     part_caption = f"{caption} \n\n**第 {part_number + 1} 部分：**"
-                    await app.send_document(sender, document=part_file, caption=part_caption,
+                    await upload_client.send_document(upload_chat, document=part_file, caption=part_caption,
                         progress=progress_bar,
                         progress_args=(UPLOAD_HEADER, edit, time.time(), part_file)
                     )
@@ -1028,13 +1177,7 @@ async def split_and_upload_file(app, sender, file_path, caption):
     os.remove(file_path)
 
 
-PROGRESS_BAR = """
-│ **__已完成：__** {1}/{2}
-│ **__字节：__** {0}%
-│ **__速度：__** {3}/秒
-│ **__预计剩余时间：__** {4}
-╰─────────────────────╯
-"""
+PROGRESS_BAR = " {0}%\n│ **__已完成：__** {1} / {2}\n│ **__速度：__** {3}/秒\n│ **__预计剩余：__** {4}\n╰───────────────────────────"
 
 async def get_seconds(time_string: str) -> int:
     """

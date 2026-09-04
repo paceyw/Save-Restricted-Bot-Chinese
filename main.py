@@ -1,14 +1,26 @@
 # Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
+# Licensed under the GNU General Public License v3.0  
 # See LICENSE file in the repository root for full license text.
 
 import asyncio
 import inspect
+import os
+import signal
+import sys
+
+from utils.logging_setup import setup_logging
+
+setup_logging()
+
+import logging
+
+logger = logging.getLogger(__name__)
+
 from shared_client import app, start_client, userbot
 from utils.func import init_db_indexes
+from utils.health import HealthServer
 import importlib
-import os
-import sys
+
 
 async def load_and_run_plugins():
     await start_client()
@@ -34,42 +46,62 @@ async def _stop_if_connected(instance, method_name):
             connected = await connected
         if not connected:
             return
-
         result = getattr(instance, method_name)()
         if inspect.isawaitable(result):
             await result
     except Exception as e:
-        print(f"Error stopping client: {e}")
+        logger.warning("error stopping client: %s", e)
 
 
 async def stop_clients():
     await _stop_if_connected(app, "stop")
     await _stop_if_connected(userbot, "stop")
 
+
 async def main():
+    """Single-process lifecycle: DB indexes -> health server -> plugins.
+
+    The health server (welcome page + /healthz) runs inside this event loop,
+    replacing the old standalone Flask process. SIGTERM/SIGINT set the stop
+    event; the finally block then stops the health server and both Telegram
+    clients before the process exits.
+    """
+    logger.info("bot main starting")
     await init_db_indexes()
-    await load_and_run_plugins()
-    while True:
-        await asyncio.sleep(1)  
+
+    health = HealthServer(port=int(os.environ.get("PORT", "5000")))
+    await health.start()
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # non-main thread or unsupported platform: default kill applies
+
+    try:
+        await load_and_run_plugins()
+        await stop.wait()
+        logger.info("shutdown signal received")
+    finally:
+        await health.stop()
+        await stop_clients()
+
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    print("Starting clients ...")
+    # pyrofork's Dispatcher captures asyncio.get_event_loop() at import time
+    # (shared_client module level) and binds its worker tasks + handler
+    # registrations to that loop. asyncio.run() always creates a DIFFERENT
+    # loop, which froze the dispatcher silently (bot connected but deaf).
+    # Run main() on the same import-time loop instead.
     try:
+        loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
     except KeyboardInterrupt:
-        print("Shutting down...")
+        logger.info("interrupted from keyboard")
     except Exception as e:
-        print(e)
+        logger.exception("fatal error in main loop: %s", e)
         sys.exit(1)
     finally:
-        try:
-            if not loop.is_closed():
-                loop.run_until_complete(stop_clients())
-        except Exception as e:
-            print(f"Error during shutdown: {e}")
-        finally:
-            try:
-                loop.close()
-            except Exception:
-                pass
+        logger.info("process exiting")

@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import re
+import secrets
 import time
 import inspect
 from config import BATCH_INTERVAL, CHANNEL_INTERVAL, MERGE_INTERVAL
@@ -13,7 +14,10 @@ except ImportError:
     # Legacy config shims (test fixtures) predate the adaptive floor: pin the
     # floor to the ceiling so the limiter degenerates to the old fixed sleep.
     BATCH_MIN_INTERVAL = BATCH_INTERVAL
-from utils.func import get_user_data, filter_settings, cred_epoch, prune_cred_epochs
+from utils.func import (
+    get_user_data, filter_settings, cred_epoch, prune_cred_epochs,
+    cleanup_task_downloads, disk_free_ok,
+)
 from utils.ratelimit import RateLimiter
 from plugins import fetch as fetch_module
 from plugins.fetch import (
@@ -87,11 +91,18 @@ def _has_active_task(uid):
 
 
 
+# Per-boot nonce: task ids feed filesystem paths (utils.func.task_downloads_dir).
+# uid+time+seq alone are NOT unique across process restarts — a worker restart
+# within the same second could reuse a dead task's id and mix its orphan files
+# into the new task's scratch dir (review round 1).
+_BOOT_NONCE = secrets.token_hex(3)
+
+
 def create_task(uid, task_type, total, **params):
     """Create a task descriptor and register it in TASKS."""
     global _TASK_SEQ
     _TASK_SEQ += 1
-    tid = f'task_{uid}_{int(time.time())}_{_TASK_SEQ}'
+    tid = f'task_{uid}_{int(time.time())}_{_BOOT_NONCE}{_TASK_SEQ:03d}'
     task = {
         'id': tid,
         'uid': uid,
@@ -131,6 +142,31 @@ async def _task_worker(uid):
     queue = USER_QUEUES[uid]
     while True:
         task = await queue.get()
+        # A cancellation requested while queued wins over every other
+        # terminal state — including the disk refusal below (review round 1:
+        # /stop on a queued task must report cancelled, not failed/disk-full).
+        if task.get('cancel_requested'):
+            task['status'] = 'cancelled'
+            task['result'] = '已取消。'
+            task['finished_at'] = time.time()
+            _prune_task_history(uid)
+            queue.task_done()
+            continue
+        # Disk watermark (plan §5.2): refuse NEW tasks while free space is
+        # under the floor; already-running tasks keep their bytes.
+        ok, free_gb = disk_free_ok()
+        if not ok:
+            task['status'] = 'failed'
+            # exact free-space figures stay in server logs, not user results
+            print(f'Task {task["id"]} refused: disk watermark reached ({free_gb:.1f}GB free)')
+            task['result'] = (
+                '❌ 服务器磁盘空间不足，已拒绝新任务，'
+                '请稍后重试或联系管理员清理'
+            )
+            task['finished_at'] = time.time()
+            _prune_task_history(uid)
+            queue.task_done()
+            continue
         task['status'] = 'running'
         try:
             await _dispatch_task(uid, task)
@@ -146,6 +182,10 @@ async def _task_worker(uid):
         finally:
             task['finished_at'] = time.time()
             _prune_task_history(uid)
+            # Last-resort net (plan §5.2): whatever per-file cleanup missed,
+            # the task-scoped scratch dir goes away with the task — success,
+            # failure, cancellation and crash paths alike.
+            cleanup_task_downloads(task['id'])
             queue.task_done()
 
 async def _dispatch_task(uid, task):
@@ -424,7 +464,7 @@ async def _run_batch_links(uid, task, doc, epoch):
         return await with_flood_retry(
             lambda: prepare_one_link(
                 ubot, uc, ci, di, lti, chat_id, uid, oc, comment_id,
-                settings=settings,
+                settings=settings, task_id=task['id'],
             ),
             context=f'{ci}/{di}',
             max_retries=2,
@@ -510,7 +550,7 @@ async def _run_single(uid, task, doc, epoch):
         try:
             return await process_one_link(
                 ubot, uc, ci, di, lt, chat_id, uid, oc, comment_id,
-                settings=settings,
+                settings=settings, task_id=task['id'],
             )
         except FloodWait as e:
             flood_seen = True
@@ -663,7 +703,7 @@ async def _run_merge(uid, task, doc, epoch):
         try:
             return await process_merged(
                 ubot, uc, all_msgs, chat_id, uid, oc,
-                settings=settings,
+                settings=settings, task_id=task['id'],
             )
         except FloodWait:
             flood_seen = True

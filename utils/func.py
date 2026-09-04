@@ -8,6 +8,7 @@ import re
 import json
 import logging
 import asyncio
+import shutil
 from copy import deepcopy
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -360,7 +361,24 @@ async def cleanup_stale_downloads(max_age_min=60):
         return
 
     cutoff = time.time() - (max_age_min * 60)
+    # Snapshot STALE dir candidates BEFORE deleting any file (file removal
+    # refreshes the parent dir's mtime). A dir qualifies by AGE, not by
+    # current emptiness: after stale files are deleted, os.rmdir drops the
+    # now-empty ones and safely no-ops on any dir still holding live files.
+    # Fresh dirs — including a task dir whose first file has not landed yet
+    # while the caller awaits network — are never candidates, no matter who
+    # invokes this sweeper or when (plan §5.2 lease/mtime protection).
+    stale_dirs = []
     removed = 0
+    for root, dirs, _files in os.walk(downloads, followlinks=False):
+        for d in dirs:
+            path = os.path.join(root, d)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    stale_dirs.append(path)
+            except OSError:
+                pass
+
     for root, _, filenames in os.walk(downloads, followlinks=False):
         for filename in filenames:
             path = os.path.join(root, filename)
@@ -371,6 +389,56 @@ async def cleanup_stale_downloads(max_age_min=60):
             except Exception:
                 pass
     logger.info("Removed %d stale downloads", removed)
+    # Task-scoped subdirs (plan §5.2): drop the pre-snapshotted stale dirs
+    # that are now empty.
+    for path in stale_dirs:
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+
+def task_downloads_dir(task_id, create=True):
+    """Per-task scratch dir under downloads/ (plan §5.2).
+
+    Task ids are unique by construction (uid + timestamp + per-boot seq), so
+    concurrent flows can never collide inside one dir, and the whole dir is
+    one rmtree away from a guaranteed no-leftover cleanup. Ids are validated
+    defensively: only [A-Za-z0-9_-] may reach the filesystem path, so no
+    future caller can smuggle traversal characters through.
+    """
+    from shared_client import _WORKDIR
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id))
+    path = os.path.join(_WORKDIR, 'downloads', f'task_{safe_id}')
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+def cleanup_task_downloads(task_id):
+    """Remove a finished task's scratch dir. Idempotent and never raises —
+    the last-resort net above every per-file cleanup path, so cancellation
+    or a crash mid-upload cannot leak the dir."""
+    path = task_downloads_dir(task_id, create=False)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def cleanup_task_downloads(task_id):
+    """Remove a finished task's scratch dir. Idempotent and never raises —
+    the last-resort net above every per-file cleanup path, so cancellation
+    or a crash mid-upload cannot leak the dir."""
+    path = task_downloads_dir(task_id, create=False)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def disk_free_ok():
+    """(ok, free_gb) of the runtime volume against DISK_FREE_MIN_GB.
+
+    Task-intake watermark (plan §5.2): when free space drops below the
+    floor, NEW tasks are refused with a clear message while already-running
+    tasks keep their bytes — no half-completed deliveries.
+    """
+    from config import DISK_FREE_MIN_GB
+    from shared_client import _WORKDIR
+    free = shutil.disk_usage(_WORKDIR).free
+    return free >= DISK_FREE_MIN_GB * 1024 ** 3, free / 1024 ** 3
 
 
 _touch_last = {}

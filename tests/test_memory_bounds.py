@@ -1,4 +1,5 @@
 import asyncio
+import os
 import importlib.util
 import sys
 import time
@@ -99,6 +100,9 @@ def batch_module(monkeypatch):
     config.MERGE_INTERVAL = 0
     config.CHANNEL_INTERVAL = 0
     config.UPLOAD_INTERVAL = 0
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     config.MAX_FLOOD_RETRIES = 1
     monkeypatch.setitem(sys.modules, "config", config)
 
@@ -122,6 +126,22 @@ def batch_module(monkeypatch):
     func.VIDEO_EXTENSIONS = set()
     func.AUDIO_EXTENSIONS = set()
     func.touch_file = lambda *_a, **_k: None
+
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     func.process_text_with_rules = None
     func.is_premium_user = None
     func.parse_link = lambda value: (None, None, None, None)

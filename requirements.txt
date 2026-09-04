@@ -8,16 +8,11 @@ attrs==26.1.0
 certifi==2026.7.22
 cffi==2.1.1
 charset-normalizer==3.4.9
-click==8.4.2
 cryptography==50.0.0
 curl-cffi==0.14.0
 dnspython==2.8.0
-Flask==2.2.5
 frozenlist==1.8.0
 idna==3.18
-itsdangerous==2.2.0
-Jinja2==3.1.6
-MarkupSafe==3.0.3
 motor==3.7.1
 m3u8==6.0.0
 multidict==6.7.1
@@ -38,7 +33,5 @@ PySocks==1.7.1
 requests==2.34.2
 typing_extensions==4.16.0
 urllib3==2.7.0
-# BUMPED from 2.2.2 (CVE-2023-25577)
-Werkzeug==2.2.3
 yarl==1.24.5
 yt-dlp==2026.7.4

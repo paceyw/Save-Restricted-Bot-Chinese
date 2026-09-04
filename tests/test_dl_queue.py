@@ -12,6 +12,7 @@ against a stubbed plugins.ytdl, proving:
 """
 
 import asyncio
+import os
 import importlib
 import sys
 import types
@@ -122,6 +123,21 @@ def queue_env(monkeypatch):
     func.get_user_data_key = lambda _uid, _key, _default=None: _default
     func.is_premium_user = lambda _uid: False
     func.parse_link = lambda _text: (None, None, None, None)
+    import shutil as _sh
+
+    def _task_dir(task_id, create=True):
+        # mirrors utils.func.task_downloads_dir semantics against the
+        # harness's stubbed shared_client._WORKDIR
+        base = getattr(sys.modules.get("shared_client"), "_WORKDIR", ".")
+        path = os.path.join(base, "downloads", f"task_{task_id}")
+        if create:
+            os.makedirs(path, exist_ok=True)
+        return path
+
+    func.task_downloads_dir = _task_dir
+    func.cleanup_task_downloads = lambda task_id: _sh.rmtree(
+        _task_dir(task_id, create=False), ignore_errors=True)
+    func.disk_free_ok = lambda: (True, 99.9)
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     custom_filters = types.ModuleType("utils.custom_filters")

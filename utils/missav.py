@@ -45,7 +45,7 @@ from html import unescape as html_unescape
 import tempfile as _tempfile
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import m3u8
+from config import BURN_CONCURRENCY, BURN_TIMEOUT_S, FFMPEG_BURN_THREADS
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger(__name__)
@@ -997,16 +997,36 @@ def extract_getav_details(data, url, family=None):
 
 # ─── ffmpeg remux ──────────────────────────────────────────────────────────────
 
-async def _run_ffmpeg(args):
-    """Await ffmpeg; thin seam for tests. Raises MissAVError on failure."""
+async def _run_ffmpeg(args, timeout_s=None):
+    """Await ffmpeg; thin seam for tests. Raises MissAVError on failure.
+
+    ``timeout_s`` (when > 0) bounds the wall-clock run: on expiry — and on
+    task cancellation — the child is killed and reaped so no orphan ffmpeg
+    keeps holding memory after the coroutine gives up. The raised MissAVError
+    carries ``exit_code`` for structured logging by callers.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, err = await proc.communicate()
+    try:
+        if timeout_s and timeout_s > 0:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout_s)
+        else:
+            _, err = await proc.communicate()
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise MissAVError(f"ffmpeg 超时 (>{timeout_s}s) 已终止: {args[:3]}")
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
     if proc.returncode != 0:
-        raise MissAVError(f"ffmpeg remux 失败: {err.decode(errors='replace')[-300:]}")
+        exc = MissAVError(f"ffmpeg remux 失败: {err.decode(errors='replace')[-300:]}")
+        exc.exit_code = proc.returncode
+        raise exc
 
 
 async def remux_to_mp4(src, dst):
@@ -1053,11 +1073,21 @@ def _escape_filter_path(path):
 
 
 def _burn_threads():
-    """Encode threads: leave one core for the bot itself."""
+    """Encode threads: explicit FFMPEG_BURN_THREADS wins, else leave one core
+    for the bot itself (clamped 2..8, pre-config behavior)."""
+    if FFMPEG_BURN_THREADS > 0:
+        return FFMPEG_BURN_THREADS
     return max(2, min(8, (os.cpu_count() or 3) - 1))
 
 
-async def burn_subtitles_to_mp4(src, dst, subtitle_path):
+# Independent budget for the libx264 re-encode: MISSAV_MAX_JOBS bounds the
+# whole HLS pipeline (download+merge+burn+upload), so with the default 2 jobs
+# two burns could still run back-to-back and blow the 512M cgroup. This
+# semaphore serializes the re-encode itself (plan Phase 1 §4.2).
+_burn_slots = asyncio.Semaphore(BURN_CONCURRENCY)
+
+
+async def burn_subtitles_to_mp4(src, dst, subtitle_path, task_id=None):
     """Re-encode TS -> MP4 with Chinese subtitles rendered INTO the frame.
 
     Full libx264 re-encode (the only way to burn subs): measured on the
@@ -1065,6 +1095,10 @@ async def burn_subtitles_to_mp4(src, dst, subtitle_path):
     movie), peak RSS ~0.5GB. The subtitles filter matches cues against
     the 0-based frame timeline, which is exactly how getav's player
     authors its VTTs, so no offset correction is needed.
+
+    Concurrency is bounded by BURN_CONCURRENCY; every run logs start/end
+    with sizes, duration and exit status (task ids only — never URLs,
+    sessions, tokens or user content).
     """
     if not shutil.which("ffmpeg"):
         raise MissAVError("服务器缺少 ffmpeg，无法烧录字幕")
@@ -1072,15 +1106,35 @@ async def burn_subtitles_to_mp4(src, dst, subtitle_path):
         f"subtitles={_escape_filter_path(subtitle_path)}"
         f":force_style='{_SUBTITLE_FORCE_STYLE}'"
     )
-    await _run_ffmpeg([
-        "ffmpeg", "-y", "-loglevel", "error", "-i", src,
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", str(BURN_CRF),
-        "-threads", str(_burn_threads()),
-        "-c:a", "copy", "-movflags", "+faststart", dst,
-    ])
+    threads = _burn_threads()
+    input_bytes = os.path.getsize(src) if os.path.isfile(src) else 0
+    started = time.monotonic()
+    logger.info(
+        "burn.start task=%s input_bytes=%d threads=%d preset=%s crf=%d",
+        task_id, input_bytes, threads, BURN_PRESET, BURN_CRF,
+    )
+    try:
+        async with _burn_slots:
+            await _run_ffmpeg([
+                "ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", str(BURN_CRF),
+                "-threads", str(threads),
+                "-c:a", "copy", "-movflags", "+faststart", dst,
+            ], timeout_s=BURN_TIMEOUT_S)
+    except MissAVError as exc:
+        logger.warning(
+            "burn.fail task=%s exit=%s input_bytes=%d duration_s=%.1f",
+            task_id, getattr(exc, "exit_code", "timeout"), input_bytes,
+            time.monotonic() - started,
+        )
+        raise
     if not os.path.isfile(dst) or os.path.getsize(dst) == 0:
         raise MissAVError("ffmpeg 未产出有效 MP4")
+    logger.info(
+        "burn.done task=%s input_bytes=%d output_bytes=%d duration_s=%.1f",
+        task_id, input_bytes, os.path.getsize(dst), time.monotonic() - started,
+    )
 
 
 _GETAV_SUB_LANG_RANK = {"zh": 3, "zh-hans": 3, "zhtw": 2, "zh-hant": 2}
@@ -1167,6 +1221,9 @@ async def _resolve_media_playlist(m3u8_url, headers, pinned_domain):
         )
         if resp is None or resp.status_code != 200:
             raise MissAVError(f"m3u8 获取失败: {err or getattr(resp, 'status_code', '?')}")
+        # m3u8 loads lazily (plan §5.4): only the missav/getav HLS path needs
+        # it, keeping idle import weight off every other bot command.
+        import m3u8
         playlist = m3u8.loads(resp.text or "")
         variant_uri = select_variant_uri(playlist)
         if not variant_uri:
@@ -1176,9 +1233,8 @@ async def _resolve_media_playlist(m3u8_url, headers, pinned_domain):
         url = _absolute(url, variant_uri)
     raise MissAVError("m3u8 嵌套层级过深，疑似改版")
 
-
-async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory, headers,
-                                pinned_domain, budget):
+async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
+                                headers, pinned_domain, budget):
     """Fetch (and decrypt) one TS segment to an index-named temp file.
 
     ``budget`` is a one-element list holding cumulative downloaded bytes
@@ -1232,7 +1288,7 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory, heade
 
 async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
                              concurrency=SEGMENT_CONCURRENCY, progress=None,
-                             subtitle_path=None):
+                             subtitle_path=None, task_id=None):
     """Shared missav/getav tail: m3u8 -> guarded segments -> merged mp4.
 
     ``info`` is {'title','thumbnail'}, ``details`` the caption
@@ -1345,7 +1401,7 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
         if subtitle_path:
             await _report(0, 1, "burn")
             try:
-                await burn_subtitles_to_mp4(merged, dest_path, subtitle_path)
+                await burn_subtitles_to_mp4(merged, dest_path, subtitle_path, task_id=task_id)
             except MissAVError:
                 # a broken subtitle/font must never lose the video itself
                 logger.warning("字幕烧录失败，回退无字幕封装", exc_info=True)
@@ -1364,7 +1420,8 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
 
 
 async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
-                          concurrency=SEGMENT_CONCURRENCY, progress=None):
+                          concurrency=SEGMENT_CONCURRENCY, progress=None,
+                          task_id=None):
     """Download a missav video page to ``dest_path`` (.mp4).
 
     ``progress`` is an optional async callable ``(done, total, stage)``
@@ -1383,11 +1440,12 @@ async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,
         m3u8_url, dest_path, host, info,
         extract_video_details(page_html, url),
         concurrency=concurrency, progress=progress,
+        task_id=task_id,
     )
 
 async def download_getav(url, dest_path, *, hosts=GETAV_DEFAULT_MIRRORS,
                          concurrency=SEGMENT_CONCURRENCY, progress=None,
-                         want_subtitle=False, source_url=None):
+                         want_subtitle=False, source_url=None, task_id=None):
     """Download a getav.net video page to ``dest_path`` (.mp4).
 
     Same contract as :func:`download_missav`: the movie JSON API is
@@ -1439,6 +1497,7 @@ async def download_getav(url, dest_path, *, hosts=GETAV_DEFAULT_MIRRORS,
             extract_getav_details(data, url, family),
             concurrency=concurrency, progress=progress,
             subtitle_path=subtitle_path,
+            task_id=task_id,
         )
     finally:
         if subtitle_path:

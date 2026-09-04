@@ -77,6 +77,19 @@ MISSAV_MAX_JOBS = max(1, int(os.getenv("MISSAV_MAX_JOBS", "2")))
 # MISSAV_SEGMENT_CONCURRENCY / MISSAV_MAX_JOBS（同一 HLS 管线、同一磁盘带宽预算）。
 GETAV_MIRRORS = [h.strip() for h in os.getenv("GETAV_MIRRORS", "").split(",") if h.strip()] or None
 
+# ─── TRANSCODE BUDGET (字幕烧录，Phase 1 §4.2) ──────────────────────────────────
+# 烧录是 libx264 全量重编码（实测峰值 RSS ~0.5GB），必须有独立并发预算，
+# 与 MISSAV_MAX_JOBS（整条 HLS 管线的信号量）分开：默认同一时刻只烧一部。
+BURN_CONCURRENCY = max(1, int(os.getenv("BURN_CONCURRENCY", "1")))
+# 编码线程数：0 = 按 CPU 数自动（旧行为 clamp 到 2..8）；>0 = 显式指定（如 3-vCPU 盒子设 3）
+FFMPEG_BURN_THREADS = int(os.getenv("FFMPEG_BURN_THREADS", "0"))
+# 单次烧录墙钟超时秒数：0 = 不限时；超时会 kill ffmpeg 并走既有的"回退无字幕封装"路径
+BURN_TIMEOUT_S = max(0, int(os.getenv("BURN_TIMEOUT_S", "10800")))
+
+# ─── DISK WATERMARK (任务准入，Phase 2 §5.2) ────────────────────────────────────
+# 运行卷剩余空间低于该值时拒绝新任务（已运行任务不受影响），避免半完成的错误投递
+DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "10"))
+
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
 JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
