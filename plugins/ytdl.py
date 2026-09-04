@@ -34,7 +34,8 @@ import string
 import requests
 import logging
 import math
-from urllib.parse import urlparse
+import re
+from urllib.parse import urlparse, quote, urljoin
 from shared_client import app, _WORKDIR
 from pyrogram import filters
 from pyrogram.types import (
@@ -45,16 +46,25 @@ from utils.func import get_video_metadata, screenshot, touch_file, task_download
 from utils.missav import (
     _hashtag,
     _registered_domain,
+    _CHROME_UA,
+    _http_get,
+    _looks_blocked,
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
     MissAVError,
     build_caption,
+    discover_missav_variants,
     download_getav,
     download_missav,
     fetch_getav_movie,
+    html_unescape,
     is_getav_url,
     is_missav_url,
     list_getav_sources,
+    mirror_candidates,
+    missav_base_slug,
+    missav_slug_family,
+    parse_missav_url,
 )
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
@@ -349,7 +359,8 @@ async def dl_handler(client, message):
     if len(parts) < 2:
         await message.reply_text(
             "**用法：** `/dl <video-link>`\n"
-            "getav 中文字幕烧录：`/dl -sub <getav链接>`（耗时约 40 分钟）\n\n"
+            "中文字幕烧录：`/dl -sub <getav或missav链接>`（需完整重编码，耗时较长）\n"
+            "番号搜索：`/search SSIS-405`，或直接发送番号文本\n\n"
             "请提供有效的视频链接！")
         return
 
@@ -381,6 +392,21 @@ async def dl_handler(client, message):
             return
         if len(versions) > 1:
             await _send_version_card(message, user_id, url, want_subtitle, versions)
+            return
+
+    # missav: probe the sister versions up-front so multi-version pages offer
+    # a selection card instead of silently downloading whatever variant was
+    # pasted (single-version pages keep the direct-enqueue path; a blocked
+    # probe degrades to the pasted page alone inside discover_missav_variants).
+    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    if is_missav_url(url, missav_hosts):
+        try:
+            variants = await discover_missav_variants(url, tuple(missav_hosts))
+        except Exception as e:
+            logger.warning("missav variant discovery failed: %s", e)
+            variants = []
+        if len(variants) > 1:
+            await _send_missav_card(message, user_id, url, want_subtitle, variants)
             return
 
     task = create_task(user_id, 'dl', 1, url=url, want_subtitle=want_subtitle, message=message)
@@ -499,6 +525,492 @@ except Exception:
     pass  # test stubs may not expose the hook
 
 
+# ─── missav version selection card (issue #17 wiring) ──────────────────────────
+# Same prompt/token/TTL/sweeper pattern as the getav card: /dl on a
+# multi-version missav page stops here and the user picks a variant. Each
+# variant is its OWN page URL (unlike getav where one URL pins a source),
+# so the callback enqueues the variant's URL directly. One open prompt per
+# user; stale prompts are answered as expired and swept.
+_MISSAV_PROMPTS = {}          # uid -> prompt dict
+_MISSAV_PROMPT_SEQ = 0        # token per prompt, embedded in callback data
+_MISSAV_CARD_ORDER = {"uc-cn": 0, "cn": 1, "uc": 2, "raw": 3}  # 推荐=uc-cn 最优
+
+
+async def _send_missav_card(message, uid, url, want_subtitle, variants):
+    global _MISSAV_PROMPT_SEQ
+    _MISSAV_PROMPT_SEQ += 1
+    token = f'{_MISSAV_PROMPT_SEQ:x}'
+    ordered = sorted(variants, key=lambda v: _MISSAV_CARD_ORDER.get(v[0], 9))
+    _MISSAV_PROMPTS[uid] = {
+        'token': token,
+        'url': url,
+        'want_subtitle': want_subtitle,
+        'message': message,
+        'variants': ordered,
+        'created_at': time.time(),
+    }
+    buttons = [
+        [InlineKeyboardButton(
+            ('⭐ ' if i == 0 else '') + label,
+            callback_data=f'mav:{token}:{i}')]
+        for i, (_variant, _vurl, label) in enumerate(ordered)
+    ]
+    buttons.append([InlineKeyboardButton('⏬ 全部下载', callback_data=f'mav:{token}:all')])
+    sub_note = '\n-sub 将烧录中文字幕（cn 版本自带字幕不重复烧录）' if want_subtitle else ''
+    await message.reply_text(
+        '🎬 **检测到多个版本，请选择要下载的版本：**\n'
+        '（⭐ 为自动推荐的默认版本；'
+        f'{_GETAV_PROMPT_TTL // 60} 分钟内有效，/stop 可取消）{sub_note}',
+        reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@app.on_callback_query(filters.regex(r'^mav:([0-9a-f]+):(all|\d+)$'))
+async def missav_version_callback(client, query):
+    uid = query.from_user.id
+    prompt = _MISSAV_PROMPTS.get(uid)
+    token, sel = query.matches[0].group(1), query.matches[0].group(2)
+    if (prompt is None or prompt['token'] != token
+            or time.time() - prompt['created_at'] > _GETAV_PROMPT_TTL):
+        try:
+            await query.answer('选择已过期，请重新发送 /dl', show_alert=True)
+        except Exception:
+            pass
+        return
+    variants = prompt['variants']
+    if sel == 'all':
+        combined = next((v for v in variants if v[0] == 'uc-cn'), None)
+        if combined:
+            picks = [combined]        # 组合页存在：只下组合（中字+无码已合一）
+        else:
+            picks = [v for v in variants if v[0] in ('cn', 'uc')]
+    else:
+        idx = int(sel)
+        if idx >= len(variants):
+            try:
+                await query.answer('无效的版本，请重新发送 /dl', show_alert=True)
+            except Exception:
+                pass
+            return
+        picks = [variants[idx]]
+    _MISSAV_PROMPTS.pop(uid, None)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    try:
+        await query.edit_text('✅ 正在加入队列...')
+    except Exception:
+        pass
+    await _enqueue_dl_tasks(uid, prompt['message'],
+                            [v[1] for v in picks],
+                            want_subtitle=prompt['want_subtitle'])
+
+
+async def _enqueue_dl_tasks(uid, message, urls, want_subtitle):
+    """Enqueue one /dl task per URL, re-checking the per-user queue cap for
+    EVERY task so「全部下载」stops cleanly at the first full check."""
+    from plugins.tasks import _MAX_QUEUE, create_task, enqueue_task, get_queue_size
+    for url in urls:
+        if get_queue_size(uid) >= _MAX_QUEUE:
+            await message.reply_text(
+                f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            return
+        task = create_task(uid, 'dl', 1, url=url, want_subtitle=want_subtitle,
+                           message=message)
+        if not await enqueue_task(uid, task):
+            await message.reply_text(
+                f'队列已满（{_MAX_QUEUE} 个任务排队中）。请使用 /tasks 查看，或 /stop 取消。')
+            return
+        qpos = get_queue_size(uid)
+        await message.reply_text(
+            '📦 下载任务已加入队列。\n'
+            f'位置：{"执行中" if qpos <= 1 else f"队列第 {qpos - 1} 位"}\n'
+            '使用 /tasks 查看进度。')
+
+
+def discard_missav_prompts(uid=None):
+    """Drop open missav version cards (/stop wiring + sweeper entry point)."""
+    if uid is None:
+        return len(_MISSAV_PROMPTS.clear() or _MISSAV_PROMPTS)
+    return 1 if _MISSAV_PROMPTS.pop(uid, None) is not None else 0
+
+
+async def _sweep_missav_prompts(now=None):
+    if now is None:
+        now = time.time()
+    for uid, prompt in list(_MISSAV_PROMPTS.items()):
+        if now - prompt['created_at'] > _GETAV_PROMPT_TTL:
+            _MISSAV_PROMPTS.pop(uid, None)
+
+
+try:
+    from plugins.tasks import register_sweep_hook
+    register_sweep_hook(_sweep_missav_prompts)
+except Exception:
+    pass  # test stubs may not expose the hook
+
+
+# ─── missav code search (issue #16, 规格 §2 方案A + D2) ────────────────────────
+# /search <code> — or a bare code typed as plain text (batch.py routes it
+# here) — lists up to 10 hits from https://{mirror}/search/{code} on a
+# cover card. Full-catalog search on purpose (D2 拍板): no filters param;
+# chinese/uncensored variants surface via slug badges. A single hit still
+# shows the card (D2 拍板, 防错下). Picking one discovers sister versions
+# (mav card when several exist, direct enqueue otherwise).
+_SEARCH_PROMPTS = {}          # uid -> prompt dict
+_SEARCH_PROMPT_SEQ = 0        # token per prompt, embedded in callback data
+_SEARCH_PAGE_SIZE = 6         # result rows per card page; footer nav on demand
+
+# 番号四层识别（插件1 思路）：FC2 / HEYZO / 纯数字 / 字母-数字，归一化为
+# CODE-123 供站内搜索使用。长前缀在前（FC2 不得落进字母-数字层）。
+_CODE_LAYERS = (
+    (re.compile(r"^FC2[-_ .]?(?:PPV)?[-_ .]?(\d{3,8})$"), "FC2-PPV-{}"),
+    (re.compile(r"^HEYZO[-_ .]?(\d{3,5})$"), "HEYZO-{}"),
+    (re.compile(r"^(\d{6})[-_ .](\d{3,4})$"), "{}-{}"),
+    (re.compile(r"^([A-Z]{2,7})[-_ .]?(\d{2,5})$"), "{}-{}"),
+)
+
+
+def _looks_like_url(text):
+    """Distinguish a pasted URL/host from a bare code like ``SSIS405``."""
+    s = (text or "").strip()
+    if "://" in s or " " in s:
+        return "://" in s
+    return bool(re.match(r"^[a-z0-9-]+(\.[a-z0-9-]+)+(/|\?|#|$)", s, re.IGNORECASE))
+
+
+def _normalize_video_code(text):
+    """番号归一化（插件1 四层思路）：FC2 / HEYZO / 纯数字 / 字母-数字。
+
+    'ssis405' / 'SSIS 405' / 'ssis-405' → 'SSIS-405'，FC2 系 →
+    'FC2-PPV-<数字>'，'092014_887' → '092014-887'；URL 与识别不了的
+    输入返回 None。
+    """
+    s = re.sub(r"\s+", " ", str(text or "").strip()).upper()
+    if not s or _looks_like_url(s):
+        return None
+    for pattern, template in _CODE_LAYERS:
+        m = pattern.match(s)
+        if m:
+            return template.format(*m.groups())
+    if re.fullmatch(r"\d{3,8}", s):        # bare numeric code
+        return s
+    return None
+
+
+_SEARCH_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*?href=(['\"])(.*?)\1[^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+_SEARCH_IMG_RE = re.compile(
+    r"<img\b[^>]*?(?:data-src|src)=(['\"])(.*?)\1", re.IGNORECASE)
+_SEARCH_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _result_badges(slug):
+    """搜索结果徽章：无码破解·中文字幕（叠加），与版本卡片命名一致。"""
+    lowered = (slug or "").lower()
+    badges = []
+    if any(t in lowered for t in ("uncensored-leak", "uncensored", "leak")):
+        badges.append("无码破解")
+    if "chinese-subtitle" in lowered or "ch-sub" in lowered:
+        badges.append("中文字幕")
+    if not badges:
+        family = missav_slug_family(lowered)
+        if family == "cn":
+            badges.append("中文字幕")
+        elif family == "uc":
+            badges.append("无码破解")
+    return "·".join(badges)
+
+
+def _parse_missav_search_html(html, base=None, hosts=None, limit=10):
+    """Parse a /search/<code> results page into result dicts.
+
+    Only anchors that parse as missav VIDEO pages count (listing/category
+    links are ignored); duplicates collapse by slug; capped at ``limit``
+    (D2: 10 条). Pure regex over the served HTML — tests use hand-made
+    fixtures, never the network.
+    """
+    out, seen = [], set()
+    for m in _SEARCH_ANCHOR_RE.finditer(html or ""):
+        href, body = m.group(2).strip(), m.group(3)
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        if base:
+            href = urljoin(base, href)
+        info = parse_missav_url(href, hosts or _MISSAV_DEFAULT_MIRRORS)
+        if not info:
+            continue
+        slug = info["slug"].lower()
+        if slug in seen:
+            continue
+        seen.add(slug)
+        title = re.sub(r"\s+", " ", _SEARCH_TAG_RE.sub(" ", body)).strip()
+        img = _SEARCH_IMG_RE.search(body)
+        if not title:
+            title = html_unescape(img.group(2)) if img else ""
+        title = html_unescape(title) if title else missav_base_slug(slug).upper()
+        thumb = ""
+        if img:
+            thumb = img.group(2).strip()
+            if base and not urlparse(thumb).netloc:
+                thumb = urljoin(base, thumb)
+        out.append({
+            "title": title,
+            "href": href,
+            "thumb": thumb,
+            "badges": _result_badges(slug),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _missav_search(code, hosts):
+    """站内搜索：任一镜像的 /search/{code} 解析出结果即返回。
+
+    Returns (results, None)；确认无结果 ([], None)；镜像全被 Cloudflare
+    拦/不可达时 (None, 中文错误提示)。同步函数（_http_get 是同步的），
+    调用方用 asyncio.to_thread 包一层。
+    """
+    hosts = tuple(hosts or ())
+    if not hosts:
+        return None, "**__未配置 missav 镜像，无法搜索__**"
+    search_url = f"https://{hosts[0]}/search/{quote(code)}"
+    saw_block = False
+    for candidate in mirror_candidates(search_url, hosts):
+        resp, err = _http_get(candidate, headers={"User-Agent": _CHROME_UA})
+        if resp is None:
+            logger.info("missav search unreachable %s: %s", candidate, err)
+            continue
+        text = resp.text or ""
+        if resp.status_code == 404:
+            return [], None
+        if _looks_blocked(resp, text):
+            saw_block = True
+            logger.info("missav search blocked %s (status %s)",
+                        candidate, resp.status_code)
+            continue
+        if resp.status_code != 200:
+            continue
+        results = _parse_missav_search_html(text, base=candidate, hosts=hosts)
+        if results:
+            return results, None
+        return [], None           # 200 但列表为空：确实没有结果
+    if saw_block:
+        return None, "**__搜索页被 Cloudflare 拦截，请稍后再试__**"
+    return None, "**__搜索失败：镜像均不可达，请稍后再试__**"
+
+
+def _search_page_markup(token, results, page):
+    """Keyboard for one card page: one result per row (title + badge),
+    footer 上一页/下一页 only when another page exists."""
+    rows = []
+    start = page * _SEARCH_PAGE_SIZE
+    for i in range(start, min(start + _SEARCH_PAGE_SIZE, len(results))):
+        item = results[i]
+        label = f"{i + 1}. {item['title'][:32]}{'…' if len(item['title']) > 32 else ''}"
+        if item["badges"]:
+            label += f"｜{item['badges']}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"srch:{token}:{i}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "‹ 上一页", callback_data=f"srchpage:{token}:{page - 1}"))
+    if start + _SEARCH_PAGE_SIZE < len(results):
+        nav.append(InlineKeyboardButton(
+            "下一页 ›", callback_data=f"srchpage:{token}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+async def _edit_or_reply(message_obj, fallback_message, text):
+    try:
+        await message_obj.edit_text(text)
+    except Exception:
+        await fallback_message.reply_text(text)
+
+
+async def start_missav_search(message, raw_code):
+    """Normalize the code, run the mirror search, present the cover card."""
+    code = _normalize_video_code(raw_code)
+    if not code:
+        await message.reply_text(
+            "**__无法识别番号格式__**\n"
+            "支持：`SSIS-405` / `ssis405` / `FC2-PPV-1234567` / "
+            "`HEYZO-1234` / `092014_887`")
+        return
+    notice = await message.reply_text(f"🔍 **__正在搜索 {code} ...__**")
+    hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    try:
+        results, err = await asyncio.to_thread(_missav_search, code, tuple(hosts))
+    except Exception as e:
+        logger.exception("missav search crashed")
+        results, err = None, f"**__搜索出错：{e}__**"
+    if err:
+        await _edit_or_reply(notice, message, err)
+        return
+    if not results:
+        await _edit_or_reply(notice, message, f"❌ **__未找到与 {code} 相关的结果__**")
+        return
+    await _safe_delete(notice)
+    await _send_search_card(message, code, results)
+
+
+async def _send_search_card(message, code, results):
+    global _SEARCH_PROMPT_SEQ
+    _SEARCH_PROMPT_SEQ += 1
+    token = f'{_SEARCH_PROMPT_SEQ:x}'
+    prompt = {
+        'token': token,
+        'code': code,
+        'results': results,
+        'message': message,
+        'created_at': time.time(),
+        'card': None,
+        'is_photo': False,
+    }
+    _SEARCH_PROMPTS[message.from_user.id] = prompt
+    markup = _search_page_markup(token, results, 0)
+    caption = (
+        f"🔍 **{code}** 搜索结果 {len(results)} 条\n"
+        f"（{_GETAV_PROMPT_TTL // 60} 分钟内有效，/stop 可取消；"
+        "选中后可再选版本）")
+    card = None
+    thumb = next((r["thumb"] for r in results if r["thumb"]), "")
+    if thumb:
+        try:
+            # Telegram fetches the cover server-side; a CDN block just
+            # degrades the card to the text-only variant below.
+            card = await message.reply_photo(thumb, caption=caption,
+                                             reply_markup=markup)
+            prompt['is_photo'] = True
+        except Exception as e:
+            logger.info("search cover send failed (%s); using text card", e)
+            card = None
+    if card is None:
+        card = await message.reply_text(caption, reply_markup=markup)
+    prompt['card'] = card
+
+
+async def _edit_search_card(prompt, text):
+    card = prompt.get("card")
+    if card is None:
+        return
+    try:
+        if prompt.get("is_photo"):
+            await card.edit_caption(text)
+        else:
+            await card.edit_text(text)
+    except Exception:
+        pass  # 卡片编辑是尽力而为：失败不影响入队
+
+
+def _search_prompt_expired(prompt, token):
+    return (prompt is None or prompt["token"] != token
+            or time.time() - prompt["created_at"] > _GETAV_PROMPT_TTL)
+
+
+@app.on_callback_query(filters.regex(r"^srch:([0-9a-f]+):(\d+)$"))
+async def search_pick_callback(client, query):
+    uid = query.from_user.id
+    token, idx_s = query.matches[0].group(1), query.matches[0].group(2)
+    prompt = _SEARCH_PROMPTS.get(uid)
+    if _search_prompt_expired(prompt, token):
+        try:
+            await query.answer("搜索结果已过期，请重新搜索", show_alert=True)
+        except Exception:
+            pass
+        return
+    idx = int(idx_s)
+    results = prompt["results"]
+    if idx >= len(results):
+        try:
+            await query.answer("无效的结果，请重新搜索", show_alert=True)
+        except Exception:
+            pass
+        return
+    picked = results[idx]
+    _SEARCH_PROMPTS.pop(uid, None)
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await _edit_search_card(prompt, f"✅ 已选择：{picked['title'][:80]}")
+    hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    variants = await discover_missav_variants(picked["href"], tuple(hosts))
+    if len(variants) > 1:
+        await _send_missav_card(prompt["message"], uid, picked["href"], False, variants)
+        return
+    # 唯一版本（或探测全挂时退化的当前页）：直接入队
+    await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                            want_subtitle=False)
+
+
+@app.on_callback_query(filters.regex(r"^srchpage:([0-9a-f]+):(\d+)$"))
+async def search_page_callback(client, query):
+    uid = query.from_user.id
+    token, page_s = query.matches[0].group(1), query.matches[0].group(2)
+    prompt = _SEARCH_PROMPTS.get(uid)
+    if _search_prompt_expired(prompt, token):
+        try:
+            await query.answer("搜索结果已过期，请重新搜索", show_alert=True)
+        except Exception:
+            pass
+        return
+    page = max(0, int(page_s))
+    try:
+        await prompt["card"].edit_reply_markup(
+            reply_markup=_search_page_markup(token, prompt["results"], page))
+    except Exception:
+        pass
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+@app.on_message(filters.command("search"))
+async def search_handler(client, message):
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply_text(
+            "**用法：** `/search <番号>`，如 `/search SSIS-405`\n"
+            "也可以直接发送番号文本（无需命令）。")
+        return
+    await start_missav_search(message, " ".join(parts[1:]))
+
+
+async def route_code_search(message):
+    """batch.py 纯文本路径：非 URL 的番号直接进搜索卡片流程。"""
+    code = _normalize_video_code(getattr(message, "text", "") or "")
+    if not code:
+        return
+    await start_missav_search(message, code)
+
+
+def discard_search_prompts(uid=None):
+    """Drop open search cards (/stop wiring + sweeper entry point)."""
+    if uid is None:
+        return len(_SEARCH_PROMPTS.clear() or _SEARCH_PROMPTS)
+    return 1 if _SEARCH_PROMPTS.pop(uid, None) is not None else 0
+
+
+async def _sweep_search_prompts(now=None):
+    if now is None:
+        now = time.time()
+    for uid, prompt in list(_SEARCH_PROMPTS.items()):
+        if now - prompt["created_at"] > _GETAV_PROMPT_TTL:
+            _SEARCH_PROMPTS.pop(uid, None)
+
+
+try:
+    from plugins.tasks import register_sweep_hook
+    register_sweep_hook(_sweep_search_prompts)
+except Exception:
+    pass  # test stubs may not expose the hook
+
+
 async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=None):
     """Site routing for a queued /dl task (yt-dlp / missav / getav)."""
 
@@ -509,14 +1021,15 @@ async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=Non
         await process_getav(message, url, getav_hosts, want_subtitle,
                             task_id=task_id, source_url=source_url)
     elif is_missav_url(url, missav_hosts):
-        await process_missav(message, url, missav_hosts, task_id=task_id)
+        await process_missav(message, url, missav_hosts, task_id=task_id,
+                             want_subtitle=want_subtitle)
     elif _host_in(url, "instagram.com"):
         await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False, task_id=task_id)
     elif _host_in(url, "youtube.com", "youtu.be"):
         await process_video(message, url, YT_COOKIES, check_duration_and_size=True, task_id=task_id)
     else:
         if want_subtitle:
-            await message.reply_text("**__-sub 仅支持 getav 视频页，忽略该参数__**")
+            await message.reply_text("**__-sub 仅支持 getav/missav 视频页，忽略该参数__**")
         await process_video(message, url, None, check_duration_and_size=False, task_id=task_id)
 
 def build_ytdlp_caption(info, title, width=0, height=0, duration=0,
@@ -704,10 +1217,16 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
                 os.remove(temp_path)
 
 
-async def process_missav(message, url, hosts, task_id=None):
+async def process_missav(message, url, hosts, task_id=None, want_subtitle=False):
     """Download a missav.ai video page via the dedicated HLS pipeline and
-    upload it back through the shared finalize/upload tail."""
-    await _process_hls_site(message, url, hosts, download_missav, "missav", task_id=task_id)
+    upload it back through the shared finalize/upload tail.
+
+    ``want_subtitle`` (``/dl -sub``) burns the page's HLS Chinese
+    subtitle track (official getav VTT by code as fallback); default is
+    a plain fast remux — same semantics as the getav flow."""
+    extra = {"want_subtitle": True} if want_subtitle else None
+    await _process_hls_site(message, url, hosts, download_missav, "missav",
+                            extra_dl_kwargs=extra, task_id=task_id)
 
 
 async def process_getav(message, url, hosts, want_subtitle=False, task_id=None,
@@ -738,15 +1257,38 @@ async def _process_hls_site(message, url, hosts, downloader, site,
     progress_message = await message.reply_text(f"**__开始下载 {site} 视频...__**")
     _report_task(task_id, f'{site} 下载中...')
 
-    async with sem:
+    await sem.acquire()
+    job_slot = {'sem': sem, 'released': False}
+    try:
         await _run_hls_download(
             message, url, hosts, progress_message, downloader, site,
-            extra_dl_kwargs or {}, task_id=task_id,
+            extra_dl_kwargs or {}, task_id=task_id, job_slot=job_slot,
         )
+    finally:
+        # 慢车道在烧录阶段已提前释放过就不再补：双重 release 会把
+        # 信号量撑到超过 MISSAV_MAX_JOBS。
+        if not job_slot['released']:
+            sem.release()
+
+
+def _release_job_slot(job_slot):
+    """慢车道（issue #20，规格 §7.2）：下载+合并完成、进入烧录阶段即
+    释放 missav job 信号量。
+
+    烧录在 utils.missav 的 BURN 信号量（BURN_CONCURRENCY，默认 1）上
+    自行排队，完成后仍由同一协程继续上传——只是不再占用 job 槽，
+    新的下载任务得以立刻进入，根治「-sub 任务空占槽、新请求被误拒」。
+    """
+    if not job_slot or job_slot.get('released'):
+        return
+    job_slot['released'] = True
+    sem = job_slot.get('sem')
+    if sem is not None:
+        sem.release()
 
 
 async def _run_hls_download(message, url, hosts, progress_message, downloader, site,
-                            extra_dl_kwargs=None, task_id=None):
+                            extra_dl_kwargs=None, task_id=None, job_slot=None):
 
 
     # Task-scoped scratch dir (plan §5.2): the whole download lives in
@@ -760,15 +1302,19 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
 
     async def progress(done, total, stage):
-        if stage == "burn" and not progress._burn_notified:
-            progress._burn_notified = True
-            _report_task(task_id, '烧录中文字幕中（约 30-60 分钟）...')
-            try:
-                await progress_message.edit_text(
-                    "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
-                )
-            except Exception:
-                pass
+        if stage == "burn":
+            # 慢车道：下载+合并已完成，烧录改在独立 BURN 信号量上排队，
+            # job 槽即刻让出（幂等，_burn_notified 只管一次文案提示）。
+            _release_job_slot(job_slot)
+            if not progress._burn_notified:
+                progress._burn_notified = True
+                _report_task(task_id, '烧录中文字幕中（约 30-60 分钟）...')
+                try:
+                    await progress_message.edit_text(
+                        "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
+                    )
+                except Exception:
+                    pass
             return
         if stage != "segments" or total <= 0:
             return

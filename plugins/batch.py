@@ -96,8 +96,15 @@ async def process_cmd(c, m):
 @main_bot.on_message(filters.command(['cancel', 'stop']))
 async def cancel_cmd(c, m):
     uid = m.from_user.id
-    from plugins.ytdl import discard_getav_prompts
-    dropped_prompts = discard_getav_prompts(uid)
+    from plugins.ytdl import (
+        discard_getav_prompts, discard_missav_prompts, discard_search_prompts,
+    )
+    cancelled = request_cancel_tasks(uid)
+    dropped_prompts = (
+        discard_getav_prompts(uid)
+        + discard_missav_prompts(uid)
+        + discard_search_prompts(uid)
+    )
     had_state = pending_flows.pop(uid, None) is not None
     if cancelled or dropped_prompts:
         await m.reply_text(f'已请求取消 {cancelled} 个任务。进行中的将在当前步骤完成后停止。')
@@ -180,11 +187,19 @@ def _has_active_tasks(user_tasks):
     return any(t['status'] in ('queued', 'running') for t in user_tasks)
 
 @main_bot.on_message(filters.text & filters.private & ~login_in_progress & ~filters.command([
-    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 
-    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot', 'merge', 'tasks']))
+    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set',
+    'pay', 'redeem', 'gencode', 'single', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot', 'merge', 'tasks', 'search']))
 async def text_handler(c, m):
     uid = m.from_user.id
-    if uid not in pending_flows: return
+    if uid not in pending_flows:
+        # 纯文本路径（issue #16）：非 URL 的番号（SSIS-405 / fc2ppv 123 等）
+        # 直接进 missav 搜索卡片流程；其余纯文本维持静默忽略。
+        try:
+            from plugins.ytdl import route_code_search
+        except (ImportError, AttributeError):
+            return
+        await route_code_search(m)
+        return
     _Z_TS[uid] = time.time()
     s = pending_flows[uid].get('step')
     oc = pending_flows[uid].get('oc')

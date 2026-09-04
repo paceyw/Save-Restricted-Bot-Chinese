@@ -181,6 +181,8 @@ def queue_env(monkeypatch):
     ytdl_stub.run_dl = default_run_dl
     ytdl_stub.run_adl = default_run_adl
     ytdl_stub.discard_getav_prompts = lambda uid=None: 0
+    ytdl_stub.discard_missav_prompts = lambda uid=None: 0
+    ytdl_stub.discard_search_prompts = lambda uid=None: 0
     monkeypatch.setitem(sys.modules, "plugins.ytdl", ytdl_stub)
     plugins.ytdl = ytdl_stub
 
@@ -371,3 +373,66 @@ def test_tasks_view_labels_adl(queue_env):
         assert "✅ 音频上传完成" in text
 
     asyncio.run(scenario())
+
+
+# ─── non-sub priority (issue #20, §7.2 slow lane) ─────────────────────────────
+
+def test_worker_promotes_non_sub_task_ahead_of_queued_sub_tasks(queue_env):
+    """worker 拿到 -sub 任务时把排在后面的非-sub 换到队头（规格 §7.2）。
+
+    三个任务在 worker 启动前全部入队（enqueue_task 全程不让出事件循环），
+    所以 promote 的扫描真实发生：执行顺序必须是 fast → slow-1 → slow-2，
+    而不是 FIFO 的 slow-1 → fast → slow-2。
+    """
+    state, tasks, _batch = queue_env
+
+    async def quick_dl(message, url, want_subtitle=False, task_id=None,
+                       source_url=None):
+        state["calls"].append((url, want_subtitle))
+        await asyncio.sleep(0.01)
+
+    import plugins.ytdl as ytdl_stub
+    ytdl_stub.run_dl = quick_dl
+
+    async def scenario():
+        created = []
+        for url, sub in (("slow-1", True), ("fast", False), ("slow-2", True)):
+            msg = _FakeMessage("/dl " + url)
+            t = tasks.create_task(42, "dl", 1, url=url,
+                                  want_subtitle=sub, message=msg)
+            await tasks.enqueue_task(42, t)
+            created.append(t)
+        deadline = asyncio.get_event_loop().time() + 5
+        while any(t["status"] in ("queued", "running") for t in created):
+            await asyncio.sleep(0.01)
+            assert asyncio.get_event_loop().time() < deadline
+
+    asyncio.run(scenario())
+    assert state["calls"] == [("fast", False), ("slow-1", True), ("slow-2", True)]
+
+
+def test_worker_keeps_fifo_when_only_sub_tasks_queued(queue_env):
+    state, tasks, _batch = queue_env
+
+    async def quick_dl(message, url, want_subtitle=False, task_id=None,
+                       source_url=None):
+        state["calls"].append(url)
+
+    import plugins.ytdl as ytdl_stub
+    ytdl_stub.run_dl = quick_dl
+
+    async def scenario():
+        created = []
+        for url in ("sub-a", "sub-b"):
+            msg = _FakeMessage("/dl -sub " + url)
+            t = tasks.create_task(42, "dl", 1, url=url,
+                                  want_subtitle=True, message=msg)
+            await tasks.enqueue_task(42, t)
+            created.append(t)
+        deadline = asyncio.get_event_loop().time() + 5
+        while any(t["status"] in ("queued", "running") for t in created):
+            await asyncio.sleep(0.01)
+            assert asyncio.get_event_loop().time() < deadline
+
+    asyncio.run(scenario())
+    assert state["calls"] == ["sub-a", "sub-b"]
