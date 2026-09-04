@@ -1418,7 +1418,13 @@ async def _resolve_cover(thumbnail_url, download_dir, video_path, duration, user
         cover_path = os.path.join(download_dir, get_random_string() + ".jpg")
         cover_file = await asyncio.to_thread(d_thumbnail, thumbnail_url, cover_path)
         if cover_file:
+            logger.info("cover: og:image downloaded (%s…)",
+                        str(thumbnail_url)[:80])
             return cover_file
+        logger.info("cover: og:image unavailable (%s…), falling back to screenshot",
+                    str(thumbnail_url)[:80])
+    else:
+        logger.info("cover: page has no og:image, falling back to screenshot")
     async with screenshot_lock:
         previous_cwd = os.getcwd()
         try:
@@ -1536,6 +1542,7 @@ def _build_album_group(cover_file, video_parts, caption, width, height):
             width=int(width) if first and width else 0,
             height=int(height) if first and height else 0,
             duration=int(part_duration) or 0,
+            thumb=cover_file if first and cover_file else None,
             supports_streaming=True,
         ))
     return group

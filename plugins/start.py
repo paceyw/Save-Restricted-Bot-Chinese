@@ -39,37 +39,46 @@ async def subscribe(app, message):
         await message.reply_text(f"出现错误。请联系管理员……以下是错误信息：{ggn}")
         return 1
      
+BOT_MENU = [
+    BotCommand("start", "🚀 启动机器人"),
+    BotCommand("search", "🔍 番号搜索影片（直接发番号也可以）"),
+    BotCommand("batch", "🫠 批量提取"),
+    BotCommand("single", "🔖 单条提取"),
+    BotCommand("merge", "🧩 合并多条链接为一条消息/相册"),
+    BotCommand("tasks", "📋 查看任务队列状态和进度"),
+    BotCommand("stop", "🛑 取消排队任务与未决卡片"),
+    BotCommand("login", "🔑 登录机器人"),
+    BotCommand("setbot", "🧸 添加处理文件的机器人"),
+    BotCommand("rembot", "🤨 移除您的自定义机器人"),
+    BotCommand("logout", "🚪 退出机器人"),
+    BotCommand("status", "📊 查看您的状态"),
+    BotCommand("myplan", "📋 查看您的会员套餐"),
+    BotCommand("transfer", "💘 将会员转赠他人"),
+    BotCommand("add", "➕ 添加用户为会员"),
+    BotCommand("rem", "➖ 移除会员"),
+    BotCommand("settings", "⚙️ 个性化设置"),
+    BotCommand("dl", "🎬 下载视频（加 -sub 烧录中文字幕）"),
+    BotCommand("adl", "🎵 提取音频"),
+    BotCommand("plan", "🗓️ 查看会员方案"),
+    BotCommand("pay", "💎 开通/续费会员"),
+    BotCommand("terms", "🥺 条款和条件"),
+    BotCommand("help", "❓ 新手也能看懂！"),
+    BotCommand("cancel", "🚫 取消登录/批量/设置流程"),
+]
+
+
+async def apply_bot_menu(application):
+    """注册全局命令菜单（/set 与进程启动共用，保证菜单随版本刷新）。"""
+    await application.set_bot_commands(list(BOT_MENU))
+
+
 @app.on_message(filters.command("set"))
 async def set(_, message):
     if message.from_user.id not in OWNER_ID:
         await message.reply("您没有权限使用此命令。")
         return
-    await app.set_bot_commands([
-        BotCommand("start", "🚀 启动机器人"),
-        BotCommand("batch", "🫠 批量提取"),
-        BotCommand("single", "🔖 单条提取"),
-        BotCommand("merge", "🧩 合并多条链接为一条消息/相册"),
-        BotCommand("tasks", "📋 查看任务队列状态和进度"),
-        BotCommand("login", "🔑 登录机器人"),
-        BotCommand("setbot", "🧸 添加处理文件的机器人"),
-        BotCommand("rembot", "🤨 移除您的自定义机器人"),
-        BotCommand("logout", "🚪 退出机器人"),
-        BotCommand("status", "📊 查看您的状态"),
-        BotCommand("myplan", "📋 查看您的会员套餐"),
-        BotCommand("transfer", "💘 将会员转赠他人"),
-        BotCommand("add", "➕ 添加用户为会员"),
-        BotCommand("rem", "➖ 移除会员"),
-        BotCommand("settings", "⚙️ 个性化设置"),
-        BotCommand("dl", "🎬 下载视频（getav 加 -sub 烧录中文字幕）"),
-        BotCommand("adl", "🎵 提取音频"),
-        BotCommand("plan", "🗓️ 查看会员方案"),
-        BotCommand("pay", "💎 开通/续费会员"),
-        BotCommand("terms", "🥺 条款和条件"),
-        BotCommand("help", "❓ 新手也能看懂！"),
-        BotCommand("cancel", "🚫 取消登录/批量/设置流程"),
-        BotCommand("stop", "🚫 取消批量提取流程")
-    ])
- 
+    await apply_bot_menu(app)
+
     await message.reply("✅ 命令配置成功！")
  
  

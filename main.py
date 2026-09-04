@@ -82,6 +82,10 @@ async def main():
 
     try:
         await load_and_run_plugins()
+        # keep the Telegram command menu in sync with the running version
+        # (previously it only refreshed when an admin ran /set)
+        from plugins.start import apply_bot_menu
+        await apply_bot_menu(app)
         await stop.wait()
         logger.info("shutdown signal received")
     finally:

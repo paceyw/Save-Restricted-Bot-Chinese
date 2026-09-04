@@ -517,25 +517,18 @@ def _hashtag(text):
 def build_caption(details, max_len=1024):
     """Five-block caption per issue #13 style:
 
-        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n[片商：#…\n]类别：#…
+        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n类别：#…
 
     The hashtag lines form ONE block (single newlines) separated from
-    the intro by a blank line, matching the reference layout; the
-    optional 「片商：」 line (issue #21) carries the studio and the
-    release date when JavBus enrichment supplied them. Blocks with no
-    data are omitted; hashtag lines are trimmed from the tail when the
-    whole caption would exceed Telegram's 1024 limit.
+    the intro by a blank line, matching the reference layout. Blocks
+    with no data are omitted; hashtag lines are trimmed from the tail
+    when the whole caption would exceed Telegram's 1024 limit.
     """
     code = (details.get("code") or "").strip()
     intro = (details.get("title") or "").strip()
     actresses = [t for t in (_hashtag(x) for x in details.get("actresses") or []) if t]
     genres = [t for t in (_hashtag(x) for x in details.get("genres") or []) if t]
     badges = [t for t in (_hashtag(x) for x in details.get("badges") or []) if t]
-    meta_items = []
-    for value in (details.get("studio"), details.get("release_date")):
-        tag = _hashtag(value) if value else ""
-        if tag:
-            meta_items.append(tag)
 
     blocks = []
     if code:
@@ -548,8 +541,6 @@ def build_caption(details, max_len=1024):
         tag_lines.append("演员：" + " ".join(actresses))
     if genres:
         tag_lines.append("标签：" + " ".join(genres))
-    if meta_items:
-        tag_lines.append("片商：" + " ".join(meta_items))
     if badges:
         tag_lines.append("类别：" + " ".join(badges))
     if tag_lines:
@@ -563,8 +554,8 @@ def build_caption(details, max_len=1024):
     # hashtag lines carry a 「label：」prefix; trim their tails (keep the
     # label + one tag) until the caption fits Telegram's limit
     def is_tag_line(line):
-        return line.startswith(("演员：", "标签：", "片商：", "类别：",
-                                "演员:", "标签:", "片商:", "类别:"))
+        return line.startswith(("演员：", "标签：", "类别：",
+                                "演员:", "标签:", "类别:"))
 
     while len(render(blocks)) > max_len:
         tag_block_idx = next(

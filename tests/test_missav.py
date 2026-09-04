@@ -1294,7 +1294,9 @@ def test_extract_video_details_release_date_and_genres_cap():
     assert "颜射" not in d2["genres"]  # beyond the cap: dropped
 
 
-def test_build_caption_with_studio_and_release_date():
+def test_build_caption_ignores_studio_and_release_date():
+    # 用户定稿：caption 只保留 演员/标签/类别 三行结构，片商与发行日期不渲染
+    # （javbus enrich 仍负责演员双名，studio/date 字段仅作数据保留）
     d = {
         "code": "DASS-629",
         "title": "想不想被我饲养？实录",
@@ -1310,18 +1312,11 @@ def test_build_caption_with_studio_and_release_date():
         "想不想被我饲养？实录\n\n"
         "演员：#桃永紗里奈_(百永さりな)\n"
         "标签：#苗条\n"
-        "片商：#プレステージ #2025-05-09\n"
         "类别：#无码破解"
     )
-
-
-def test_build_caption_omits_studio_line_when_absent():
-    d = {"code": "ABP-1", "title": "t", "actresses": ["Sarina Momonaga"],
-         "genres": [], "badges": ["无码"]}
-    assert "片商：" not in missav.build_caption(d)
-    # date alone still renders the 片商 line
-    d["release_date"] = "2025-05-09"
-    assert missav.build_caption(d).splitlines()[-2] == "片商：#2025-05-09"
+    assert "片商" not in cap
+    d2 = {"code": "ABP-1", "title": "t", "release_date": "2025-05-09"}
+    assert "片商" not in missav.build_caption(d2)
 
 
 def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
