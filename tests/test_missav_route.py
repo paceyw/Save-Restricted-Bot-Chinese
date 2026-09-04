@@ -132,8 +132,8 @@ def ytdl(monkeypatch):
     pyrogram_types = types.ModuleType("pyrogram.types")
     pyrogram_types.InputMediaPhoto = object
     pyrogram_types.InputMediaVideo = object
-    pyrogram_types.InlineKeyboardButton = lambda text, callback_data=None: \
-        types.SimpleNamespace(text=text, callback_data=callback_data)
+    pyrogram_types.InlineKeyboardButton = lambda text, callback_data=None, url=None: \
+        types.SimpleNamespace(text=text, callback_data=callback_data, url=url)
     pyrogram_types.InlineKeyboardMarkup = lambda buttons: \
         types.SimpleNamespace(buttons=buttons)
     monkeypatch.setitem(sys.modules, "pyrogram.types", pyrogram_types)

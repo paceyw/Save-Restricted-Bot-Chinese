@@ -309,38 +309,199 @@ def enrich_details(details, url=None):
         return details
 
 
+# ─── JavLibrary CN（补充源：FC2 有收录；JavBus 404/被拦时的兜底） ────────────────
+
+JAVLIBRARY_BASE = "https://www.javlibrary.com/cn"
+_JL_CACHE = OrderedDict()
+_JL_CACHE_MAX = _CACHE_MAX
+
+_JL_TITLE_RE = re.compile(
+    r'<h1[^>]*id="video_title"[^>]*>\s*<a[^>]*>(.*?)</a>', re.S | re.I)
+_JL_DATE_RE = re.compile(r'id="video_date"[^>]*>\s*([0-9]{4}-[0-9]{2}-[0-9]{2})', re.I)
+_JL_MAKER_RE = re.compile(r'id="video_maker".*?<a[^>]*>(.*?)</a>', re.S | re.I)
+_JL_GENRES_BLOCK = re.compile(r'id="video_genres"(.*?)</div>', re.S | re.I)
+_JL_CAST_BLOCK = re.compile(r'id="video_cast"(.*?)</div>', re.S | re.I)
+_JL_ANCHOR_RE = re.compile(r'<a[^>]*>(.*?)</a>', re.S | re.I)
+_JL_COVER_RE = re.compile(r'id="video_jacket"[^>]*src="([^"]+)"', re.I)
+_JL_SEARCH_ANCHOR_RE = re.compile(
+    r'<a[^>]*href="([^"]*\?v=[a-z0-9]+[^"]*)"[^>]*>(.*?)</a>', re.S | re.I)
+_JL_CODE_TOKEN_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+")
+
+
+def _strip_tags(text):
+    return html_unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+
+
+def _jl_off_domain(resp, requested_url):
+    from urllib.parse import urlparse
+    final = urlparse(getattr(resp, "url", None) or requested_url).hostname or ""
+    host = final.lower().removeprefix("www.")
+    return host != "javlibrary.com"
+
+
+def parse_javlibrary_page(html):
+    """影片页 HTML -> 元数据 dict；字段独立降级，全空返回 None。"""
+    if not html:
+        return None
+    title_m = _JL_TITLE_RE.search(html)
+    if not title_m:
+        return None
+    title = _strip_tags(title_m.group(1))
+    # 标题习惯以番号开头（"DASS-629 私に…"）：去掉番号前缀
+    title = re.sub(r"^[A-Za-z0-9-]+\s*", "", title).strip()
+
+    def block_names(block_re):
+        m = block_re.search(html)
+        if not m:
+            return []
+        seen, out = [], []
+        for a in _JL_ANCHOR_RE.finditer(m.group(1)):
+            name = _strip_tags(a.group(1))
+            if name and name not in seen:
+                seen.append(name)
+                out.append(name)
+        return out
+
+    date_m = _JL_DATE_RE.search(html)
+    cover_m = _JL_COVER_RE.search(html)
+    meta = {
+        "title": title,
+        "actresses": block_names(_JL_CAST_BLOCK),
+        "genres": block_names(_JL_GENRES_BLOCK)[:GENRES_MAX],
+        "studio": _strip_tags(_JL_MAKER_RE.search(html).group(1)) if _JL_MAKER_RE.search(html) else "",
+        "release_date": date_m.group(1) if date_m else "",
+        "cover": cover_m.group(1) if cover_m else "",
+    }
+    if not any((meta["title"], meta["actresses"], meta["genres"])):
+        return None
+    return meta
+
+
+def _jl_cache_get(code):
+    meta = _JL_CACHE.get(code)
+    if meta is not None:
+        _JL_CACHE.move_to_end(code)
+    return meta
+
+
+def _jl_cache_put(code, meta):
+    _JL_CACHE[code] = meta
+    _JL_CACHE.move_to_end(code)
+    while len(_JL_CACHE) > _JL_CACHE_MAX:
+        _JL_CACHE.popitem(last=False)
+
+
+def fetch_javlibrary_meta(code):
+    """番号 -> JavLibrary CN 元数据 dict；失败一律 None（永不抛出）。
+
+    流程：keyword 搜索（唯一命中时站点直接重定向到影片页）；多结果页
+    则按番号 token 精确匹配挑候选再进影片页（防前缀误配，与 getav
+    兜底同规则）。重定向最终 host 必须仍在 javlibrary.com。
+    """
+    code = str(code or "").strip().upper()
+    if not _CODE_RE.match(code):
+        return None
+    cached = _jl_cache_get(code)
+    if cached is not None:
+        return cached
+
+    from urllib.parse import quote, urljoin
+    search_url = f"{JAVLIBRARY_BASE}/vl_searchbyid.php?keyword={quote(code)}"
+    html = None
+    try:
+        page, err = _http_get(search_url)
+        if page is not None and _jl_off_domain(page, search_url):
+            logger.info("javlibrary redirected off-domain for %s", code)
+            return None
+        html = _page_html(page)
+    except Exception:
+        logger.info("javlibrary search failed %s", code, exc_info=True)
+        return None
+    if not html:
+        return None
+
+    if 'id="video_title"' not in html:
+        # 多候选列表页：按标题内番号 token 精确匹配挑一个
+        want = re.sub(r"[^A-Z0-9]", "", code)
+        picked = None
+        for m in _JL_SEARCH_ANCHOR_RE.finditer(html):
+            text = _strip_tags(m.group(2)).upper()
+            token = _JL_CODE_TOKEN_RE.search(text)
+            if token and re.sub(r"[^A-Z0-9]", "", token.group(0)) == want:
+                picked = m.group(1)
+                break
+        if not picked:
+            logger.info("javlibrary no exact-code candidate for %s", code)
+            return None
+        detail_url = urljoin(JAVLIBRARY_BASE + "/", picked)
+        try:
+            page2, err2 = _http_get(detail_url)
+            if page2 is not None and _jl_off_domain(page2, detail_url):
+                logger.info("javlibrary detail redirected off-domain for %s", code)
+                return None
+            html = _page_html(page2)
+        except Exception:
+            logger.info("javlibrary detail failed %s", code, exc_info=True)
+            return None
+        if not html or 'id="video_title"' not in html:
+            return None
+
+    meta = parse_javlibrary_page(html)
+    if meta is None:
+        return None
+    _jl_cache_put(code, meta)
+    return meta
+
+
+def _javbus_source_meta(code):
+    return fetch_javbus_meta(code)
+
+
+def _javlibrary_source_meta(code):
+    return fetch_javlibrary_meta(code)
+
+
+def _getav_source_meta(code):
+    try:
+        from utils.missav import find_getav_details_for_code
+        return find_getav_details_for_code(code)
+    except Exception:
+        return None
+
+
 def _enrich_details(details, url):
+
     if not isinstance(details, dict):
         return details
 
     code = str(details.get("code") or "")
     cn_names = []
     if code.upper().startswith("FC2"):
-        # JavBus does not catalog FC2 (guaranteed 404) — getav usually
-        # carries the FC2 release with full Chinese metadata instead.
-        try:
-            from utils.missav import find_getav_details_for_code
-            g = find_getav_details_for_code(code)
-        except Exception:
-            g = None
-        if g:
-            if not details.get("title") and g.get("title"):
-                details["title"] = g["title"]
-            if not details.get("genres") and g.get("genres"):
-                details["genres"] = list(g["genres"][:GENRES_MAX])
-            cn_names = list(g.get("actresses") or [])
+        # JavBus does not catalog FC2: getav usually carries the release
+        # with full Chinese metadata; JavLibrary CN lists FC2 too.
+        sources = (_getav_source_meta, _javlibrary_source_meta)
     else:
-        meta = fetch_javbus_meta(code) if code else None
-        if meta:
-            if not details.get("studio") and meta.get("studio"):
-                details["studio"] = meta["studio"]
-            if not details.get("release_date") and meta.get("release_date"):
-                details["release_date"] = meta["release_date"]
-            if not details.get("title") and meta.get("title"):
-                details["title"] = meta["title"]
-            if not details.get("genres") and meta.get("genres"):
-                details["genres"] = list(meta["genres"][:GENRES_MAX])
-            cn_names = list(meta.get("actresses") or [])
+        sources = (_javbus_source_meta, _javlibrary_source_meta)
+    for fetch in sources:
+        try:
+            meta = fetch(code) if code else None
+        except Exception:
+            meta = None
+        if not meta:
+            continue
+        if not details.get("title") and meta.get("title"):
+            details["title"] = meta["title"]
+        if not details.get("genres") and meta.get("genres"):
+            details["genres"] = list(meta["genres"][:GENRES_MAX])
+        if not details.get("studio") and meta.get("studio"):
+            details["studio"] = meta["studio"]
+        if not details.get("release_date") and meta.get("release_date"):
+            details["release_date"] = meta["release_date"]
+        for name in meta.get("actresses") or []:
+            if name and name not in cn_names:
+                cn_names.append(name)
+        if details.get("genres") and details.get("actresses") and cn_names:
+            break  # nothing left worth another network round
 
     if not cn_names and url:
         cn_names = _missav_cn_actresses(url)

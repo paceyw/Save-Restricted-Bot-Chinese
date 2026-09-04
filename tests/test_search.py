@@ -169,6 +169,8 @@ class _Notice:
     async def edit_text(self, text, *a, **kw):
         self.edits.append(text)
         self.text = text
+        if "reply_markup" in kw:
+            self.reply_markup = kw["reply_markup"]
 
     async def edit_reply_markup(self, reply_markup=None):
         self.markups.append(reply_markup)
@@ -177,23 +179,26 @@ class _Notice:
     async def edit_caption(self, text, *a, **kw):
         self.edits.append(text)
         self.text = text
+        if "reply_markup" in kw:
+            self.reply_markup = kw["reply_markup"]
+        self.text = text
 
     async def delete(self):
         self.deleted = True
 
 
 def test_search_blocked_message(ytdl, monkeypatch):
-    def fake_search(code, hosts):
+    def fake_search(code, m_hosts, g_hosts):
         return None, "**__搜索页被 Cloudflare 拦截，请稍后再试__**"
 
-    monkeypatch.setattr(ytdl, "_missav_search", fake_search)
+    monkeypatch.setattr(ytdl, "_search_both", fake_search)
     msg = _Card()
     asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
     assert any("Cloudflare" in n.text for n in msg.notices)
 
 
 def test_search_no_results_message(ytdl, monkeypatch):
-    monkeypatch.setattr(ytdl, "_missav_search", lambda code, hosts: ([], None))
+    monkeypatch.setattr(ytdl, "_search_both", lambda code, m, g: ([], None))
     msg = _Card()
     asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
     assert any("未找到" in n.text for n in msg.notices)
@@ -285,15 +290,18 @@ def test_search_pick_single_variant_enqueues_directly(ytdl, monkeypatch):
     query = _FakeQuery(42, f"srch:{token}:0",
                        _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
     asyncio.run(ytdl.search_pick_callback(None, query))
-    # prompt consumed and task enqueued with the picked href
+    # 选中后先进操作卡片（预览/下载/返回），prompt 保留
+    assert 42 in ytdl._SEARCH_PROMPTS
+    assert prompt["picked"]["href"] == "https://missav.ai/ssis-405"
+    assert "已选择" in msg.cards[0].edits[0]
+    act_query = _FakeQuery(42, f"srchact:{token}:dl",
+                           _re.compile(r"^srchact:([0-9a-f]+):(dl|back)$"))
+    asyncio.run(ytdl.search_action_callback(None, act_query))
+    # 下载确认后 prompt 消费，任务以选中 href 入队
     assert 42 not in ytdl._SEARCH_PROMPTS
     task = state["enqueued"][0]
     assert task["url"] == "https://missav.ai/ssis-405"
     assert task["want_subtitle"] is False
-    # card text edited to the selection
-    assert "已选择" in msg.cards[0].edits[0]
-    # no version card: single variant goes straight to the queue
-    assert 42 not in ytdl._MISSAV_PROMPTS
     assert any("加入队列" in r for r in msg.replies)
 
 
@@ -315,6 +323,9 @@ def test_search_pick_multi_variant_goes_to_mav_card(ytdl, monkeypatch):
     query = _FakeQuery(42, f"srch:{prompt['token']}:0",
                        _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
     asyncio.run(ytdl.search_pick_callback(None, query))
+    act_query = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                           _re.compile(r"^srchact:([0-9a-f]+):(dl|back)$"))
+    asyncio.run(ytdl.search_action_callback(None, act_query))
     # >1 版本 → 进 mav 版本卡片流程，不直接入队
     assert 42 in ytdl._MISSAV_PROMPTS
     assert state["enqueued"] == []
@@ -375,3 +386,120 @@ def test_route_code_search_ignores_urls_and_plain_text(ytdl, monkeypatch):
     assert called == []
 
 
+
+
+# ─── 双源搜索（D2 追加）：missav + getav /zh/search?q= ─────────────────────────
+
+def test_search_both_merges_and_dedupes(ytdl, monkeypatch):
+    missav_results = [{"title": "A", "href": "https://missav.ai/ssis-405",
+                       "thumb": "", "badges": "", "source": "missav"}]
+    getav_results = [
+        {"title": "A getav", "href": "https://getav.net/zh/videos/ssis-405",
+         "thumb": "", "badges": "", "source": "getav"},          # 同番号 → 去重
+        {"title": "B getav", "href": "https://getav.net/zh/videos/ssis-405-b",
+         "thumb": "", "badges": "", "source": "getav"},
+    ]
+    seen = {}
+    def fake_missav(code, hosts):
+        return missav_results, None
+    def fake_getav(code, hosts):
+        return getav_results, None
+    monkeypatch.setattr(ytdl, "_missav_search", fake_missav)
+    monkeypatch.setattr(ytdl, "_getav_search", fake_getav)
+    merged, err = ytdl._search_both("SSIS-405", ("missav.ai",), ("getav.net",))
+    assert err is None
+    assert [r["source"] for r in merged] == ["missav", "getav"]
+    assert len(merged) == 2
+
+
+def test_search_both_both_fail_yields_error(ytdl, monkeypatch):
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda c, h: (None, "**__搜索页被 Cloudflare 拦截，请稍后再试__**"))
+    monkeypatch.setattr(ytdl, "_getav_search", lambda c, h: (None, None))
+    merged, err = ytdl._search_both("SSIS-405", ("missav.ai",), ("getav.net",))
+    assert merged is None and "Cloudflare" in err
+
+
+def test_getav_search_parses_video_anchors(ytdl, monkeypatch):
+    html = (
+        '<div class="videos">'
+        '<a href="/zh/videos/ssis-405"><img src="//getav.net/th/1.jpg" alt="标题一">标题一</a>'
+        '<a href="/zh/videos/fc2-ppv-2761664"><img src="//getav.net/th/2.jpg" alt="FC2">FC2 作品</a>'
+        "</div>")
+    fake_page = __import__("types").SimpleNamespace(status_code=200, text=html)
+    monkeypatch.setattr(
+        ytdl, "_http_get", lambda url, headers=None: (fake_page, None))
+    results, err = ytdl._getav_search("SSIS-405", ("getav.net",))
+    assert err is None
+    assert [r["href"] for r in results] == [
+        "https://getav.net/zh/videos/ssis-405",
+        "https://getav.net/zh/videos/fc2-ppv-2761664"]
+    assert results[0]["source"] == "getav"
+
+
+def test_search_pick_back_restores_results(ytdl, monkeypatch):
+    """↩️ 返回：恢复结果卡片（markup 回结果按钮），prompt 保留可重选。"""
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(
+        ytdl, "_missav_search", lambda code, hosts: (_search_results(ytdl, n=3), None))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    import re as _re
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:1",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    assert prompt["picked"]["href"].endswith("ssis-405-x")
+    back = _FakeQuery(42, f"srchact:{prompt['token']}:back",
+                      _re.compile(r"^srchact:([0-9a-f]+):(dl|back)$"))
+    asyncio.run(ytdl.search_action_callback(None, back))
+    assert "picked" not in prompt
+    assert prompt["card"].reply_markup is not None
+    # 返回后可再次选择
+    pick2 = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                       _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick2))
+    assert prompt["picked"]["href"].endswith("ssis-405")
+
+
+def test_search_pick_action_card_has_preview_url(ytdl, monkeypatch):
+    """操作卡片带 🌐 预览网页 的 URL 按钮（浏览器直开）。"""
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(
+        ytdl, "_missav_search", lambda code, hosts: (_search_results(ytdl, n=1), None))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    import re as _re
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    markup = prompt["card"].reply_markup
+    url_buttons = [b for row in markup.buttons for b in row if b.url]
+    assert any("https://missav.ai/ssis-405" == b.url for b in url_buttons)
+
+
+def test_avsea_search_parses_results(ytdl, monkeypatch):
+    """avsea（missav 同引擎克隆）搜索解析：host 限定 avsea.site。"""
+    html = (
+        '<a href="/ssis-405"><img src="//avsea.site/th/1.jpg" alt="标题">SSIS-405 标题</a>'
+        '<a href="/tags/HD">HD</a>')
+    fake_page = __import__("types").SimpleNamespace(status_code=200, text=html)
+    monkeypatch.setattr(
+        ytdl, "_http_get", lambda url, headers=None: (fake_page, None))
+    results, err = ytdl._avsea_search("SSIS-405")
+    assert err is None
+    assert len(results) == 1
+    assert results[0]["href"] == "https://avsea.site/ssis-405"
+    assert results[0]["source"] == "avsea"    # _avsea_search 统一打来源标
+
+
+def test_search_both_includes_avsea(ytdl, monkeypatch):
+    monkeypatch.setattr(ytdl, "_missav_search", lambda c, h: ([], None))
+    monkeypatch.setattr(ytdl, "_getav_search", lambda c, h: ([], None))
+    monkeypatch.setattr(ytdl, "_avsea_search",
+                        lambda c: ([{"title": "A", "href": "https://avsea.site/ssis-405",
+                                     "thumb": "", "badges": "无码破解·中文字幕",
+                                     "source": "missav"}], None))
+    merged, err = ytdl._search_both("SSIS-405", ("missav.ai",), ("getav.net",))
+    assert err is None and len(merged) == 1

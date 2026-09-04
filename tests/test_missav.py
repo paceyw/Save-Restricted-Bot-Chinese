@@ -169,21 +169,35 @@ def test_probe_missav_page_rejects_non_video(monkeypatch):
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (
             FakeResp(text="<html>new releases</html>"), None))
-    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+    assert missav._probe_missav_page("https://missav.ai/sone-543") == (False, None)
     monkeypatch.setattr(
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (FakeResp(status=404), None))
-    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+    assert missav._probe_missav_page("https://missav.ai/sone-543") == (False, None)
     monkeypatch.setattr(
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (None, "timeout"))
-    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+    assert missav._probe_missav_page("https://missav.ai/sone-543") == (False, None)
+
+
+def test_probe_missav_page_returns_stream_fingerprint(monkeypatch):
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (
+            FakeResp(text=_page_html("https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8")), None))
+    ok, m3u8 = missav._probe_missav_page("https://missav.ai/sone-543")
+    assert ok is True
+    assert m3u8 == "https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8"
+    assert missav._m3u8_stream_key(m3u8) == "0a1b2c3d-0000-1111-2222-abcde0000001"
 
 
 def test_discover_missav_variants_partial_existence(monkeypatch):
     def fake_get(url, headers=None, timeout=None, max_bytes=None):
-        if url.endswith("sone-543") or "uncensored-leak-chinese-subtitle" in url:
-            return FakeResp(text=_page_html("https://surrit.com/a/playlist.m3u8")), None
+        if url.endswith("sone-543"):
+            return FakeResp(text=_page_html("https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8")), None
+        if "uncensored-leak-chinese-subtitle" in url:
+            # a REAL combo page serves its own stream (different UUID)
+            return FakeResp(text=_page_html("https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000002/playlist.m3u8")), None
         return FakeResp(status=404), None
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
@@ -196,11 +210,33 @@ def test_discover_missav_variants_partial_existence(monkeypatch):
     ]
 
 
-def test_discover_missav_variants_all_exist_sorted(monkeypatch):
+def test_discover_missav_variants_phantom_alias_rejected(monkeypatch):
+    """missav answers unknown slug suffixes with the BASE video's page:
+    same m3u8 stream ⇒ phantom alias, never offered as a version."""
     monkeypatch.setattr(
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (
-            FakeResp(text=_page_html("https://surrit.com/a/playlist.m3u8")), None))
+            FakeResp(text=_page_html("https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8")), None))
+    found = asyncio.run(
+        missav.discover_missav_variants("https://missav.ai/fc2-ppv-2761664"))
+    assert found == [("raw", "https://missav.ai/fc2-ppv-2761664", "原版")]
+
+
+def test_discover_missav_variants_all_exist_sorted(monkeypatch):
+    streams = {
+        "sone-543": "https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8",
+        "sone-543-chinese-subtitle": "https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000002/playlist.m3u8",
+        "sone-543-uncensored-leak": "https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000003/playlist.m3u8",
+        "sone-543-uncensored-leak-chinese-subtitle": "https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000004/playlist.m3u8",
+    }
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        for tail, m3u8 in streams.items():
+            if url.endswith(tail):
+                return FakeResp(text=_page_html(m3u8)), None
+        return FakeResp(status=404), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
     found = asyncio.run(
         missav.discover_missav_variants("https://missav.ai/sone-543"))
     assert [(v, u) for v, u, _ in found] == [
@@ -736,7 +772,7 @@ def test_fetch_video_page_rotates_blocked_mirrors(monkeypatch):
         if "missav.ai" in url:
             return FakeResp(status=403, text="Just a moment..."), None
         if "missav.ws" in url:
-            return FakeResp(text=_page_html("https://surrit.com/a/playlist.m3u8")), None
+            return FakeResp(text=_page_html("https://surrit.com/0a1b2c3d-0000-1111-2222-abcde0000001/playlist.m3u8")), None
         raise AssertionError(f"unexpected url {url}")
 
     monkeypatch.setattr(missav, "_http_get", fake_get)

@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 # ─── constants ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MIRRORS = ("missav.ai", "missav.ws", "missav.live", "missav123.com")
+DEFAULT_MIRRORS = ("missav.ai", "missav.ws", "missav.live", "missav123.com", "avsea.site")
 GETAV_DEFAULT_MIRRORS = ("getav.net",)
 
 _LANG_PREFIXES = ("cn", "en", "ja", "ko", "ms", "th")
@@ -1003,12 +1003,26 @@ _MISSAV_VARIANT_LABELS = {
 }
 
 
+def _m3u8_stream_key(m3u8_url):
+    """Stream fingerprint: the surrit per-video UUID path segment when
+    present, else the full URL."""
+    m = re.search(
+        r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/",
+        m3u8_url or "", re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return (m3u8_url or "").strip()
+
+
 def _probe_missav_page(url):
-    """One lightweight GET: does this URL serve a real missav video page?
+    """One lightweight GET: (valid, m3u8_url) for a missav video page.
 
     Same Chrome UA as :func:`fetch_video_page`, same page-shaped guard;
-    every failure (blocked, 404, listing page, timeout) is False — a
-    probe must never raise into the caller.
+    every failure (blocked, 404, listing page, timeout) is (False, None)
+    — a probe must never raise into the caller. The extracted stream URL
+    is the fingerprint discovery uses to reject phantom alias pages
+    (missav answers unknown slug suffixes with a playable page for the
+    BASE video — observed live on FC2-PPV-2761664).
     """
     try:
         resp, err = _http_get(
@@ -1016,25 +1030,30 @@ def _probe_missav_page(url):
             max_bytes=PAGE_MAX_BYTES,
         )
     except Exception:  # _http_get never raises by contract; belt and braces
-        return False
+        return False, None
     if resp is None or resp.status_code != 200:
         logger.info("missav variant probe failed %s: %s",
                     url, err or getattr(resp, "status_code", "?"))
-        return False
+        return False, None
     text = resp.text or ""
     if _looks_blocked(resp, text):
         logger.info("missav variant probe blocked %s (status %s)", url, resp.status_code)
-        return False
-    return _is_video_page(text)
+        return False, None
+    if not _is_video_page(text):
+        return False, None
+    return True, extract_m3u8_url(text)
 
 
 async def discover_missav_variants(url, hosts=DEFAULT_MIRRORS):
-    """Probe the sister versions of a missav video page (one GET each).
+    """Probe the sister versions of a missav page (one GET each).
 
-    Returns [(variant, url, label)] for every version that really
-    exists, ordered raw < cn < uc < uc-cn. When every probe fails (e.g.
-    all mirrors Cloudflare-blocked) it degrades to the current page
-    alone, so the caller always has a usable answer; non-missav URLs
+    Returns [(variant, url, label)] ordered raw < cn < uc < uc-cn. A
+    candidate only counts when it serves a DIFFERENT stream than the
+    page itself: missav answers slug suffixes it does not know with a
+    playable page for the BASE video (phantom alias — observed live on
+    FC2-PPV-2761664, which the site lists as one unlabeled version).
+    When the base page cannot be probed, discovery degrades to the
+    current page alone rather than risk phantom cards; non-missav URLs
     return [].
     """
     candidates = missav_variant_candidates(url, hosts)
@@ -1043,16 +1062,22 @@ async def discover_missav_variants(url, hosts=DEFAULT_MIRRORS):
     probes = await asyncio.gather(*(
         asyncio.to_thread(_probe_missav_page, candidate) for _, candidate in candidates
     ))
-    found = [
-        (variant, candidate, _MISSAV_VARIANT_LABELS[variant])
-        for (variant, candidate), ok in zip(candidates, probes) if ok
-    ]
+    base_ok, base_m3u8 = probes[0]          # first candidate = the page itself
+    base_key = _m3u8_stream_key(base_m3u8) if base_ok and base_m3u8 else None
+    base_variant = candidates[0][0]
+    found = []
+    for (variant, candidate), (ok, m3u8) in zip(candidates, probes):
+        if not ok:
+            continue
+        if variant != base_variant and _m3u8_stream_key(m3u8) == base_key:
+            logger.info("missav variant %s is a phantom alias (same stream)", candidate)
+            continue
+        found.append((variant, candidate, _MISSAV_VARIANT_LABELS[variant]))
     if not found:
         variant, candidate = candidates[0]
         return [(variant, candidate, _MISSAV_VARIANT_LABELS[variant])]
     found.sort(key=lambda item: _MISSAV_VARIANT_ORDER[item[0]])
     return found
-
 
 # ─── getav movie API (fetch + parse, pure where possible) ─────────────────────
 

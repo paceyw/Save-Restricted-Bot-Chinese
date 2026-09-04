@@ -715,6 +715,10 @@ _SEARCH_IMG_RE = re.compile(
 _SEARCH_TAG_RE = re.compile(r"<[^>]+>")
 
 
+_GETAV_SEARCH_ANCHOR_RE = re.compile(
+    r'<a[^>]+href="([^"]*/videos/([a-z0-9][a-z0-9-]*))"[^>]*>(.*?)</a>', re.S | re.I)
+
+
 def _result_badges(slug):
     """搜索结果徽章：无码破解·中文字幕（叠加），与版本卡片命名一致。"""
     lowered = (slug or "").lower()
@@ -775,6 +779,121 @@ def _parse_missav_search_html(html, base=None, hosts=None, limit=10):
     return out
 
 
+def _getav_search(code, hosts):
+    """getav 站内搜索：/zh/search?q={code}，结构与 missav 搜索同型。
+
+    Returns (results, None) / ([], None) / (None, 中文错误提示)。同步。
+    """
+    hosts = tuple(hosts or ())
+    if not hosts:
+        return None, "**__未配置 getav 镜像，无法搜索__**"
+    saw_block = False
+    for host in hosts:
+        search_url = f"https://{host}/zh/search?q={quote(code)}"
+        resp, err = _http_get(search_url, headers={"User-Agent": _CHROME_UA})
+        if resp is None:
+            logger.info("getav search unreachable %s: %s", search_url, err)
+            continue
+        text = resp.text or ""
+        if resp.status_code == 404:
+            return [], None
+        if _looks_blocked(resp, text):
+            saw_block = True
+            continue
+        if resp.status_code != 200:
+            continue
+        results = []
+        for m in _GETAV_SEARCH_ANCHOR_RE.finditer(text):
+            href, slug = m.group(1), m.group(2).lower()
+            title = re.sub(r"\s+", " ", _SEARCH_TAG_RE.sub(" ", m.group(3))).strip()
+            title = html_unescape(title) if title else slug.upper()
+            img = _SEARCH_IMG_RE.search(m.group(3))
+            results.append({
+                "title": title[:120],
+                "href": f"https://{host}/zh/videos/{slug}",
+                "thumb": img.group(2).strip() if img else "",
+                "badges": _result_badges(slug),
+                "source": "getav",
+            })
+            if len(results) >= 10:
+                break
+        if results:
+            return results, None
+        return [], None
+    if saw_block:
+        return None, None          # getav 被拦不阻塞整体：静默降级
+    return [], None
+
+
+AVSEA_HOST = "avsea.site"   # 无码+中文字幕搜索源（missav 同引擎克隆）
+
+
+def _avsea_search(code, hosts=(AVSEA_HOST,)):
+    """avsea.site 站内搜索（/search/{code}）；尽力而为，失败静默返回 []。
+
+    解析复用 missav 搜索解析器（avsea 为同引擎克隆），host 限定 avsea。
+    """
+    search_url = f"https://{hosts[0]}/search/{quote(code)}"
+    try:
+        resp, err = _http_get(search_url, headers={"User-Agent": _CHROME_UA})
+    except Exception:
+        return [], None
+    if resp is None or resp.status_code != 200:
+        logger.info("avsea search unavailable %s: %s",
+                    search_url, err or getattr(resp, "status_code", "?"))
+        return [], None
+    text = resp.text or ""
+    if _looks_blocked(resp, text):
+        logger.info("avsea search blocked (status %s)", resp.status_code)
+        return [], None
+    results = _parse_missav_search_html(
+        text, base=search_url, hosts=hosts, limit=10)
+    for r in results:
+        r["source"] = "avsea"
+    return results, None
+
+
+def _search_both(code, missav_hosts, getav_hosts):
+    """双源搜索（D2 追加）：missav 优先，getav 补充；按番号去重合并。
+
+    Returns (results, err)：任一源有结果即合并返回；两源都失败才给
+    错误提示。结果项带 ``source`` 字段（missav/getav）。
+    """
+    missav_results, missav_err = _missav_search(code, missav_hosts)
+    getav_results, _getav_err = _getav_search(code, getav_hosts)
+    if missav_results:
+        for r in missav_results:
+            r["source"] = "missav"
+    merged = list(missav_results or [])
+    seen = {missav_base_slug((parse_missav_url(r["href"]) or {}).get("slug", "")
+                             or r["href"].rstrip("/").rsplit("/", 1)[-1]).lower()
+            for r in merged}
+    for r in getav_results or []:
+        slug = r["href"].rstrip("/").rsplit("/", 1)[-1].lower()
+        base = missav_base_slug(slug)
+        if base in seen:
+            continue
+        seen.add(base)
+        merged.append(r)
+        if len(merged) >= 10:
+            break
+    if merged:
+        return merged[:10], None
+    avsea_results, _avsea_err = _avsea_search(code)
+    for r in avsea_results or []:
+        slug = r["href"].rstrip("/").rsplit("/", 1)[-1].lower()
+        base = missav_base_slug(slug)
+        if base in seen or len(merged) >= 10:
+            continue
+        seen.add(base)
+        merged.append(r)
+    if merged:
+        return merged[:10], None
+    if missav_results is not None or getav_results is not None:
+        return [], None            # 至少一个源确认无结果
+    return None, missav_err or "**__搜索失败，请稍后再试__**"
+
+
 def _missav_search(code, hosts):
     """站内搜索：任一镜像的 /search/{code} 解析出结果即返回。
 
@@ -782,34 +901,6 @@ def _missav_search(code, hosts):
     拦/不可达时 (None, 中文错误提示)。同步函数（_http_get 是同步的），
     调用方用 asyncio.to_thread 包一层。
     """
-    hosts = tuple(hosts or ())
-    if not hosts:
-        return None, "**__未配置 missav 镜像，无法搜索__**"
-    search_url = f"https://{hosts[0]}/search/{quote(code)}"
-    saw_block = False
-    for candidate in mirror_candidates(search_url, hosts):
-        resp, err = _http_get(candidate, headers={"User-Agent": _CHROME_UA})
-        if resp is None:
-            logger.info("missav search unreachable %s: %s", candidate, err)
-            continue
-        text = resp.text or ""
-        if resp.status_code == 404:
-            return [], None
-        if _looks_blocked(resp, text):
-            saw_block = True
-            logger.info("missav search blocked %s (status %s)",
-                        candidate, resp.status_code)
-            continue
-        if resp.status_code != 200:
-            continue
-        results = _parse_missav_search_html(text, base=candidate, hosts=hosts)
-        if results:
-            return results, None
-        return [], None           # 200 但列表为空：确实没有结果
-    if saw_block:
-        return None, "**__搜索页被 Cloudflare 拦截，请稍后再试__**"
-    return None, "**__搜索失败：镜像均不可达，请稍后再试__**"
-
 
 def _search_page_markup(token, results, page):
     """Keyboard for one card page: one result per row (title + badge),
@@ -818,7 +909,8 @@ def _search_page_markup(token, results, page):
     start = page * _SEARCH_PAGE_SIZE
     for i in range(start, min(start + _SEARCH_PAGE_SIZE, len(results))):
         item = results[i]
-        label = f"{i + 1}. {item['title'][:32]}{'…' if len(item['title']) > 32 else ''}"
+        chip = {"missav": "M", "getav": "G"}.get(item.get("source", "missav"), "A")
+        label = f"{i + 1}. [{chip}] {item['title'][:30]}{'…' if len(item['title']) > 30 else ''}"
         if item["badges"]:
             label += f"｜{item['badges']}"
         rows.append([InlineKeyboardButton(label, callback_data=f"srch:{token}:{i}")])
@@ -851,11 +943,13 @@ async def start_missav_search(message, raw_code):
             "`HEYZO-1234` / `092014_887`")
         return
     notice = await message.reply_text(f"🔍 **__正在搜索 {code} ...__**")
-    hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
     try:
-        results, err = await asyncio.to_thread(_missav_search, code, tuple(hosts))
+        results, err = await asyncio.to_thread(
+            _search_both, code, tuple(missav_hosts), tuple(getav_hosts))
     except Exception as e:
-        logger.exception("missav search crashed")
+        logger.exception("search crashed")
         results, err = None, f"**__搜索出错：{e}__**"
     if err:
         await _edit_or_reply(notice, message, err)
@@ -879,6 +973,10 @@ async def _send_search_card(message, code, results):
         'created_at': time.time(),
         'card': None,
         'is_photo': False,
+        'page': 0,
+        'caption': (f"🔍 **{code}** 搜索结果 {len(results)} 条\n"
+                    f"（{_GETAV_PROMPT_TTL // 60} 分钟内有效，/stop 可取消；"
+                    "选中后可再选版本）"),
     }
     _SEARCH_PROMPTS[message.from_user.id] = prompt
     markup = _search_page_markup(token, results, 0)
@@ -903,17 +1001,26 @@ async def _send_search_card(message, code, results):
     prompt['card'] = card
 
 
-async def _edit_search_card(prompt, text):
+async def _edit_search_card(prompt, text, markup=None):
     card = prompt.get("card")
     if card is None:
         return
     try:
         if prompt.get("is_photo"):
-            await card.edit_caption(text)
+            await card.edit_caption(text, reply_markup=markup)
         else:
-            await card.edit_text(text)
+            await card.edit_text(text, reply_markup=markup)
     except Exception:
         pass  # 卡片编辑是尽力而为：失败不影响入队
+
+
+def _picked_action_markup(token, picked):
+    """选中结果后的操作卡片：预览（浏览器打开）/ 下载 / 返回。"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 预览网页", url=picked["href"])],
+        [InlineKeyboardButton("⬇️ 下载", callback_data=f"srchact:{token}:dl")],
+        [InlineKeyboardButton("↩️ 返回搜索结果", callback_data=f"srchact:{token}:back")],
+    ])
 
 
 def _search_prompt_expired(prompt, token):
@@ -941,14 +1048,71 @@ async def search_pick_callback(client, query):
             pass
         return
     picked = results[idx]
+    prompt["picked"] = picked
+    await _edit_search_card(
+        prompt,
+        f"✅ 已选择：{picked['title'][:80]}\n"
+        f"来源：{'getav' if picked.get('source') == 'getav' else 'missav'}\n"
+        "选择操作：",
+        _picked_action_markup(token, picked))
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    return
+
+
+@app.on_callback_query(filters.regex(r"^srchact:([0-9a-f]+):(dl|back)$"))
+async def search_action_callback(client, query):
+    """选中结果后的操作：预览走 URL 按钮（无需回调）；dl 进下载流程；
+    back 回到搜索结果卡片重选。"""
+    uid = query.from_user.id
+    token, action = query.matches[0].group(1), query.matches[0].group(2)
+    prompt = _SEARCH_PROMPTS.get(uid)
+    if _search_prompt_expired(prompt, token):
+        try:
+            await query.answer("搜索结果已过期，请重新搜索", show_alert=True)
+        except Exception:
+            pass
+        return
+    if action == "back":
+        prompt.pop("picked", None)
+        await _edit_search_card(
+            prompt, prompt.get("caption", "🔍 搜索结果"),
+            _search_page_markup(token, prompt["results"], prompt.get("page", 0)))
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    picked = prompt.get("picked")
     _SEARCH_PROMPTS.pop(uid, None)
     try:
         await query.answer()
     except Exception:
         pass
+    if not picked:
+        return
     await _edit_search_card(prompt, f"✅ 已选择：{picked['title'][:80]}")
-    hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
-    variants = await discover_missav_variants(picked["href"], tuple(hosts))
+    if picked.get("source") == "getav":
+        # getav 结果：走 getav 管线（多播放源时出 getav 版本卡片）
+        getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
+        try:
+            data, _host = await asyncio.to_thread(
+                fetch_getav_movie, picked["href"], tuple(getav_hosts))
+        except MissAVError as e:
+            await prompt["message"].reply_text(f"**__getav 视频信息获取失败：{e}__**")
+            return
+        versions = list_getav_sources(data.get("videoSources") or [])
+        if len(versions) > 1:
+            await _send_version_card(prompt["message"], uid, picked["href"],
+                                     False, versions)
+            return
+        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                                want_subtitle=False)
+        return
+    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    variants = await discover_missav_variants(picked["href"], tuple(missav_hosts))
     if len(variants) > 1:
         await _send_missav_card(prompt["message"], uid, picked["href"], False, variants)
         return
@@ -969,6 +1133,7 @@ async def search_page_callback(client, query):
             pass
         return
     page = max(0, int(page_s))
+    prompt["page"] = page
     try:
         await prompt["card"].edit_reply_markup(
             reply_markup=_search_page_markup(token, prompt["results"], page))
