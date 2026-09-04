@@ -24,6 +24,15 @@ from tests.test_missav_route import (  # noqa: F401
 )
 
 
+@pytest.fixture(autouse=True)
+def _mute_other_sources(ytdl, monkeypatch):
+    """默认静默 getav/avsea 搜索源；需要真实解析的测试取 reals 恢复。"""
+    reals = {"getav": ytdl._getav_search, "avsea": ytdl._avsea_search}
+    monkeypatch.setattr(ytdl, "_getav_search", lambda code, hosts=(): ([], None))
+    monkeypatch.setattr(ytdl, "_avsea_search", lambda code: ([], None))
+    yield reals
+
+
 # ─── 番号归一化（四层正则） ────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("raw,expected", [
@@ -390,26 +399,30 @@ def test_route_code_search_ignores_urls_and_plain_text(ytdl, monkeypatch):
 
 # ─── 双源搜索（D2 追加）：missav + getav /zh/search?q= ─────────────────────────
 
-def test_search_both_merges_and_dedupes(ytdl, monkeypatch):
-    missav_results = [{"title": "A", "href": "https://missav.ai/ssis-405",
-                       "thumb": "", "badges": "", "source": "missav"}]
-    getav_results = [
-        {"title": "A getav", "href": "https://getav.net/zh/videos/ssis-405",
-         "thumb": "", "badges": "", "source": "getav"},          # 同番号 → 去重
-        {"title": "B getav", "href": "https://getav.net/zh/videos/ssis-405-b",
-         "thumb": "", "badges": "", "source": "getav"},
-    ]
-    seen = {}
-    def fake_missav(code, hosts):
-        return missav_results, None
-    def fake_getav(code, hosts):
-        return getav_results, None
-    monkeypatch.setattr(ytdl, "_missav_search", fake_missav)
-    monkeypatch.setattr(ytdl, "_getav_search", fake_getav)
+def test_search_both_interleaves_and_keeps_cross_source(ytdl, monkeypatch, _mute_other_sources):
+    """三源轮插：同番号跨源保留（不同站 = 不同的流选择），卡片来源可见。"""
+    monkeypatch.setattr(
+        ytdl, "_missav_search",
+        lambda code, hosts: ([
+            {"title": "M 版本0", "href": "https://missav.ai/ssis-405", "thumb": "", "badges": ""},
+            {"title": "M 中字", "href": "https://missav.ai/ssis-405-chinese-subtitle", "thumb": "", "badges": "中文字幕"},
+        ], None))
+    monkeypatch.setattr(
+        ytdl, "_getav_search",
+        lambda code, hosts: ([
+            {"title": "G 版本0", "href": "https://getav.net/zh/videos/ssis-405",
+             "thumb": "", "badges": "", "source": "getav"},
+        ], None))
+    monkeypatch.setattr(
+        ytdl, "_avsea_search",
+        lambda code: ([
+            {"title": "A 无码", "href": "https://avsea.site/movies/ssis-405-uncensored",
+             "thumb": "", "badges": "无码破解", "source": "avsea"},
+        ], None))
     merged, err = ytdl._search_both("SSIS-405", ("missav.ai",), ("getav.net",))
     assert err is None
-    assert [r["source"] for r in merged] == ["missav", "getav"]
-    assert len(merged) == 2
+    assert [r["source"] for r in merged] == ["missav", "getav", "avsea", "missav"]
+
 
 
 def test_search_both_both_fail_yields_error(ytdl, monkeypatch):
@@ -420,7 +433,7 @@ def test_search_both_both_fail_yields_error(ytdl, monkeypatch):
     assert merged is None and "Cloudflare" in err
 
 
-def test_getav_search_parses_video_anchors(ytdl, monkeypatch):
+def test_getav_search_parses_video_anchors(ytdl, monkeypatch, _mute_other_sources):
     html = (
         '<div class="videos">'
         '<a href="/zh/videos/ssis-405"><img src="//getav.net/th/1.jpg" alt="标题一">标题一</a>'
@@ -429,6 +442,7 @@ def test_getav_search_parses_video_anchors(ytdl, monkeypatch):
     fake_page = __import__("types").SimpleNamespace(status_code=200, text=html)
     monkeypatch.setattr(
         ytdl, "_http_get", lambda url, headers=None: (fake_page, None))
+    monkeypatch.setattr(ytdl, "_getav_search", _mute_other_sources["getav"])
     results, err = ytdl._getav_search("SSIS-405", ("getav.net",))
     assert err is None
     assert [r["href"] for r in results] == [
@@ -479,18 +493,19 @@ def test_search_pick_action_card_has_preview_url(ytdl, monkeypatch):
     assert any("https://missav.ai/ssis-405" == b.url for b in url_buttons)
 
 
-def test_avsea_search_parses_results(ytdl, monkeypatch):
+def test_avsea_search_parses_results(ytdl, monkeypatch, _mute_other_sources):
     """avsea（missav 同引擎克隆）搜索解析：host 限定 avsea.site。"""
     html = (
-        '<a href="/ssis-405"><img src="//avsea.site/th/1.jpg" alt="标题">SSIS-405 标题</a>'
+        '<a href="/movies/ssis-405"><img src="//avsea.site/th/1.jpg" alt="标题">SSIS-405 标题</a>'
         '<a href="/tags/HD">HD</a>')
     fake_page = __import__("types").SimpleNamespace(status_code=200, text=html)
     monkeypatch.setattr(
         ytdl, "_http_get", lambda url, headers=None: (fake_page, None))
+    monkeypatch.setattr(ytdl, "_avsea_search", _mute_other_sources["avsea"])
     results, err = ytdl._avsea_search("SSIS-405")
     assert err is None
     assert len(results) == 1
-    assert results[0]["href"] == "https://avsea.site/ssis-405"
+    assert results[0]["href"] == "https://avsea.site/movies/ssis-405"
     assert results[0]["source"] == "avsea"    # _avsea_search 统一打来源标
 
 

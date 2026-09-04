@@ -735,6 +735,10 @@ _SEARCH_IMG_RE = re.compile(
 _SEARCH_TAG_RE = re.compile(r"<[^>]+>")
 
 
+_AVSEA_SEARCH_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*?href="([^"]*/movies/([a-z0-9][a-z0-9-]*))"[^>]*>(.*?)</a>', re.S | re.I)
+
+
 _GETAV_SEARCH_ANCHOR_RE = re.compile(
     r'<a[^>]+href="([^"]*/videos/([a-z0-9][a-z0-9-]*))"[^>]*>(.*?)</a>', re.S | re.I)
 
@@ -866,52 +870,63 @@ def _avsea_search(code, hosts=(AVSEA_HOST,)):
     if _looks_blocked(resp, text):
         logger.info("avsea search blocked (status %s)", resp.status_code)
         return [], None
-    results = _parse_missav_search_html(
-        text, base=search_url, hosts=hosts, limit=10)
-    for r in results:
-        r["source"] = "avsea"
+    results, seen = [], set()
+    for m in _AVSEA_SEARCH_ANCHOR_RE.finditer(text):
+        href, slug = m.group(1), m.group(2).lower()
+        if slug in seen:
+            continue
+        seen.add(slug)
+        title = re.sub(r"\s+", " ", _SEARCH_TAG_RE.sub(" ", m.group(3))).strip()
+        title = html_unescape(title) if title else slug.upper()
+        img = _SEARCH_IMG_RE.search(m.group(3))
+        results.append({
+            "title": html_unescape(title)[:120],
+            "href": urljoin(search_url, m.group(1)),
+            "thumb": img.group(2).strip() if img else "",
+            "badges": _result_badges(slug),
+            "source": "avsea",
+        })
+        if len(results) >= 10:
+            break
     return results, None
 
 
 def _search_both(code, missav_hosts, getav_hosts):
-    """双源搜索（D2 追加）：missav 优先，getav 补充；按番号去重合并。
+    """三源搜索：missav / getav / avsea，结果轮插合并（D2 定稿）。
 
-    Returns (results, err)：任一源有结果即合并返回；两源都失败才给
-    错误提示。结果项带 ``source`` 字段（missav/getav）。
+    同源内各自去重；跨源保留（同番号在不同站是不同的流/版本选择）。
+    任一源有结果即合并返回；有源被拦/出错时优先报错误（可重试）；
+    三源皆失败或全部确认无结果才分别返回错误/空。
     """
     missav_results, missav_err = _missav_search(code, missav_hosts)
-    getav_results, _getav_err = _getav_search(code, getav_hosts)
-    if missav_results:
-        for r in missav_results:
-            r["source"] = "missav"
-    merged = list(missav_results or [])
-    seen = {missav_base_slug((parse_missav_url(r["href"]) or {}).get("slug", "")
-                             or r["href"].rstrip("/").rsplit("/", 1)[-1]).lower()
-            for r in merged}
-    for r in getav_results or []:
-        slug = r["href"].rstrip("/").rsplit("/", 1)[-1].lower()
-        base = missav_base_slug(slug)
-        if base in seen:
-            continue
-        seen.add(base)
-        merged.append(r)
-        if len(merged) >= 10:
+    getav_results, _gerr = _getav_search(code, getav_hosts)
+    avsea_results, _aerr = _avsea_search(code)
+    for r in missav_results or []:
+        r["source"] = "missav"
+    queues = [missav_results or [], getav_results or [], avsea_results or []]
+    merged, idx = [], [0, 0, 0]
+    while len(merged) < 10:
+        added = False
+        for qi, q in enumerate(queues):
+            if idx[qi] < len(q):
+                merged.append(q[idx[qi]])
+                idx[qi] += 1
+                added = True
+                if len(merged) >= 10:
+                    break
+        if not added:
             break
     if merged:
-        return merged[:10], None
-    avsea_results, _avsea_err = _avsea_search(code)
-    for r in avsea_results or []:
-        slug = r["href"].rstrip("/").rsplit("/", 1)[-1].lower()
-        base = missav_base_slug(slug)
-        if base in seen or len(merged) >= 10:
-            continue
-        seen.add(base)
-        merged.append(r)
-    if merged:
-        return merged[:10], None
-    if missav_results is not None or getav_results is not None:
+        return merged, None
+    errs = [err for results, err in
+            ((missav_results, missav_err), (getav_results, _gerr), (avsea_results, _aerr))
+            if results is None and err]
+    if errs:
+        return None, errs[0]
+    if (missav_results is not None or getav_results is not None
+            or avsea_results is not None):
         return [], None            # 至少一个源确认无结果
-    return None, missav_err or "**__搜索失败，请稍后再试__**"
+    return None, "**__搜索失败，请稍后再试__**"
 
 
 def _missav_search(code, hosts):
@@ -1028,10 +1043,16 @@ async def _send_search_card(message, code, results):
     }
     _SEARCH_PROMPTS[message.from_user.id] = prompt
     markup = _search_page_markup(token, results, 0)
+    counts = {}
+    for r in results:
+        key = r.get("source", "missav")
+        counts[key] = counts.get(key, 0) + 1
+    src_line = " · ".join(f"{k} {v} 条" for k, v in counts.items())
     caption = (
-        f"🔍 **{code}** 搜索结果 {len(results)} 条\n"
+        f"🔍 **{code}** 搜索结果 {len(results)} 条（{src_line}）\n"
         f"（{_GETAV_PROMPT_TTL // 60} 分钟内有效，/stop 可取消；"
         "选中后可再选版本）")
+    prompt["caption"] = caption
     card = None
     thumb = next((r["thumb"] for r in results if r["thumb"]), "")
     if thumb:
