@@ -85,6 +85,10 @@ BURN_CONCURRENCY = max(1, int(os.getenv("BURN_CONCURRENCY", "1")))
 FFMPEG_BURN_THREADS = int(os.getenv("FFMPEG_BURN_THREADS", "0"))
 # 单次烧录墙钟超时秒数：0 = 不限时；超时会 kill ffmpeg 并走既有的"回退无字幕封装"路径
 BURN_TIMEOUT_S = max(0, int(os.getenv("BURN_TIMEOUT_S", "10800")))
+# 编码档位（issue #19 定稿 §8）：superfast 与 veryfast 同 CRF 质量档基本一致、
+# 实测快 1.5-1.8×；ultrafast 仅建议 env 覆盖（关 CABAC/psy，暗场 banding 风险）。
+BURN_PRESET = os.getenv("BURN_PRESET", "superfast")
+BURN_CRF = int(os.getenv("BURN_CRF", "19"))
 
 # ─── DISK WATERMARK (任务准入，Phase 2 §5.2) ────────────────────────────────────
 # 运行卷剩余空间低于该值时拒绝新任务（已运行任务不受影响），避免半完成的错误投递
