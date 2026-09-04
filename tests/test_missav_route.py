@@ -851,6 +851,87 @@ def test_discard_missav_prompts_drops_card(ytdl, monkeypatch):
     assert ytdl.discard_missav_prompts(42) == 0
 
 
+# ─── slow lane: burn stage frees the job slot (issue #20, §7.2) ───────────────
+
+class _FakeSemaphore:
+    def __init__(self, value=1):
+        self.value = value
+        self.releases = 0
+
+    def locked(self):
+        return self.value <= 0
+
+    async def acquire(self):
+        self.value -= 1
+        return True
+
+    def release(self):
+        self.releases += 1
+        self.value += 1
+
+
+def _drive_hls_site(ytdl, monkeypatch, stages):
+    """Run _process_hls_site with a fake downloader emitting the given
+    (done, total, stage) progress events and a stubbed upload tail."""
+    sent = {"album": []}
+
+    async def fake_downloader(url, path, *, hosts, concurrency, progress,
+                              task_id, **extra):
+        for done, total, stage in stages:
+            await progress(done, total, stage)
+        return {"title": "t", "thumbnail": "", "details": {}}
+
+    async def fake_probe(path):
+        return {"duration": 3, "width": 1, "height": 1}
+
+    async def fake_cover(*_a, **_k):
+        return None
+
+    async def fake_delivery(_message):
+        return -100, ytdl.app
+
+    async def fake_album(sender, dest, notice, path, cover, caption, d, w, h):
+        sent["album"].append((dest, caption))
+
+    class FakeApp:
+        async def send_message(self, *_a, **_k):
+            return types.SimpleNamespace(delete=lambda: None)
+
+    monkeypatch.setattr(ytdl, "get_video_metadata", fake_probe)
+    monkeypatch.setattr(ytdl, "_resolve_cover", fake_cover)
+    monkeypatch.setattr(ytdl, "_resolve_delivery", fake_delivery)
+    monkeypatch.setattr(ytdl, "_upload_missav_album", fake_album)
+    monkeypatch.setattr(ytdl, "app", FakeApp())
+    msg = _FakeMessage("/dl x")
+    asyncio.run(ytdl._process_hls_site(
+        msg, "https://missav.ai/sone-543", ("missav.ai",),
+        fake_downloader, "missav"))
+    return sent
+
+
+def test_burn_stage_releases_job_slot(ytdl, monkeypatch):
+    sem = _FakeSemaphore(1)
+    monkeypatch.setattr(ytdl, "_get_missav_jobs_sem", lambda: sem)
+
+    sent = _drive_hls_site(ytdl, monkeypatch,
+                           [(0, 1, "burn"), (1, 1, "segments")])
+    assert sent["album"]           # upload still happened on the same coroutine
+    # burn freed the slot exactly once, and the outer finally did NOT
+    # double-release (semaphore value would exceed MISSAV_MAX_JOBS)
+    assert sem.releases == 1
+    assert sem.value == 1
+
+
+def test_non_sub_task_releases_slot_only_in_finally(ytdl, monkeypatch):
+    sem = _FakeSemaphore(1)
+    monkeypatch.setattr(ytdl, "_get_missav_jobs_sem", lambda: sem)
+
+    _drive_hls_site(ytdl, monkeypatch, [(1, 1, "segments")])
+    # no burn stage: slot held for the whole pipeline, released by the finally
+    assert sem.releases == 1
+    assert sem.value == 1
+
+
 def test_dl_usage_mentions_missav_for_sub(ytdl, monkeypatch):
     _queue_state(monkeypatch)
     msg = _FakeMessage("/dl")

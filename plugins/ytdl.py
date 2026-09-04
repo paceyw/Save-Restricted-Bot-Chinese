@@ -1257,15 +1257,38 @@ async def _process_hls_site(message, url, hosts, downloader, site,
     progress_message = await message.reply_text(f"**__开始下载 {site} 视频...__**")
     _report_task(task_id, f'{site} 下载中...')
 
-    async with sem:
+    await sem.acquire()
+    job_slot = {'sem': sem, 'released': False}
+    try:
         await _run_hls_download(
             message, url, hosts, progress_message, downloader, site,
-            extra_dl_kwargs or {}, task_id=task_id,
+            extra_dl_kwargs or {}, task_id=task_id, job_slot=job_slot,
         )
+    finally:
+        # 慢车道在烧录阶段已提前释放过就不再补：双重 release 会把
+        # 信号量撑到超过 MISSAV_MAX_JOBS。
+        if not job_slot['released']:
+            sem.release()
+
+
+def _release_job_slot(job_slot):
+    """慢车道（issue #20，规格 §7.2）：下载+合并完成、进入烧录阶段即
+    释放 missav job 信号量。
+
+    烧录在 utils.missav 的 BURN 信号量（BURN_CONCURRENCY，默认 1）上
+    自行排队，完成后仍由同一协程继续上传——只是不再占用 job 槽，
+    新的下载任务得以立刻进入，根治「-sub 任务空占槽、新请求被误拒」。
+    """
+    if not job_slot or job_slot.get('released'):
+        return
+    job_slot['released'] = True
+    sem = job_slot.get('sem')
+    if sem is not None:
+        sem.release()
 
 
 async def _run_hls_download(message, url, hosts, progress_message, downloader, site,
-                            extra_dl_kwargs=None, task_id=None):
+                            extra_dl_kwargs=None, task_id=None, job_slot=None):
 
 
     # Task-scoped scratch dir (plan §5.2): the whole download lives in
@@ -1279,15 +1302,19 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
     download_path = os.path.join(download_dir, f"{get_random_string()}.mp4")
 
     async def progress(done, total, stage):
-        if stage == "burn" and not progress._burn_notified:
-            progress._burn_notified = True
-            _report_task(task_id, '烧录中文字幕中（约 30-60 分钟）...')
-            try:
-                await progress_message.edit_text(
-                    "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
-                )
-            except Exception:
-                pass
+        if stage == "burn":
+            # 慢车道：下载+合并已完成，烧录改在独立 BURN 信号量上排队，
+            # job 槽即刻让出（幂等，_burn_notified 只管一次文案提示）。
+            _release_job_slot(job_slot)
+            if not progress._burn_notified:
+                progress._burn_notified = True
+                _report_task(task_id, '烧录中文字幕中（约 30-60 分钟）...')
+                try:
+                    await progress_message.edit_text(
+                        "**__下载完成，正在烧录中文字幕到画面（需完整重编码，约 30-60 分钟）...__**"
+                    )
+                except Exception:
+                    pass
             return
         if stage != "segments" or total <= 0:
             return
