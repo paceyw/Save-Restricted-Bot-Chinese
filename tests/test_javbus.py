@@ -314,3 +314,36 @@ def test_enrich_details_never_raises(monkeypatch):
     assert javbus.enrich_details(d, "https://missav.ai/en/dass-629") is d
     assert javbus.enrich_details(None) is None
     assert javbus.enrich_details("not-a-dict") == "not-a-dict"
+
+
+def test_fetch_javbus_meta_redirect_off_domain_rejected(monkeypatch):
+    """重定向到 javbus.com 之外的最终响应必须整体拒绝（review）。"""
+    class _R:
+        status_code = 200
+        text = "<html><title>x</title></html>"
+        content = b"x"
+        url = "https://evil.com/dass-629"
+
+    def fake_get(url, timeout=None, max_bytes=None):
+        page = javbus._Page(200, b"<html></html>", None, url="https://evil.com/dass-629")
+        return page, None
+
+    monkeypatch.setattr(javbus, "_http_get", fake_get)
+    assert javbus.fetch_javbus_meta("DASS-629") is None
+
+
+def test_fetch_javbus_meta_same_host_redirect_accepted(monkeypatch):
+    """最终 host 仍是 javbus.com（www 归一）时正常解析。"""
+    page = javbus._Page(
+        200,
+        b"<html><title>DASS-629</title></html>",
+        None,
+        url="https://www.javbus.com/DASS-629",
+    )
+
+    def fake_get(url, timeout=None, max_bytes=None):
+        return page, None
+
+    monkeypatch.setattr(javbus, "_http_get", fake_get)
+    meta = javbus.fetch_javbus_meta("DASS-629")
+    assert meta is not None and meta["title"].startswith("DASS-629")

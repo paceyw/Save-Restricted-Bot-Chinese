@@ -70,14 +70,24 @@ def _get_session():
 
 
 class _Page:
-    """Minimal response facade: status_code / text / headers."""
+    """Minimal response facade: status_code / text / headers / final url."""
 
-    __slots__ = ("status_code", "text", "headers")
+    __slots__ = ("status_code", "text", "headers", "url")
 
-    def __init__(self, status_code, body, headers=None):
+    def __init__(self, status_code, body, headers=None, url=None):
         self.status_code = status_code
         self.text = body.decode("utf-8", errors="replace")
         self.headers = headers or {}
+        self.url = url
+
+
+def _redirected_off_domain(resp, requested_url):
+    """True when the FINAL response host left javbus.com (review: the
+    session follows redirects, so the request-time URL is not enough)."""
+    from urllib.parse import urlparse
+    final = urlparse(getattr(resp, "url", None) or requested_url).hostname or ""
+    host = final.lower().removeprefix("www.")
+    return host != JAVBUS_HOST.removeprefix("www.")
 
 
 def _http_get(url, timeout=PAGE_TIMEOUT, max_bytes=PAGE_MAX_BYTES):
@@ -101,7 +111,8 @@ def _http_get(url, timeout=PAGE_TIMEOUT, max_bytes=PAGE_MAX_BYTES):
                 chunks.append(chunk)
             return (
                 _Page(resp.status_code, b"".join(chunks),
-                      getattr(resp, "headers", None)),
+                      getattr(resp, "headers", None),
+                      getattr(resp, "url", url)),
                 None,
             )
         finally:
@@ -262,6 +273,10 @@ def fetch_javbus_meta(code):
 
     try:
         page, err = _http_get(f"https://{JAVBUS_HOST}/{code}")
+        if page is not None and _redirected_off_domain(
+                page, f"https://{JAVBUS_HOST}/{code}"):
+            logger.info("javbus redirected off-domain for %s", code)
+            return None
         html = _page_html(page)
         meta = parse_javbus_page(html) if html else None
     except Exception:  # a broken seam must never surface into the pipeline

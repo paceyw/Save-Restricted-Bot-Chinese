@@ -52,6 +52,7 @@ from utils.missav import (
     _looks_blocked,
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
+    cover_url_allowed,
     MissAVError,
     build_caption,
     discover_missav_variants,
@@ -116,6 +117,14 @@ def _task_result(task_id, result):
 UPLOAD_HEADER = "╭───────────────────────────\n│ **__⬆️ 上传中__**\n├───────────────────────────"
  
 def d_thumbnail(thumbnail_url, save_path, timeout=(5, 20), max_bytes=10 * 1024 * 1024):
+    # review (SSRF medium): og:image / movie-JSON covers are page-controlled.
+    # Scheme + private-host + registered-domain allowlist, else drop the
+    # cover — _resolve_cover falls back to a video screenshot.
+    if not cover_url_allowed(thumbnail_url,
+                             (*_MISSAV_DEFAULT_MIRRORS, *_GETAV_DEFAULT_MIRRORS)):
+        logger.info("cover host not allowed, dropping thumbnail: %s",
+                    thumbnail_url[:80])
+        return None
     try:
         response = requests.get(thumbnail_url, stream=True, timeout=timeout)
         response.raise_for_status()

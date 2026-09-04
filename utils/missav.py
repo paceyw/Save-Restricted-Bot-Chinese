@@ -504,8 +504,12 @@ def extract_video_details(page_html, url):
 
 
 def _hashtag(text):
-    """'#' + text with characters that break Telegram hashtags mapped away."""
-    cleaned = re.sub(r"[\s#\n]+", "_", html_unescape(text).strip())
+    """'#' + text with characters that break Telegram hashtags mapped away.
+
+    Markdown-active characters are mapped too: caption text derived from
+    page-controlled titles must not inject formatting into the album.
+    """
+    cleaned = re.sub(r"[\s#\n\[\]~`*|<>{}]+", "_", html_unescape(text).strip())
     cleaned = cleaned.strip("_")
     return f"#{cleaned}" if cleaned else ""
 
@@ -899,6 +903,46 @@ def _host_allowed(url, pinned_domain):
     if host == pinned_domain or host.endswith("." + pinned_domain):
         return True
     return _registered_domain(host) == pinned_domain
+
+
+def _response_host_allowed(resp, requested_url, pinned_domain):
+    """Re-validate the FINAL host after redirects.
+
+    ``_http_get`` follows redirects transparently and exposes the final
+    URL as ``resp.url``; a request-time ``_host_allowed`` check alone
+    does not pin the actual endpoint (review finding: subtitle/getav
+    subtitle paths). Missing ``url`` (older fakes) falls back to the
+    requested URL.
+    """
+    final = getattr(resp, "url", None) or requested_url
+    return _host_allowed(final, pinned_domain)
+
+
+# Page-provided cover URLs (og:image / movie-JSON covers) may live on the
+# mirror itself or the known video-CDN families; anything else drops the
+# cover and the delivery falls back to a screenshot. Same discipline the
+# HLS pipeline applies to playlists/segments (review: unpinned cover GET).
+_COVER_EXTRA_DOMAINS = (
+    "surrit.com", "nineyu.com", "fourhoi.com", "worldstatic.com", "getav.net",
+)
+
+
+def cover_url_allowed(url, hosts=DEFAULT_MIRRORS):
+    """Scheme + private-host + registered-domain allowlist for cover URLs."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if _PRIVATE_HOST_RE.match(host):
+        return False
+    domain = _registered_domain(host)
+    allowed = {h.lower() for h in hosts} | set(_COVER_EXTRA_DOMAINS)
+    return domain in allowed
 
 
 def _looks_blocked(resp, text):
@@ -1520,6 +1564,10 @@ def _fetch_getav_subtitle(sub_entry, pinned_domain, dest_dir):
     if resp is None or resp.status_code != 200 or not resp.content:
         logger.info("getav subtitle fetch failed: %s", err or getattr(resp, "status_code", "?"))
         return None
+    if not _response_host_allowed(resp, url, pinned_domain):
+        logger.info("getav subtitle redirected off-domain: %s",
+                    urlparse(getattr(resp, "url", url) or url).hostname)
+        return None
     text = resp.text or ""
     if "-->" not in text:
         logger.info("getav subtitle has no cues, skipped")
@@ -1566,8 +1614,15 @@ def find_getav_subtitle_for_code(code, dest_dir):
         if data is None:
             continue
         haystack = f"{data.get('id') or ''} {data.get('title') or ''}".upper()
-        if code.upper() not in haystack:
-            logger.info("getav code-subtitle mismatch: %s not in %s", code, haystack[:80])
+        # boundary-aware match (review: "ABC-12" must not accept "ABC-123"):
+        # the record id must normalize to exactly the wanted code, or the
+        # title's own CODE-123 token must normalize to it exactly
+        want = re.sub(r"[^A-Z0-9]", "", code.upper())
+        ident = re.sub(r"[^A-Z0-9]", "", str(data.get("id") or "").upper())
+        title_token = re.search(r"[A-Z][A-Z0-9]*-\d+", str(data.get("title") or "").upper())
+        token_code = re.sub(r"[^A-Z0-9]", "", title_token.group(0)) if title_token else ""
+        if want != ident and want != token_code:
+            logger.info("getav code-subtitle mismatch: %s vs %s", code, haystack[:80])
             continue
         sub = select_getav_subtitle(data)
         if not sub:
@@ -1603,6 +1658,11 @@ async def _fetch_subtitle_track(subtitle_uri, headers, pinned_domain, dest_dir):
                 logger.info("subtitle playlist fetch failed: %s",
                             err or getattr(resp, "status_code", "?"))
                 return None
+            # redirects are followed transparently: re-pin the FINAL host
+            if not _response_host_allowed(resp, url, pinned_domain):
+                logger.info("subtitle playlist redirected off-domain: %s",
+                            urlparse(getattr(resp, "url", url) or url).hostname)
+                return None
             text = resp.text or ""
             if text.lstrip().startswith("WEBVTT") and "-->" in text:
                 vtt_bodies = [text]  # track URI pointed straight at a VTT body
@@ -1625,8 +1685,14 @@ async def _fetch_subtitle_track(subtitle_uri, headers, pinned_domain, dest_dir):
                         logger.info("subtitle segment failed (%s), dropping track",
                                     seg_err or getattr(seg_resp, "status_code", "?"))
                         return None
+                    if not _response_host_allowed(seg_resp, seg_url, pinned_domain):
+                        logger.info("subtitle segment redirected off-domain: %s",
+                                    urlparse(getattr(seg_resp, "url", seg_url) or seg_url).hostname)
+                        return None
                     body = seg_resp.text or ""
-                    spent += len(body)
+                    # budget on encoded BYTES, not decoded chars (CJK VTT
+                    # is up to 3 bytes/char — review finding)
+                    spent += len(seg_resp.content or b"")
                     if spent > PAGE_MAX_BYTES:
                         return None
                     vtt_bodies.append(body)
@@ -1719,9 +1785,13 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
             elif len(data) > MAX_SEGMENT_BYTES:
                 raise MissAVError(f"片段 {index} 异常巨大 ({len(data)} bytes)，中止")
             else:
+                # reserve BEFORE the decrypt await: with several workers in
+                # flight, a check that only precedes the await lets them all
+                # pass on the same stale budget (review finding)
                 if budget[0] + len(data) > MAX_TOTAL_BYTES:
                     raise MissAVError(
                         f"累计下载量超预算 ({budget[0] + len(data)} > {MAX_TOTAL_BYTES} bytes)，中止")
+                budget[0] += len(data)
                 if key is not None:
                     data = await asyncio.to_thread(
                         decrypt_segment, data, key, iv_factory(index)
@@ -1729,7 +1799,6 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
                 path = os.path.join(temp_dir, f"{index:06d}.ts")
                 with open(path, "wb") as fh:
                     fh.write(data)
-                budget[0] += len(data)
                 return path
         else:
             last_err = f"segment {index}: HTTP {status if status is not None else err}"
@@ -1870,6 +1939,10 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
             raise
 
         await _report(total, total, "merge")
+        # review F1: the job slot frees at burn time, so concurrent tasks
+        # may hold several GB by now — re-check before writing the output
+        if shutil.disk_usage(dest_dir).free < MIN_FREE_DISK:
+            raise MissAVError("磁盘剩余空间不足（封装前复查），请稍后重试")
         # no merged.ts: remux/burn read the decrypted parts straight from
         # this ffconcat list (-4..8 GB of copy IO per 2-4 GB job)
         concat_list = os.path.join(temp_dir, "list.txt")

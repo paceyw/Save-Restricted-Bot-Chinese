@@ -1536,3 +1536,178 @@ def test_playlist_stall_retries_then_download_succeeds(monkeypatch, tmp_path):
     missav.asyncio.run(missav.download_missav("https://missav.ai/sone-543", str(dest)))
     assert dest.read_bytes() == b"".join(parts)
     assert master_stalls["n"] == 3               # stalled twice, third attempt OK
+
+
+# ─── review hardening: redirect pin / code boundary / budget / disk ──────────
+
+def test_subtitle_playlist_redirect_off_domain_rejected(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        resp = FakeResp(text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nx\n")
+        resp.url = "https://evil.com/sub.vtt"  # redirect landed off-domain
+        return resp, None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert asyncio.run(missav._fetch_subtitle_track(
+        "https://surrit.com/sub.vtt", {"Referer": "https://missav.ai/"},
+        "surrit.com", str(tmp_path))) is None
+
+
+def test_subtitle_segment_redirect_off_domain_rejected(monkeypatch, tmp_path):
+    playlist = ("#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+                "#EXTINF:5.0,\nseg0.vtt\n#EXT-X-ENDLIST")
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        resp = FakeResp(text=playlist if url.endswith("track.m3u8")
+                        else "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nx\n")
+        if url.endswith("seg0.vtt"):
+            resp.url = "https://evil.com/seg0.vtt"
+        else:
+            resp.url = url
+        return resp, None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert asyncio.run(missav._fetch_subtitle_track(
+        "https://surrit.com/track.m3u8", {"Referer": "https://missav.ai/"},
+        "surrit.com", str(tmp_path))) is None
+
+
+def test_getav_subtitle_redirect_off_domain_rejected(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("/api/movies/SONE-543"):
+            return FakeResp(text=json.dumps({
+                "success": True,
+                "data": {"id": "sone-543", "title": "SONE-543",
+                         "videoSources": [{"type": "raw_1080p",
+                                           "url": "https://static.worldstatic.com/v.m3u8"}],
+                         "subtitles": [{"language": "zh", "format": "vtt",
+                                        "filePath": "https://static.worldstatic.com/zh.vtt"}]}})), None
+        resp = FakeResp(text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nx\n",
+                        content=b"WEBVTT cue body")
+        resp.url = "https://evil.com/zh.vtt"
+        return resp, None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert missav.find_getav_subtitle_for_code("SONE-543", str(tmp_path)) is None
+
+
+def test_find_getav_subtitle_prefix_code_rejected(monkeypatch, tmp_path):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("/api/movies/SONE-54"):
+            return FakeResp(text=json.dumps({
+                "success": True,
+                "data": {"id": "sone-543", "title": "SONE-543 作品",
+                         "videoSources": [{"type": "raw_1080p",
+                                           "url": "https://static.worldstatic.com/v.m3u8"}],
+                         "subtitles": [{"language": "zh", "format": "vtt",
+                                        "filePath": "https://static.worldstatic.com/zh.vtt"}]}})), None
+        raise AssertionError(f"subtitle must not be fetched after mismatch: {url}")
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert missav.find_getav_subtitle_for_code("SONE-54", str(tmp_path)) is None
+
+
+def test_subtitle_budget_counts_bytes_not_chars(monkeypatch, tmp_path):
+    # 1500 CJK chars = 4500 UTF-8 bytes: over a 2000-byte budget even though
+    # the char count (1500) stays under it
+    monkeypatch.setattr(missav, "PAGE_MAX_BYTES", 2000)
+    playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:5.0,\nseg0.vtt\n#EXT-X-ENDLIST"
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("track.m3u8"):
+            resp = FakeResp(text=playlist)
+            resp.url = url
+            return resp, None
+        resp = FakeResp(text="あ" * 1500, content=("あ" * 1500).encode())
+        resp.url = url
+        return resp, None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    assert asyncio.run(missav._fetch_subtitle_track(
+        "https://surrit.com/track.m3u8", {"Referer": "https://missav.ai/"},
+        "surrit.com", str(tmp_path))) is None
+
+
+def test_encrypted_segments_concurrent_budget_hard_stop(monkeypatch, tmp_path):
+    # 2 workers x 6MB against a 10MB budget: with the check separated from
+    # the reserve by the decrypt await, both workers passed and 12MB landed
+    key = os.urandom(16)
+    media_sequence = 0
+    parts = [os.urandom(6 * 1024 * 1024) for _ in range(2)]
+
+    def enc_part(i, data):
+        iv = (i + media_sequence).to_bytes(16, "big")
+        return _aes_crypt(_pkcs7(data), key, iv, encrypt=True)
+
+    media_pl = MEDIA.replace(
+        "seg-1.ts\n#EXT-X-ENDLIST",
+        "seg-1.ts\n#EXTINF:5.0,\nseg-2.ts\n#EXT-X-ENDLIST")
+    served = {
+        "https://missav.ai/sone-543": FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER),
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=media_pl),
+        "https://surrit.com/vid/1080/enc.key": FakeResp(content=key),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=enc_part(0, parts[0])),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=enc_part(1, parts[1])),
+        "https://surrit.com/vid/1080/seg-2.ts": FakeResp(content=enc_part(2, parts[1])),
+    }
+    monkeypatch.setattr(missav, "_http_get",
+                        lambda url, headers=None, timeout=None, max_bytes=None:
+                        (served.get(url) or FakeResp(404), None))
+    monkeypatch.setattr(missav, "MAX_TOTAL_BYTES", 10 * 1024 * 1024)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav.MissAVError, match="预算"):
+        asyncio.run(missav.download_missav(
+            "https://missav.ai/sone-543", str(tmp_path / "o.mp4"), concurrency=3))
+
+
+def test_burn_stage_disk_recheck_aborts(monkeypatch, tmp_path):
+    parts = [os.urandom(64) for _ in range(2)]
+    served = {
+        "https://missav.ai/sone-543": FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")),
+        "https://surrit.com/vid/master.m3u8": FakeResp(text=MASTER),
+        "https://surrit.com/vid/1080/prog.m3u8": FakeResp(text=MEDIA),
+        "https://surrit.com/vid/1080/enc.key": FakeResp(content=os.urandom(16)),
+        "https://surrit.com/vid/1080/seg-0.ts": FakeResp(content=os.urandom(64)),
+        "https://surrit.com/vid/1080/seg-1.ts": FakeResp(content=os.urandom(64)),
+    }
+    calls = {"n": 0}
+
+    class _Disk:
+        free = 100 * 1024 ** 3
+
+    def fake_disk(_):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # admission passes, pre-merge recheck fails
+            _Disk.free = 1 * 1024 ** 3
+        return shutil.disk_usage("/", ) if False else _Disk
+
+    monkeypatch.setattr(missav.shutil, "disk_usage", fake_disk)
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None:
+        (served.get(url) or FakeResp(404), None))
+    with pytest.raises(missav.MissAVError, match="磁盘剩余空间不足"):
+        asyncio.run(missav.download_missav(
+            "https://missav.ai/sone-543", str(tmp_path / "o.mp4")))
+    assert calls["n"] >= 2
+
+
+def test_cover_url_allowed_allowlist():
+    assert missav.cover_url_allowed("https://missav.ai/pic.jpg")
+    assert missav.cover_url_allowed("https://www.missav.ws/pic.jpg")
+    assert missav.cover_url_allowed("https://surrit.com/x.jpg")
+    assert missav.cover_url_allowed("https://static.worldstatic.com/c.jpg")
+    assert missav.cover_url_allowed("https://getav.net/c.jpg")
+    assert not missav.cover_url_allowed("https://evil.com/x.jpg")
+    assert not missav.cover_url_allowed("http://169.254.169.254/latest/meta")
+    assert not missav.cover_url_allowed("http://localhost/x.jpg")
+    assert not missav.cover_url_allowed("ftp://missav.ai/x.jpg")
+    assert not missav.cover_url_allowed(None)
+
+
+def test_hashtag_maps_markdown_specials():
+    assert missav._hashtag("a[b](c)`d`*e|f") == "#a_b_(c)_d_e_f"
