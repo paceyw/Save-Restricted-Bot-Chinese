@@ -166,27 +166,44 @@ python3 main.py
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `API_ID` | ✅ | — | Telegram API ID |
+| `API_ID` | ✅ | — | Telegram API ID（my.telegram.org 申请） |
 | `API_HASH` | ✅ | — | Telegram API Hash |
-| `BOT_TOKEN` | ✅ | — | 机器人 Token |
-| `OWNER_ID` | ✅ | — | 管理员 ID，多个用空格分隔 |
+| `BOT_TOKEN` | ✅ | — | BotFather 下发的机器人 Token |
+| `OWNER_ID` | ✅ | — | 管理员数字用户 ID，多个用空格分隔 |
 | `MONGO_DB` | ✅ | — | MongoDB 连接 URI |
+| `MASTER_KEY` | ✅ | —（硬必填） | 会话加密密钥，`openssl rand -hex 32`；未设置启动即报错 |
+| `IV_KEY` | ✅ | —（硬必填） | 解密密钥，`openssl rand -hex 16`；未设置启动即报错 |
 | `DB_NAME` | — | `telegram_downloader` | 数据库名 |
-| `MASTER_KEY` | ✅* | 演示值 | 会话加密密钥，**必须覆盖** |
-| `IV_KEY` | ✅* | 演示值 | 解密密钥，**必须覆盖** |
-| `STRING` | — | 空 | 高级账号会话字符串，启用 4GB 上传 |
-| `LOG_GROUP` | — | `-1001234456` | 默认投递频道 ID（文件发到该频道，须将 `/setbot` 机器人加入并授发帖权限） |
-| `FORCE_SUB` | — | `-10012345567` | 强制订阅频道 ID，`0` 不启用 |
-| `FREEMIUM_LIMIT` | — | `0` | 免费用户提取上限 |
-| `PREMIUM_LIMIT` | — | `500` | 高级用户批量上限 |
-| `YT_COOKIES` | — | 空 | YouTube 下载 cookie（Netscape 格式） |
+| `STRING` | — | 空 | 高级账号 Pyrogram 会话字符串，启用 4GB 上传 |
+| `LOG_GROUP` | — | `0` | 投递/日志频道 Chat ID（`-100...`），提取文件发到该频道，须将机器人加入并授予发帖权限；`0` 不启用 |
+| `FORCE_SUB` | — | `0` | 强制订阅频道 Chat ID；`0` 不启用 |
+| `YT_COOKIES` | — | 空 | YouTube 下载 cookie（Netscape 格式文本） |
 | `INSTA_COOKIES` | — | 空 | Instagram 下载 cookie |
-| `JOIN_LINK` | — | `t.me/team_spy_pro` | 加入链接 |
-| `ADMIN_CONTACT` | — | — | 管理员联系方式（`/terms` 按钮指向） |
-| `PAY_NOTICE` | — | 见 config | 付费提示文案（`/start` `/pay` `/plan` 等）；不填用默认值 |
-| `PLAN_D_*` / `PLAN_W_*` / `PLAN_M_*` | — | 见 config | 日/周/月方案配置 |
+| `FREEMIUM_LIMIT` | — | `0` | 免费用户单批链接数上限；`0` = 关闭免费使用（提示联系管理员订阅） |
+| `PREMIUM_LIMIT` | — | `500` | 付费用户单批链接数上限 |
+| `BATCH_INTERVAL` | — | `10` | `/batch` `/single` 循环的自适应间隔上限（秒） |
+| `BATCH_MIN_INTERVAL` | — | `2` | `/batch` `/single` 循环的自适应间隔下限（秒） |
+| `PROGRESS_MIN_INTERVAL` | — | `3` | 进度消息编辑节流间隔（秒） |
+| `MERGE_INTERVAL` | — | `5` | `/merge` 相邻链接处理间隔（秒） |
+| `CHANNEL_INTERVAL` | — | `5` | `/merge` 相邻频道处理间隔（秒） |
+| `UPLOAD_INTERVAL` | — | `2` | 每个媒体上传完成后的间隔（秒） |
+| `MAX_FLOOD_RETRIES` | — | `3` | Telegram FloodWait 自动重试次数 |
+| `MISSAV_MIRRORS` | — | 空（内置列表） | missav 镜像域名，逗号分隔；留空用 missav.ai / .ws / .live / missav123.com |
+| `MISSAV_SEGMENT_CONCURRENCY` | — | `8` | missav HLS 分段下载并发数（自动限制在 1–32） |
+| `MISSAV_MAX_JOBS` | — | `2` | 全局同时进行的 missav/getav 任务数上限（最小 1） |
+| `GETAV_MIRRORS` | — | 空（内置 getav.net） | getav 镜像域名，逗号分隔；分段并发与任务上限复用 `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` |
+| `BURN_CONCURRENCY` | — | `1` | 字幕烧录（ffmpeg 全量重编码）并发数 |
+| `FFMPEG_BURN_THREADS` | — | `0` | 烧录编码线程数；`0` = 自动（按 CPU 数，限制在 2–8） |
+| `BURN_TIMEOUT_S` | — | `10800` | 单次烧录墙钟超时（秒）；`0` = 不限时，超时自动回退无字幕封装 |
+| `DISK_FREE_MIN_GB` | — | `10` | 运行卷剩余空间水位（GB），低于该值拒绝新任务 |
+| `JOIN_LINK` | — | `https://t.me/team_spy_pro` | 加入频道/群组链接 |
+| `ADMIN_CONTACT` | — | `https://t.me/username_of_admin` | 管理员联系方式（`/terms` 按钮指向） |
+| `PAY_NOTICE` | — | 内置默认文案 | 统一付费提示文案（`/start` `/pay` `/plan` 等入口） |
+| `PLAN_D_*` / `PLAN_W_*` / `PLAN_M_*` | — | 见 `config.py` | 日/周/月套餐：`_S` 价格、`_DU` 时长数、`_U` 单位、`_L` 显示标签 |
+| `BURN_PRESET`（即将加入） | — | `superfast` | 烧录 x264 preset；MISSAV 方案 §8 定稿（superfast + CRF19 + 源分辨率）即将合入，合入前配置不生效 |
+| `BURN_CRF`（即将加入） | — | `19` | 烧录 CRF；同上，§8 定稿即将合入 |
 
-\* `MASTER_KEY`/`IV_KEY` 虽有默认值，但**生产环境必须覆盖为随机值**，否则会话加密形同虚设。
+\* `MASTER_KEY`/`IV_KEY` 为硬必填：未设置时启动直接抛 `RuntimeError`，无默认值。生成方式：`openssl rand -hex 32` → `MASTER_KEY`，`openssl rand -hex 16` → `IV_KEY`。
 
 ### Cookie 获取方法
 
@@ -206,7 +223,7 @@ python3 main.py
 
 ### Q: 如何修改付费提示文案？
 
-编辑 `config.py` 中的 `PAY_NOTICE` 常量，或通过环境变量无法覆盖（它是硬编码常量）。如需改成环境变量读取，可自行修改 `config.py`。
+`PAY_NOTICE` 支持环境变量覆盖（`config.py` 读取该变量，见第 4 节表格），不填使用内置默认文案；修改后重启容器生效。
 
 ### Q: MongoDB 连接失败？
 
