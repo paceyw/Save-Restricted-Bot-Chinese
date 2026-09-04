@@ -100,7 +100,7 @@ def _task_result(task_id, result):
     task_update(task_id, progress_msg='', result=result)
 
 
-UPLOAD_HEADER = "╭─────────────────────╮\n│      **__上传中__**\n├─────────────────────"
+UPLOAD_HEADER = "╭───────────────────────────\n│ **__⬆️ 上传中__**\n├───────────────────────────"
  
 def d_thumbnail(thumbnail_url, save_path, timeout=(5, 20), max_bytes=10 * 1024 * 1024):
     try:
@@ -1177,13 +1177,7 @@ async def split_and_upload_file(upload_client, upload_chat, file_path, caption,
     os.remove(file_path)
 
 
-PROGRESS_BAR = """
-│ **__已完成：__** {1}/{2}
-│ **__字节：__** {0}%
-│ **__速度：__** {3}/秒
-│ **__预计剩余时间：__** {4}
-╰─────────────────────╯
-"""
+PROGRESS_BAR = " {0}%\n│ **__已完成：__** {1} / {2}\n│ **__速度：__** {3}/秒\n│ **__预计剩余：__** {4}\n╰───────────────────────────"
 
 async def get_seconds(time_string: str) -> int:
     """
