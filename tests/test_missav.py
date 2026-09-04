@@ -1277,6 +1277,53 @@ def test_build_caption_empty_details():
     assert missav.build_caption({}) == ""
 
 
+def test_extract_video_details_release_date_and_genres_cap():
+    d = missav.extract_video_details(REAL_PAGE, "https://missav.ai/cn/dass-629")
+    assert d["release_date"] == "2025-05-09"
+    assert d["studio"] == ""  # missav panel has no studio row: javbus fills it
+    # D4 拍板「抓主要标签」: genres capped at the first 6
+    page = REAL_PAGE.replace(
+        '<a href="https://missav.live/dm166/cn/genres/%E5%A4%9A%E4%BA" class="text-nord13 font-medium">多人运动</a>',
+        '<a href="https://missav.live/dm166/cn/genres/a" class="text-nord13 font-medium">多人运动</a>,\n'
+        '   <a href="https://missav.live/dm167/cn/genres/b" class="text-nord13 font-medium">巨乳</a>,\n'
+        '   <a href="https://missav.live/dm168/cn/genres/c" class="text-nord13 font-medium">中出</a>,\n'
+        '   <a href="https://missav.live/dm169/cn/genres/d" class="text-nord13 font-medium">颜射</a>,\n'
+        '   <a href="https://missav.live/dm170/cn/genres/e" class="text-nord13 font-medium">单体作品</a>')
+    d2 = missav.extract_video_details(page, "https://missav.ai/cn/dass-629")
+    assert d2["genres"] == ["苗条", "女同性恋", "潮吹", "多人运动", "巨乳", "中出"]
+    assert "颜射" not in d2["genres"]  # beyond the cap: dropped
+
+
+def test_build_caption_with_studio_and_release_date():
+    d = {
+        "code": "DASS-629",
+        "title": "想不想被我饲养？实录",
+        "actresses": ["桃永紗里奈 (百永さりな)"],
+        "genres": ["苗条"],
+        "studio": "プレステージ",
+        "release_date": "2025-05-09",
+        "badges": ["无码破解"],
+    }
+    cap = missav.build_caption(d)
+    assert cap == (
+        "DASS-629\n\n"
+        "想不想被我饲养？实录\n\n"
+        "演员：#桃永紗里奈_(百永さりな)\n"
+        "标签：#苗条\n"
+        "片商：#プレステージ #2025-05-09\n"
+        "类别：#无码破解"
+    )
+
+
+def test_build_caption_omits_studio_line_when_absent():
+    d = {"code": "ABP-1", "title": "t", "actresses": ["Sarina Momonaga"],
+         "genres": [], "badges": ["无码"]}
+    assert "片商：" not in missav.build_caption(d)
+    # date alone still renders the 片商 line
+    d["release_date"] = "2025-05-09"
+    assert missav.build_caption(d).splitlines()[-2] == "片商：#2025-05-09"
+
+
 def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
     """A CDN 429 must escalate to the long-backoff budget, not fail fast."""
     calls = {"n": 0}
