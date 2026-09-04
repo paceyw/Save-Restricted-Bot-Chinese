@@ -34,6 +34,7 @@ import string
 import requests
 import logging
 import math
+from urllib.parse import urlparse
 from shared_client import app, _WORKDIR
 from pyrogram import filters
 from pyrogram.types import (
@@ -43,6 +44,7 @@ from pyrogram.types import (
 from utils.func import get_video_metadata, screenshot, touch_file, task_downloads_dir
 from utils.missav import (
     _hashtag,
+    _registered_domain,
     DEFAULT_MIRRORS as _MISSAV_DEFAULT_MIRRORS,
     GETAV_DEFAULT_MIRRORS as _GETAV_DEFAULT_MIRRORS,
     MissAVError,
@@ -281,11 +283,37 @@ async def adl_handler(client, message):
         '使用 /tasks 查看进度。')
 
 
+def _host_in(url, *domains):
+    """True when url's host belongs to one of the registered domains.
+
+    urlparse-based, mirroring the missav/getav routers (_host_allowed):
+    http(s) schemes only, and the parse copy folds ``\\`` to ``/`` so the
+    decision matches the WHATWG/requests view of ``evil.com\\@youtube.com``
+    (plain substring checks routed that URL — and
+    ``https://evil.com/?u=youtube.com`` — to the YouTube branch, letting a
+    query string bypass the duration check; issue #14). Bare-host pastes
+    without a scheme ("youtu.be/x") keep their old routing via https
+    normalization; _registered_domain() absorbs www. and the trailing-dot
+    FQDN form.
+    """
+    if not url:
+        return False
+    if "://" not in url:
+        url = "https://" + url.strip()
+    try:
+        parsed = urlparse(url.replace("\\", "/"))
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    return _registered_domain(parsed.hostname or "") in {d.lower() for d in domains}
+
+
 async def run_adl(message, url, task_id=None):
     """Cookie-aware site routing for a queued /adl task."""
-    if "instagram.com" in url:
+    if _host_in(url, "instagram.com"):
         await process_audio(message, url, cookies_env_var=INSTA_COOKIES, task_id=task_id)
-    elif "youtube.com" in url or "youtu.be" in url:
+    elif _host_in(url, "youtube.com", "youtu.be"):
         await process_audio(message, url, cookies_env_var=YT_COOKIES, task_id=task_id)
     else:
         await process_audio(message, url, task_id=task_id)
@@ -482,9 +510,9 @@ async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=Non
                             task_id=task_id, source_url=source_url)
     elif is_missav_url(url, missav_hosts):
         await process_missav(message, url, missav_hosts, task_id=task_id)
-    elif "instagram.com" in url:
+    elif _host_in(url, "instagram.com"):
         await process_video(message, url, INSTA_COOKIES, check_duration_and_size=False, task_id=task_id)
-    elif "youtube.com" in url or "youtu.be" in url:
+    elif _host_in(url, "youtube.com", "youtu.be"):
         await process_video(message, url, YT_COOKIES, check_duration_and_size=True, task_id=task_id)
     else:
         if want_subtitle:

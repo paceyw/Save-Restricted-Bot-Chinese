@@ -176,6 +176,9 @@ def ytdl(monkeypatch):
     config.MISSAV_SEGMENT_CONCURRENCY = 8
     config.PROGRESS_MIN_INTERVAL = 3
     config.MISSAV_MAX_JOBS = 2
+    config.BURN_CONCURRENCY = 1
+    config.FFMPEG_BURN_THREADS = 0
+    config.BURN_TIMEOUT_S = 0
     monkeypatch.setitem(sys.modules, "config", config)
 
     plugins = types.ModuleType("plugins")
@@ -289,6 +292,79 @@ def test_missav_category_url_falls_through_to_generic(ytdl, monkeypatch):
     calls = _drive(ytdl, monkeypatch, "/dl https://missav.ai/dm278/chinese-subtitle")
     assert calls["missav"] == []
     assert calls["video"] == ["https://missav.ai/dm278/chinese-subtitle"]
+
+
+# ─── hostname routing: _host_in (issue #14) ──────────────────────────────────
+
+def test_host_in_matches_domain_subdomains_and_bare_hosts(ytdl):
+    yt = ("youtube.com", "youtu.be")
+    assert ytdl._host_in("https://www.youtube.com/watch?v=x", *yt)
+    assert ytdl._host_in("https://music.youtube.com/watch?v=x", *yt)
+    assert ytdl._host_in("https://youtu.be/x", *yt)
+    assert ytdl._host_in("youtu.be/x", *yt)  # scheme-less paste keeps routing
+    assert ytdl._host_in("https://www.instagram.com/reel/x/", "instagram.com")
+
+
+def test_host_in_rejects_lookalike_hosts(ytdl):
+    yt = ("youtube.com", "youtu.be")
+    assert not ytdl._host_in("https://evil.com/?u=youtube.com", *yt)
+    assert not ytdl._host_in("https://youtube.com.evil.com/", *yt)
+    assert not ytdl._host_in("https://notyoutube.com/x", *yt)
+    assert not ytdl._host_in("https://evil.com/youtu.be", *yt)
+    assert not ytdl._host_in("", *yt)
+    assert not ytdl._host_in("http://[::1", *yt)  # malformed URL → generic branch
+    assert not ytdl._host_in("ftp://youtube.com/x", *yt)
+    assert not ytdl._host_in("javascript://youtube.com/watch?v=x", *yt)
+    # \ in authority: urlparse says youtube.com, WHATWG/requests say evil.com
+    assert not ytdl._host_in("https://evil.com\\@youtube.com/x", *yt)
+
+
+def test_run_dl_youtube_insta_and_lookalike_routing(ytdl, monkeypatch):
+    calls = []
+
+    async def fake_video(message, url, cookies, check_duration_and_size=False,
+                         task_id=None):
+        calls.append((url, cookies, check_duration_and_size))
+
+    async def no_detour(*_a, **_k):
+        raise AssertionError("missav/getav router must not fire")
+
+    monkeypatch.setattr(ytdl, "process_missav", no_detour)
+    monkeypatch.setattr(ytdl, "process_getav", no_detour)
+    monkeypatch.setattr(ytdl, "process_video", fake_video)
+    monkeypatch.setattr(ytdl, "INSTA_COOKIES", "insta")
+    monkeypatch.setattr(ytdl, "YT_COOKIES", "yt")
+
+    asyncio.run(ytdl.run_dl(None, "https://www.youtube.com/watch?v=x"))
+    asyncio.run(ytdl.run_dl(None, "https://www.instagram.com/reel/x"))
+    asyncio.run(ytdl.run_dl(None, "https://evil.com/?u=youtube.com"))
+    asyncio.run(ytdl.run_dl(None, "https://youtube.com.evil.com/v"))
+    assert calls == [
+        ("https://www.youtube.com/watch?v=x", "yt", True),
+        ("https://www.instagram.com/reel/x", "insta", False),
+        ("https://evil.com/?u=youtube.com", None, False),
+        ("https://youtube.com.evil.com/v", None, False),
+    ]
+
+
+def test_run_adl_cookie_routing(ytdl, monkeypatch):
+    calls = []
+
+    async def fake_audio(message, url, cookies_env_var=None, task_id=None):
+        calls.append((url, cookies_env_var))
+
+    monkeypatch.setattr(ytdl, "process_audio", fake_audio)
+    monkeypatch.setattr(ytdl, "INSTA_COOKIES", "insta")
+    monkeypatch.setattr(ytdl, "YT_COOKIES", "yt")
+
+    asyncio.run(ytdl.run_adl(None, "https://www.instagram.com/reel/x"))
+    asyncio.run(ytdl.run_adl(None, "https://youtu.be/x"))
+    asyncio.run(ytdl.run_adl(None, "https://evil.com/?u=instagram.com"))
+    assert calls == [
+        ("https://www.instagram.com/reel/x", "insta"),
+        ("https://youtu.be/x", "yt"),
+        ("https://evil.com/?u=instagram.com", None),
+    ]
 
 
 def _queue_state(monkeypatch):
