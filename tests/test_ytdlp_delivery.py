@@ -77,6 +77,8 @@ def ytdl_env(monkeypatch, tmp_path):
     config.BURN_CONCURRENCY = 1
     config.FFMPEG_BURN_THREADS = 0
     config.BURN_TIMEOUT_S = 0
+    config.BURN_PRESET = "superfast"
+    config.BURN_CRF = 19
     config.DISK_FREE_MIN_GB = 10.0
     monkeypatch.setitem(sys.modules, "config", config)
 
