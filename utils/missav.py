@@ -344,9 +344,11 @@ def _panel_links(section):
 
 _CODE_FROM_SLUG = re.compile(r"^([a-z]{2,7})-?(\d{2,5})", re.IGNORECASE)
 _SLUG_BADGES = (
+    ("uncensored-leak", "无码破解"),
     ("chinese-subtitle", "中文字幕"),
-    ("uncensored", "无码"),
+    ("ch-sub", "中文字幕"),
     ("uncensored-leaked", "无码流出"),
+    ("uncensored", "无码"),
     ("leaked", "流出"),
 )
 
@@ -382,10 +384,13 @@ def extract_video_details(page_html, url):
     slug = (parse_missav_url(url) or {}).get("slug", "") or ""
     lowered = slug.lower()
     badges = [label for token, label in _SLUG_BADGES if token in lowered]
-    # keep order but drop the weaker "leaked"/"uncensored" when the
-    # combined badge already covers them
-    if "无码流出" in badges:
+    # keep order but drop the weaker badge when a combined one covers it:
+    # "无码破解" (uncensored-leak) subsumes 无码/流出/无码流出,
+    # "无码流出" (uncensored-leaked) subsumes 无码/流出
+    if "无码破解" in badges:
         badges = [b for b in badges if b not in ("无码", "流出", "无码流出")]
+    elif "无码流出" in badges:
+        badges = [b for b in badges if b not in ("无码", "流出")]
         badges.append("无码流出")
     details["badges"] = badges
 
