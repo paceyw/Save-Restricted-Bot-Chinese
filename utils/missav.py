@@ -171,6 +171,96 @@ def mirror_candidates(url, hosts=DEFAULT_MIRRORS):
     return out
 
 
+# ─── variant slugs (sister-version detection, issue #17, pure) ─────────────────
+
+# Longest tail first: "-uncensored-leak" must win over "-leak".
+_CN_SLUG_TAILS = ("chinese-subtitle", "ch-sub", "c")
+_UC_SLUG_TAILS = ("uncensored-leak", "uncensored", "leak")
+
+
+def _strip_slug_tail(slug, tails):
+    """``slug`` minus its first matching ``-<tail>`` (longest first), else None."""
+    for tail in tails:
+        if slug.endswith("-" + tail):
+            return slug[: -(len(tail) + 1)]
+    return None
+
+
+def missav_slug_family(slug):
+    """'cn' for a Chinese-subtitled slug, 'uc' for an uncensored one, else None.
+
+    长尾优先 within each tail group. The combined
+    ``<base>-uncensored-leak-chinese-subtitle`` counts as 'cn' here; use
+    :func:`_slug_variant` when the uncensored half matters too.
+    """
+    s = (slug or "").lower()
+    if _strip_slug_tail(s, _CN_SLUG_TAILS) is not None:
+        return "cn"
+    if _strip_slug_tail(s, _UC_SLUG_TAILS) is not None:
+        return "uc"
+    return None
+
+
+def _slug_variant(slug):
+    """Four-state variant of a slug: 'raw' | 'cn' | 'uc' | 'uc-cn'."""
+    s = (slug or "").lower()
+    without_cn = _strip_slug_tail(s, _CN_SLUG_TAILS)
+    if without_cn is not None:
+        return "uc-cn" if _strip_slug_tail(without_cn, _UC_SLUG_TAILS) is not None else "cn"
+    return "uc" if _strip_slug_tail(s, _UC_SLUG_TAILS) is not None else "raw"
+
+
+def missav_base_slug(slug):
+    """Strip every variant tail (loop, longest first) back to the bare id slug."""
+    s = slug or ""
+    while True:
+        stripped = _strip_slug_tail(s, _CN_SLUG_TAILS)
+        if stripped is None:
+            stripped = _strip_slug_tail(s, _UC_SLUG_TAILS)
+        if stripped is None:
+            return s
+        s = stripped
+
+
+def _same_site_variant_url(url, new_slug):
+    """Same URL with only the slug segment replaced; dm/lang prefixes kept."""
+    parsed = urlparse(url.strip())
+    parts = [seg for seg in parsed.path.split("/") if seg]
+    idx = 0
+    if parts and re.fullmatch(r"dm\d+", parts[0]):
+        idx = 1
+    if len(parts) > idx and parts[idx].lower() in _LANG_PREFIXES:
+        idx += 1
+    return urlunparse(parsed._replace(path="/" + "/".join(parts[:idx] + [new_slug])))
+
+
+# Constructed sister pages, recommended-first (combined > cn > uc).
+_VARIANT_BUILDERS = (
+    ("cn", "{base}-chinese-subtitle"),
+    ("uc", "{base}-uncensored-leak"),
+    ("uc-cn", "{base}-uncensored-leak-chinese-subtitle"),
+)
+
+
+def missav_variant_candidates(url, hosts=DEFAULT_MIRRORS):
+    """[(variant, url)] to probe around a missav video page.
+
+    First entry is the page itself; the rest are same-host siblings built
+    from the base slug. The variant the page already is gets skipped —
+    it is covered by the first entry. Empty for non-missav URLs.
+    """
+    info = parse_missav_url(url, hosts)
+    if not info:
+        return []
+    current = _slug_variant(info["slug"])
+    base = missav_base_slug(info["slug"])
+    out = [(current, url)]
+    for variant, template in _VARIANT_BUILDERS:
+        if variant != current:
+            out.append((variant, _same_site_variant_url(url, template.format(base=base))))
+    return out
+
+
 # ─── getav URL recognition (pure) ──────────────────────────────────────────────
 
 _GETAV_LOCALE_RE = re.compile(r"[a-z]{2}(?:-[a-z0-9]{2,8})?", re.IGNORECASE)
@@ -725,6 +815,68 @@ def fetch_video_page(url, hosts=DEFAULT_MIRRORS):
     if saw_404:
         raise MissAVError(f"视频不存在或已删除: {url}")
     raise MissAVBlockedError(BLOCKED_MSG)
+
+
+# ─── sister-version probing (issue #17) ────────────────────────────────────────
+
+_MISSAV_VARIANT_ORDER = {"raw": 0, "cn": 1, "uc": 2, "uc-cn": 3}
+_MISSAV_VARIANT_LABELS = {
+    "raw": "原版",
+    "cn": "中文字幕",
+    "uc": "无码破解",
+    "uc-cn": "无码破解·中文字幕",
+}
+
+
+def _probe_missav_page(url):
+    """One lightweight GET: does this URL serve a real missav video page?
+
+    Same Chrome UA as :func:`fetch_video_page`, same page-shaped guard;
+    every failure (blocked, 404, listing page, timeout) is False — a
+    probe must never raise into the caller.
+    """
+    try:
+        resp, err = _http_get(
+            url, headers={"User-Agent": _CHROME_UA}, timeout=PAGE_TIMEOUT,
+            max_bytes=PAGE_MAX_BYTES,
+        )
+    except Exception:  # _http_get never raises by contract; belt and braces
+        return False
+    if resp is None or resp.status_code != 200:
+        logger.info("missav variant probe failed %s: %s",
+                    url, err or getattr(resp, "status_code", "?"))
+        return False
+    text = resp.text or ""
+    if _looks_blocked(resp, text):
+        logger.info("missav variant probe blocked %s (status %s)", url, resp.status_code)
+        return False
+    return _is_video_page(text)
+
+
+async def discover_missav_variants(url, hosts=DEFAULT_MIRRORS):
+    """Probe the sister versions of a missav video page (one GET each).
+
+    Returns [(variant, url, label)] for every version that really
+    exists, ordered raw < cn < uc < uc-cn. When every probe fails (e.g.
+    all mirrors Cloudflare-blocked) it degrades to the current page
+    alone, so the caller always has a usable answer; non-missav URLs
+    return [].
+    """
+    candidates = missav_variant_candidates(url, hosts)
+    if not candidates:
+        return []
+    probes = await asyncio.gather(*(
+        asyncio.to_thread(_probe_missav_page, candidate) for _, candidate in candidates
+    ))
+    found = [
+        (variant, candidate, _MISSAV_VARIANT_LABELS[variant])
+        for (variant, candidate), ok in zip(candidates, probes) if ok
+    ]
+    if not found:
+        variant, candidate = candidates[0]
+        return [(variant, candidate, _MISSAV_VARIANT_LABELS[variant])]
+    found.sort(key=lambda item: _MISSAV_VARIANT_ORDER[item[0]])
+    return found
 
 
 # ─── getav movie API (fetch + parse, pure where possible) ─────────────────────

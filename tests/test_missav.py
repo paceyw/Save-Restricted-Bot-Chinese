@@ -79,6 +79,157 @@ def urlparse_host(u):
     from urllib.parse import urlparse
     return urlparse(u).hostname
 
+# ─── variant slugs / sister versions (issue #17) ──────────────────────────────
+
+@pytest.mark.parametrize("slug,family", [
+    ("sone-543", None),
+    ("sone-543-chinese-subtitle", "cn"),
+    ("sone-543-ch-sub", "cn"),
+    ("sone-543-c", "cn"),
+    ("cawd-629-uncensored-leak", "uc"),
+    ("stars-804-uncensored", "uc"),
+    ("stars-804-leak", "uc"),
+    ("cawd-629-uncensored-leak-chinese-subtitle", "cn"),  # cn tail wins; _slug_variant splits
+])
+def test_missav_slug_family(slug, family):
+    assert missav.missav_slug_family(slug) == family
+
+
+@pytest.mark.parametrize("slug,variant", [
+    ("sone-543", "raw"),
+    ("sone-543-chinese-subtitle", "cn"),
+    ("sone-543-ch-sub", "cn"),
+    ("cawd-629-uncensored-leak", "uc"),
+    ("cawd-629-uncensored-leak-chinese-subtitle", "uc-cn"),
+    ("092014_887", "raw"),
+])
+def test_slug_variant_four_states(slug, variant):
+    assert missav._slug_variant(slug) == variant
+
+
+@pytest.mark.parametrize("slug,base", [
+    ("sone-543", "sone-543"),
+    ("sone-543-chinese-subtitle", "sone-543"),
+    ("sone-543-ch-sub", "sone-543"),
+    ("stars-804-uncensored-leak", "stars-804"),
+    ("midv-911-uncensored", "midv-911"),
+    ("sone-543-leak", "sone-543"),
+    ("cawd-629-uncensored-leak-chinese-subtitle", "cawd-629"),
+    ("092014_887", "092014_887"),
+])
+def test_missav_base_slug_strips_tails_repeatedly(slug, base):
+    assert missav.missav_base_slug(slug) == base
+
+
+def test_variant_candidates_from_raw_page():
+    cands = missav.missav_variant_candidates("https://missav.ai/sone-543")
+    assert cands[0] == ("raw", "https://missav.ai/sone-543")
+    assert [v for v, _ in cands[1:]] == ["cn", "uc", "uc-cn"]
+    urls = dict(cands[1:])
+    assert urls["cn"] == "https://missav.ai/sone-543-chinese-subtitle"
+    assert urls["uc"] == "https://missav.ai/sone-543-uncensored-leak"
+    assert urls["uc-cn"] == "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle"
+
+
+def test_variant_candidates_skip_current_family():
+    cands = missav.missav_variant_candidates(
+        "https://missav.ai/cn/sone-543-chinese-subtitle")
+    assert cands[0] == ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle")
+    assert [v for v, _ in cands[1:]] == ["uc", "uc-cn"]
+    # a combined page still probes the plain cn + uc sisters
+    cands = missav.missav_variant_candidates(
+        "https://missav.ai/cawd-629-uncensored-leak-chinese-subtitle")
+    assert cands[0] == (
+        "uc-cn", "https://missav.ai/cawd-629-uncensored-leak-chinese-subtitle")
+    assert [v for v, _ in cands[1:]] == ["cn", "uc"]
+
+
+def test_variant_candidates_keep_dm_lang_prefix_and_host():
+    # dm<digits> category prefix (dm BEFORE the slug: /cn/dm1151/... is a listing)
+    cands = missav.missav_variant_candidates("https://www.missav.ws/dm1151/092014_887")
+    assert cands[0] == ("raw", "https://www.missav.ws/dm1151/092014_887")
+    for variant, u in cands[1:]:
+        assert urlparse_host(u) == "www.missav.ws"
+        assert u.startswith("https://www.missav.ws/dm1151/092014_887-")
+    # language-prefixed video URL keeps the lang segment
+    cands = missav.missav_variant_candidates("https://www.missav.ws/cn/sone-543")
+    assert cands[0][1] == "https://www.missav.ws/cn/sone-543"
+    for variant, u in cands[1:]:
+        assert urlparse_host(u) == "www.missav.ws"
+        assert u.startswith("https://www.missav.ws/cn/sone-543-")
+
+
+def test_variant_candidates_non_missav_url():
+    assert missav.missav_variant_candidates("https://youtube.com/watch?v=x") == []
+
+
+def test_probe_missav_page_rejects_non_video(monkeypatch):
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (
+            FakeResp(text="<html>new releases</html>"), None))
+    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (FakeResp(status=404), None))
+    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (None, "timeout"))
+    assert missav._probe_missav_page("https://missav.ai/sone-543") is False
+
+
+def test_discover_missav_variants_partial_existence(monkeypatch):
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("sone-543") or "uncensored-leak-chinese-subtitle" in url:
+            return FakeResp(text=_page_html("https://surrit.com/a/playlist.m3u8")), None
+        return FakeResp(status=404), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    found = asyncio.run(
+        missav.discover_missav_variants("https://missav.ai/sone-543"))
+    assert found == [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("uc-cn", "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle",
+         "无码破解·中文字幕"),
+    ]
+
+
+def test_discover_missav_variants_all_exist_sorted(monkeypatch):
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (
+            FakeResp(text=_page_html("https://surrit.com/a/playlist.m3u8")), None))
+    found = asyncio.run(
+        missav.discover_missav_variants("https://missav.ai/sone-543"))
+    assert [(v, u) for v, u, _ in found] == [
+        ("raw", "https://missav.ai/sone-543"),
+        ("cn", "https://missav.ai/sone-543-chinese-subtitle"),
+        ("uc", "https://missav.ai/sone-543-uncensored-leak"),
+        ("uc-cn", "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle"),
+    ]
+    assert [lbl for _, _, lbl in found] == ["原版", "中文字幕", "无码破解", "无码破解·中文字幕"]
+
+
+def test_discover_missav_variants_all_blocked_falls_back(monkeypatch):
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (
+            FakeResp(status=403, text="Just a moment..."), None))
+    found = asyncio.run(missav.discover_missav_variants(
+        "https://missav.ai/cn/sone-543-chinese-subtitle"))
+    assert found == [
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕")]
+
+
+def test_discover_missav_variants_unreachable_falls_back(monkeypatch):
+    monkeypatch.setattr(
+        missav, "_http_get",
+        lambda url, headers=None, timeout=None, max_bytes=None: (None, "conn reset"))
+    found = asyncio.run(
+        missav.discover_missav_variants("https://missav.ai/sone-543"))
+    assert found == [("raw", "https://missav.ai/sone-543", "原版")]
+
 
 # ─── packed JS ─────────────────────────────────────────────────────────────────
 
