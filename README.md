@@ -11,6 +11,109 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 
 ---
 
+## 🚀 快速部署（人工版）
+
+前置：Docker 24+ 与 Docker Compose v2；在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 `BOT_TOKEN`，在 [my.telegram.org](https://my.telegram.org) 拿到 `API_ID` / `API_HASH`。
+
+```bash
+git clone <你的fork地址> && cd Save-Restricted-Content-Bot-v3
+cp .env.example .env              # 编辑 .env：填入全部 __REQUIRED_*__ 与 __GENERATE_*__ 项
+docker compose -p save-restricted-content-bot-v3 up -d --build
+docker compose ps                 # bot 与 mongo 均应为 healthy
+docker compose exec bot curl -s http://127.0.0.1:5000/healthz   # {"ok": true}
+```
+
+给 bot 发送 `/start`，收到欢迎菜单即部署完成。日常运维：`docker compose logs -f --tail=200 bot` 看日志；`docker compose restart` 重启；**回滚**：`git checkout <上一个版本tag> && docker compose up -d --build`。
+
+## 🤖 快速部署（AI 可读版）
+
+```yaml
+project: save-restricted-content-bot-v3
+runtime: {engine: docker, orchestrator: compose_v2, project_name: save-restricted-content-bot-v3}
+layout:
+  compose_file: docker-compose.yml
+  secrets: .env                     # 从 .env.example 复制；绝不提交
+  entrypoint: main.py               # 容器内 /app/main.py
+  runtime_volume: ../runtime        # session/tmp/downloads；位于仓库外，绝不提交
+required_env: [API_ID, API_HASH, BOT_TOKEN, OWNER_ID, LOG_GROUP, MONGO_ROOT_USERNAME,
+               MONGO_ROOT_PASSWORD, MONGO_APP_USERNAME, MONGO_APP_PASSWORD,
+               DB_NAME, MASTER_KEY, IV_KEY]
+optional_env: [STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, YT_COOKIES,
+               INSTA_COOKIES, MISSAV_MIRRORS, GETAV_MIRRORS, BURN_CONCURRENCY,
+               FFMPEG_BURN_THREADS, DISK_FREE_MIN_GB, LOG_LEVEL]
+steps:
+  - "cp .env.example .env 并填满 required_env（__GENERATE_*__ 用 openssl rand -hex 32）"
+  - "docker compose -p save-restricted-content-bot-v3 up -d --build"
+  - "等待 mongo healthy 且 bot healthy 且 GET :5000/healthz 返回 {\"ok\": true}"
+  - "冒烟：向 bot 发送 /start，应收到欢迎菜单"
+verify:
+  health: "GET :5000/healthz -> {\"ok\": true}"
+  diagnostics: "GET :5000/debug/tasks  # asyncio 任务栈，bot 无响应时排查用"
+  logs: "docker compose logs --tail=200 bot"
+limits: {bot_memory: 512M, mongo_memory: 512M, mongo_wiredtiger_cache: 0.25GB}
+rollback: "git checkout <prev_tag> && docker compose up -d --build"
+forbidden:
+  - "docker compose down -v        # 会删除 mongo 数据卷"
+  - "提交 .env / *.session / runtime/  # 含真实凭据"
+  - "将 main.py 启动改为 asyncio.run()  # 与 pyrofork Dispatcher 的导入期 loop 绑定冲突，bot 会静默失聪（见 main.py 注释）"
+```
+
+## 🏗️ 架构
+
+```mermaid
+flowchart LR
+    subgraph bot["bot 容器 · 单进程 Python · 512M 上限"]
+        MAIN["main.py<br/>asyncio 主循环"]
+        HEALTH["aiohttp 健康服务<br/>/ · /healthz · /debug/tasks"]
+        APP["bot 客户端 pyrofork · 常驻"]
+        SWEEP["缓存治理 sweeper 60s · 常驻<br/>任务历史/LRU/进度TTL/闲置驱逐"]
+        CB["自定义 bot / 登录会话<br/>按需 · 闲置30分钟驱逐"]
+        YTDLP["yt-dlp 子进程 · 按需"]
+        FF["ffmpeg/ffprobe 子进程 · 按需"]
+    end
+    subgraph mongo["mongo 容器 · C++ · 512M 上限"]
+        MG[("MongoDB 8.0<br/>WiredTiger 缓存 0.25GB")]
+    end
+    MAIN --- HEALTH
+    MAIN --- SWEEP
+    APP --- CB
+    MAIN --> MG
+    APP --> TG["Telegram"]
+    CB --> TG
+    YTDLP --> SRC["missav / getav 镜像"]
+```
+
+### 常驻 vs 按需
+
+| 类别 | 组件 | 要点 |
+|---|---|---|
+| 常驻 | bot 客户端（pyrofork） | 唯一常驻 Telegram 会话 |
+| 常驻 | aiohttp 健康服务 | 与主循环同一事件循环，循环卡死则探针自然失败 |
+| 常驻 | 缓存治理 sweeper（60s） | 任务历史 10min/每人 20 条、消息来源 LRU 1000、进度状态 1h TTL、闲置客户端 30min 驱逐 |
+| 常驻 | pymongo 连接池 | 3 条常驻 TCP |
+| 按需 | 自定义 bot / 登录会话客户端 | 每任务拉起、用完驱逐、透明重建 |
+| 按需 | yt-dlp / ffmpeg / ffprobe 子进程 | `asyncio.create_subprocess_exec`，不常驻 |
+| 一次性 | mongo-init | 建库建索引后退出 |
+
+### 语言构成
+
+| 语言 | 组件 |
+|---|---|
+| Python | 主程序、全部插件、yt-dlp、418 项测试 |
+| C 扩展 | TgCrypto（MTProto AES 加速）、ffmpeg/ffprobe、pymediainfo |
+| C++ | MongoDB 8.0 / WiredTiger |
+| Rust | 无（重构计划明确否决全量 Rust 重写，仅保留瓶颈门禁触发后的 PoC 选项） |
+
+### 内存治理（实测）
+
+| 指标 | 重构前（运行 2 周） | 重构后 |
+|---|---|---|
+| 空闲基线 | 109MiB（持续爬升） | **86MiB** |
+| 大文件任务后 | 431MB + swap 142MB | 182MiB（其中页缓存 ~45MiB 可回收，进程 anon 仅 ~77MiB） |
+| cgroup 回收压力事件 | 939,558 次 | **0** |
+
+---
+
 ## 🔧 本 Fork 相对原版做了什么
 
 原版 v3 存在一个**架构性缺陷**：机器人的命令处理器一部分注册在 Telethon 客户端上，但 `shared_client.py` 为了让 Pyrogram 独占接收消息，主动关闭了 Telethon 的 update loop。结果所有写在 Telethon 上的命令**永远收不到消息**，处于完全失效状态。
