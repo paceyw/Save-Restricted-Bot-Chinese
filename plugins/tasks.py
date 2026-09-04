@@ -64,6 +64,32 @@ def sanitize(filename):
     return re.sub(r'[<>:"/\\|?*\']', '_', filename).strip(" .")[:255]
 
 
+def _promote_non_subtitle_task(queue, task):
+    """非-sub 优先（issue #20，规格 §7.2）：worker 拿到 -sub 任务时扫描
+    队列，若排着非-sub 任务就把它与队头换位，先执行非-sub。
+
+    队列无界（容量在 enqueue_task 处把关），取空再回填之间没有 await，
+    对并发 enqueue 是原子的；不存在 put_nowait 满队异常。
+    """
+    if not task.get('want_subtitle'):
+        return task
+    pending = []
+    while True:
+        try:
+            pending.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    for i, candidate in enumerate(pending):
+        if not candidate.get('want_subtitle'):
+            pending[i] = task
+            task = candidate
+            break
+    for candidate in pending:
+        queue.put_nowait(candidate)
+    return task
+
+
+
 def _prune_task_history(uid):
     user_tasks = [
         (task_id, candidate) for task_id, candidate in TASKS.items()
@@ -142,6 +168,10 @@ async def _task_worker(uid):
     queue = USER_QUEUES[uid]
     while True:
         task = await queue.get()
+        # 非-sub 优先（issue #20，规格 §7.2）：拿到 -sub 任务时先扫一眼
+        # 队列，把排在后面的非-sub 任务提到队头执行；换入的任务同普通
+        # 队头一样过下面的取消/磁盘检查。
+        task = _promote_non_subtitle_task(queue, task)
         # A cancellation requested while queued wins over every other
         # terminal state — including the disk refusal below (review round 1:
         # /stop on a queued task must report cancelled, not failed/disk-full).
