@@ -43,6 +43,7 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaVideo,
 )
 from utils.func import get_video_metadata, screenshot, touch_file, task_downloads_dir
+from utils.javbus import enrich_details
 from utils.missav import (
     _hashtag,
     _registered_domain,
@@ -1345,7 +1346,14 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
             task_id=task_id,
             **(extra_dl_kwargs or {}),
         )
-        caption = build_caption(info.get('details') or {}) or f"**{info.get('title') or f'{site} 视频'}**"
+        # issue #21 D4/D5 元数据补全（javbus 片商/发行日期 + 演员 CN/JP
+        # 双名）：尽力而为，任何失败都不影响本次下载与投递。
+        details = info.get('details') or {}
+        try:
+            await asyncio.to_thread(enrich_details, details, url)
+        except Exception as enrich_err:
+            logger.info("%s metadata enrichment skipped: %s", site, enrich_err)
+        caption = build_caption(details) or f"**{info.get('title') or f'{site} 视频'}**"
 
         k = await get_video_metadata(download_path)
         duration, width, height = k['duration'], k['width'], k['height']

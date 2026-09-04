@@ -403,6 +403,7 @@ _PANEL_LABELS = {
     "orig_title": r"标题|標題|Title",
     "actresses": r"女优|女優|Actress(?:es)?",
     "genres": r"类型|類型|Genre|Tag",
+    "release_date": r"发行日期|發行日期|Release",
 }
 
 
@@ -444,13 +445,20 @@ _SLUG_BADGES = (
 )
 
 
+GENRES_MAX = 6    # D4 拍板「抓主要标签」：类型 hashtag 截前 6 个
+_PANEL_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def extract_video_details(page_html, url):
     """Parse the labelled info panel + og meta into caption ingredients.
 
-    Returns {'code','title','actresses','genres','badges'} — every field
-    degrades independently (page layout changes must not break downloads).
+    Returns {'code','title','actresses','genres','badges','studio',
+    'release_date'} — every field degrades independently (page layout
+    changes must not break downloads). studio is never on the missav
+    panel; it starts empty and is filled by the JavBus enrichment.
     """
-    details = {"code": "", "title": "", "actresses": [], "genres": [], "badges": []}
+    details = {"code": "", "title": "", "actresses": [], "genres": [],
+               "badges": [], "studio": "", "release_date": ""}
 
     code = _panel_plain(_panel_section(page_html, "code"))
     details["code"] = code.upper() if code else ""
@@ -470,7 +478,10 @@ def extract_video_details(page_html, url):
     details["title"] = intro
 
     details["actresses"] = _panel_links(_panel_section(page_html, "actresses"))
-    details["genres"] = _panel_links(_panel_section(page_html, "genres"))
+    details["genres"] = _panel_links(_panel_section(page_html, "genres"))[:GENRES_MAX]
+    date_m = _PANEL_DATE_RE.search(
+        _panel_plain(_panel_section(page_html, "release_date")))
+    details["release_date"] = date_m.group(0) if date_m else ""
 
     slug = (parse_missav_url(url) or {}).get("slug", "") or ""
     lowered = slug.lower()
@@ -502,18 +513,25 @@ def _hashtag(text):
 def build_caption(details, max_len=1024):
     """Five-block caption per issue #13 style:
 
-        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n类别：#…
+        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n[片商：#…\n]类别：#…
 
-    The three hashtag lines form ONE block (single newlines) separated
-    from the intro by a blank line, matching the reference layout.
-    Blocks with no data are omitted; hashtag lines are trimmed from the
-    tail when the whole caption would exceed Telegram's 1024 limit.
+    The hashtag lines form ONE block (single newlines) separated from
+    the intro by a blank line, matching the reference layout; the
+    optional 「片商：」 line (issue #21) carries the studio and the
+    release date when JavBus enrichment supplied them. Blocks with no
+    data are omitted; hashtag lines are trimmed from the tail when the
+    whole caption would exceed Telegram's 1024 limit.
     """
     code = (details.get("code") or "").strip()
     intro = (details.get("title") or "").strip()
     actresses = [t for t in (_hashtag(x) for x in details.get("actresses") or []) if t]
     genres = [t for t in (_hashtag(x) for x in details.get("genres") or []) if t]
     badges = [t for t in (_hashtag(x) for x in details.get("badges") or []) if t]
+    meta_items = []
+    for value in (details.get("studio"), details.get("release_date")):
+        tag = _hashtag(value) if value else ""
+        if tag:
+            meta_items.append(tag)
 
     blocks = []
     if code:
@@ -526,6 +544,8 @@ def build_caption(details, max_len=1024):
         tag_lines.append("演员：" + " ".join(actresses))
     if genres:
         tag_lines.append("标签：" + " ".join(genres))
+    if meta_items:
+        tag_lines.append("片商：" + " ".join(meta_items))
     if badges:
         tag_lines.append("类别：" + " ".join(badges))
     if tag_lines:
@@ -539,7 +559,8 @@ def build_caption(details, max_len=1024):
     # hashtag lines carry a 「label：」prefix; trim their tails (keep the
     # label + one tag) until the caption fits Telegram's limit
     def is_tag_line(line):
-        return line.startswith(("演员：", "标签：", "类别：", "演员:", "标签:", "类别:"))
+        return line.startswith(("演员：", "标签：", "片商：", "类别：",
+                                "演员:", "标签:", "片商:", "类别:"))
 
     while len(render(blocks)) > max_len:
         tag_block_idx = next(
