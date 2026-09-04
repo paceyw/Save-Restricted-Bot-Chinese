@@ -114,7 +114,7 @@ def _task_result(task_id, result):
     task_update(task_id, progress_msg='', result=result)
 
 
-UPLOAD_HEADER = "╭───────────────────────────\n│ **__⬆️ 上传中__**\n├───────────────────────────"
+UPLOAD_HEADER = "**⬆️ 上传中**"
  
 def d_thumbnail(thumbnail_url, save_path, timeout=(5, 20), max_bytes=10 * 1024 * 1024):
     # review (SSRF medium): og:image / movie-JSON covers are page-controlled.
@@ -1775,7 +1775,7 @@ async def split_and_upload_file(upload_client, upload_chat, file_path, caption,
     os.remove(file_path)
 
 
-PROGRESS_BAR = " {0}%\n│ **__已完成：__** {1} / {2}\n│ **__速度：__** {3}/秒\n│ **__预计剩余：__** {4}\n╰───────────────────────────"
+PROGRESS_BAR = ("{0}%\n已完成：{1} / {2}\n速度：{3}/秒\n预计剩余：{4}")
 
 async def get_seconds(time_string: str) -> int:
     """
@@ -1829,7 +1829,7 @@ async def progress_bar(current: int, total: int, ud_type: str, message, start: f
             estimated_total_time_str if estimated_total_time_str else "0 s"
         )
         try:
-            await message.edit(text=f"{ud_type}\n│ {progress_text}")
+            await message.edit(text=f"{ud_type}\n{progress_text}")
         except:
             pass
 
