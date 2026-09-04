@@ -503,3 +503,30 @@ def test_search_both_includes_avsea(ytdl, monkeypatch):
                                      "source": "missav"}], None))
     merged, err = ytdl._search_both("SSIS-405", ("missav.ai",), ("getav.net",))
     assert err is None and len(merged) == 1
+
+
+def test_missav_search_mirror_rotation_and_block(ytdl, monkeypatch):
+    """直测 _missav_search：镜像轮换取结果、全拦时给中文错误。"""
+    seen = []
+    ok_html = ('<a href="/ssis-405"><img src="//c/1.jpg" alt="">标题</a>')
+
+    def fake_get(url, headers=None):
+        seen.append(url)
+        if "missav.ai" in url:
+            return __import__("types").SimpleNamespace(
+                status_code=403, text="Just a moment..."), None
+        return __import__("types").SimpleNamespace(status_code=200, text=ok_html), None
+
+    monkeypatch.setattr(ytdl, "_http_get", fake_get)
+    results, err = ytdl._missav_search("SSIS-405", ("missav.ai", "missav.ws"))
+    assert err is None and results and results[0]["href"].endswith("ssis-405")
+    assert any("missav.ai" in u for u in seen) and any("missav.ws" in u for u in seen)
+
+
+def test_missav_search_all_blocked_returns_error(ytdl, monkeypatch):
+    monkeypatch.setattr(
+        ytdl, "_http_get",
+        lambda url, headers=None: (__import__("types").SimpleNamespace(
+            status_code=403, text="Just a moment..."), None))
+    results, err = ytdl._missav_search("SSIS-405", ("missav.ai",))
+    assert results is None and "Cloudflare" in err

@@ -921,6 +921,34 @@ def _missav_search(code, hosts):
     拦/不可达时 (None, 中文错误提示)。同步函数（_http_get 是同步的），
     调用方用 asyncio.to_thread 包一层。
     """
+    hosts = tuple(hosts or ())
+    if not hosts:
+        return None, "**__未配置 missav 镜像，无法搜索__**"
+    search_url = f"https://{hosts[0]}/search/{quote(code)}"
+    saw_block = False
+    for candidate in mirror_candidates(search_url, hosts):
+        resp, err = _http_get(candidate, headers={"User-Agent": _CHROME_UA})
+        if resp is None:
+            logger.info("missav search unreachable %s: %s", candidate, err)
+            continue
+        text = resp.text or ""
+        if resp.status_code == 404:
+            return [], None
+        if _looks_blocked(resp, text):
+            saw_block = True
+            logger.info("missav search blocked %s (status %s)",
+                        candidate, resp.status_code)
+            continue
+        if resp.status_code != 200:
+            continue
+        results = _parse_missav_search_html(text, base=candidate, hosts=hosts)
+        if results:
+            return results, None
+        return [], None           # 200 但列表为空：确实没有结果
+    if saw_block:
+        return None, "**__搜索页被 Cloudflare 拦截，请稍后再试__**"
+    return None, "**__搜索失败：镜像均不可达，请稍后再试__**"
+
 
 def _search_page_markup(token, results, page):
     """Keyboard for one card page: one result per row (title + badge),
