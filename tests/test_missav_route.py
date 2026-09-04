@@ -177,6 +177,8 @@ def ytdl(monkeypatch):
     config.PROGRESS_MIN_INTERVAL = 3
     config.MISSAV_MAX_JOBS = 2
     config.BURN_CONCURRENCY = 1
+    config.BURN_PRESET = "superfast"
+    config.BURN_CRF = 23
     config.FFMPEG_BURN_THREADS = 0
     config.BURN_TIMEOUT_S = 0
     monkeypatch.setitem(sys.modules, "config", config)
@@ -208,8 +210,8 @@ def _drive(ytdl, monkeypatch, text):
     """Drive run_dl (the queue worker's site router) with a /dl command text."""
     calls = {"missav": [], "getav": [], "video": []}
 
-    async def fake_missav(message, url, hosts, task_id=None):
-        calls["missav"].append(url)
+    async def fake_missav(message, url, hosts, task_id=None, want_subtitle=False):
+        calls["missav"].append((url, want_subtitle))
 
     async def fake_getav(message, url, hosts, want_subtitle=False, task_id=None,
                          source_url=None):
@@ -231,13 +233,15 @@ def _drive(ytdl, monkeypatch, text):
 
 def test_missav_url_routed_to_process_missav(ytdl, monkeypatch):
     calls = _drive(ytdl, monkeypatch, "/dl https://missav.ai/cn/sone-543-chinese-subtitle")
-    assert calls["missav"] == ["https://missav.ai/cn/sone-543-chinese-subtitle"]
+    assert calls["missav"] == [("https://missav.ai/cn/sone-543-chinese-subtitle", False)]
     assert calls["video"] == []
 
 
 def test_missav_mirror_domain_routed(ytdl, monkeypatch):
     calls = _drive(ytdl, monkeypatch, "/dl https://missav.ws/sone-543")
-    assert calls["missav"] == ["https://missav.ws/sone-543"]
+    assert calls["missav"] == [("https://missav.ws/sone-543", False)]
+
+
 
 
 
@@ -694,3 +698,162 @@ def test_upload_album_big_file_splits_with_private_notice(ytdl, monkeypatch, tmp
     assert sent["album"] == [(-100, ["GROUP", "GROUP"])]
     # split temp dir cleaned up
     assert not parts_dir.exists()
+
+
+# ─── missav version card wiring (issue #17 ytdl side) ─────────────────────────
+
+def _variants_stub(ytdl, monkeypatch, variants):
+    async def fake_discover(url, hosts=None):
+        return list(variants)
+
+    monkeypatch.setattr(ytdl, "discover_missav_variants", fake_discover)
+
+
+def test_dl_handler_missav_multiversion_shows_card(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+        ("uc-cn", "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle",
+         "无码破解·中文字幕"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert not state["created"]            # nothing enqueued until picked
+    assert any("多个版本" in r for r in msg.replies)
+    prompt = ytdl._MISSAV_PROMPTS[42]
+    # recommended first: uc-cn > cn > raw (spec C1 ⭐推荐位)
+    assert [v[0] for v in prompt["variants"]] == ["uc-cn", "cn", "raw"]
+    assert prompt["want_subtitle"] is False
+    assert prompt["url"] == "https://missav.ai/sone-543"
+
+
+def test_dl_handler_missav_single_version_enqueues_directly(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版")])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert len(state["enqueued"]) == 1
+    task = state["enqueued"][0]
+    assert task["url"] == "https://missav.ai/sone-543"
+    assert task["want_subtitle"] is False
+    assert 42 not in ytdl._MISSAV_PROMPTS
+
+
+def test_dl_handler_missav_sub_flag_reaches_card(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+    ])
+    msg = _FakeMessage("/dl -sub https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert ytdl._MISSAV_PROMPTS[42]["want_subtitle"] is True
+
+
+def test_missav_version_callback_picks_variant(ytdl, monkeypatch):
+    import re as _re
+    state = _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("uc", "https://missav.ai/sone-543-uncensored-leak", "无码破解"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._MISSAV_PROMPTS[42]
+    token = prompt["token"]
+
+    # user picks the FIRST button = uc (recommended order puts uc before raw)
+    query = _FakeQuery(42, f"mav:{token}:0",
+                       _re.compile(r"^mav:([0-9a-f]+):(all|\d+)$"))
+    asyncio.run(ytdl.missav_version_callback(None, query))
+    assert 42 not in ytdl._MISSAV_PROMPTS      # prompt consumed
+    task = state["enqueued"][0]
+    # the variant's OWN page URL rides the task (each variant is a page)
+    assert task["url"] == "https://missav.ai/sone-543-uncensored-leak"
+    assert task["want_subtitle"] is False
+
+
+def test_missav_version_callback_rejects_expired(ytdl, monkeypatch):
+    import re as _re
+    import time as _time
+    _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._MISSAV_PROMPTS[42]
+    prompt["created_at"] = _time.time() - ytdl._GETAV_PROMPT_TTL - 1
+
+    query = _FakeQuery(42, f"mav:{prompt['token']}:0",
+                       _re.compile(r"^mav:([0-9a-f]+):(all|\d+)$"))
+    asyncio.run(ytdl.missav_version_callback(None, query))
+    assert query.answers and "过期" in query.answers[0][0]
+
+
+def test_missav_download_all_combined_page_wins(ytdl, monkeypatch):
+    import re as _re
+    state = _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+        ("uc", "https://missav.ai/sone-543-uncensored-leak", "无码破解"),
+        ("uc-cn", "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle",
+         "无码破解·中文字幕"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._MISSAV_PROMPTS[42]
+    query = _FakeQuery(42, f"mav:{prompt['token']}:all",
+                       _re.compile(r"^mav:([0-9a-f]+):(all|\d+)$"))
+    asyncio.run(ytdl.missav_version_callback(None, query))
+    # 组合页存在：只下组合，不重复下 cn/uc
+    assert [t["url"] for t in state["enqueued"]] == [
+        "https://missav.ai/sone-543-uncensored-leak-chinese-subtitle"]
+
+
+def test_missav_download_all_splits_cn_uc_and_honours_queue_cap(ytdl, monkeypatch):
+    import re as _re
+    state = _queue_state(monkeypatch)
+    stub = sys.modules["plugins.tasks"]
+    monkeypatch.setattr(stub, "_MAX_QUEUE", 1)
+    monkeypatch.setattr(stub, "get_queue_size",
+                        lambda uid: len(state["enqueued"]))
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+        ("uc", "https://missav.ai/sone-543-uncensored-leak", "无码破解"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    prompt = ytdl._MISSAV_PROMPTS[42]
+    query = _FakeQuery(42, f"mav:{prompt['token']}:all",
+                       _re.compile(r"^mav:([0-9a-f]+):(all|\d+)$"))
+    asyncio.run(ytdl.missav_version_callback(None, query))
+    # 无组合页：cn+uc 各一任务；容量逐个检查，第二个任务被拒
+    assert [t["url"] for t in state["enqueued"]] == [
+        "https://missav.ai/cn/sone-543-chinese-subtitle"]
+    assert any("队列已满" in r for r in msg.replies)
+
+
+def test_discard_missav_prompts_drops_card(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    _variants_stub(ytdl, monkeypatch, [
+        ("raw", "https://missav.ai/sone-543", "原版"),
+        ("cn", "https://missav.ai/cn/sone-543-chinese-subtitle", "中文字幕"),
+    ])
+    msg = _FakeMessage("/dl https://missav.ai/sone-543")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    assert ytdl.discard_missav_prompts(42) == 1
+    assert ytdl.discard_missav_prompts(42) == 0
+
+
+def test_dl_usage_mentions_missav_for_sub(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    msg = _FakeMessage("/dl")
+    asyncio.run(ytdl.dl_handler(None, msg))
+    usage = next(r for r in msg.replies if "用法" in r)
+    assert "getav" in usage and "missav" in usage
