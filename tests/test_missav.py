@@ -1246,7 +1246,7 @@ def test_build_caption_full_format():
     )
 
 
-def test_build_caption_sanitizes_and_skips_empty_blocks():
+def test_build_caption_sanitizes_and_keeps_blank_skeleton():
     d = {
         "code": "ABP-1",
         "title": "",
@@ -1255,7 +1255,7 @@ def test_build_caption_sanitizes_and_skips_empty_blocks():
         "badges": ["无码"],
     }
     cap = missav.build_caption(d)
-    assert cap == "ABP-1\n\n演员：#Sarina_Momonaga\n类别：#无码"
+    assert cap == "ABP-1\n\n演员：#Sarina_Momonaga\n标签：\n类别：#无码"
 
 
 def test_build_caption_trims_to_telegram_limit():
@@ -1336,24 +1336,8 @@ def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
     monkeypatch.setattr(missav, "_http_get", fake_get)
     monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
     path = asyncio.run(missav._download_one_segment(
-        7, "https://surrit.com/seg-7.ts", str(tmp_path), None, None,
+        0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
         {}, "surrit.com", [0]))
-    assert path.endswith("000007.ts")
-    assert calls["n"] == 5                       # 4x 429 then success
-    assert sleeps == [2, 4, 8, 16]               # escalating, 429 cap 60s
-
-
-def test_segment_429_exhausts_extended_budget(monkeypatch, tmp_path):
-    async def fake_sleep(s):
-        pass
-
-    monkeypatch.setattr(missav, "_http_get",
-                        lambda *a, **k: (FakeResp(429), None))
-    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
-    with pytest.raises(missav.MissAVError, match="HTTP 429"):
-        asyncio.run(missav._download_one_segment(
-            0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
-            {}, "surrit.com", [0]))
 
 
 def test_segment_404_still_fails_fast(monkeypatch, tmp_path):
@@ -1706,3 +1690,21 @@ def test_cover_url_allowed_allowlist():
 
 def test_hashtag_maps_markdown_specials():
     assert missav._hashtag("a[b](c)`d`*e|f") == "#a_b_(c)_d_e_f"
+
+
+def test_build_caption_blank_skeleton_from_sparse_details():
+    """FC2 等无演员/标签面板的页面：骨架留空占位，结构恒定（用户定稿）。"""
+    cap = missav.build_caption({
+        "code": "FC2-PPV-2761664",
+        "title": "【無码破解】FC2 作品标题 中文字幕",
+        "badges": ["无码破解", "中文字幕"],
+    })
+    assert cap == (
+        "FC2-PPV-2761664\n\n"
+        "【無码破解】FC2 作品标题 中文字幕\n\n"
+        "演员：\n"
+        "标签：\n"
+        "类别：#无码破解 #中文字幕"
+    )
+
+

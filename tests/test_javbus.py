@@ -347,3 +347,37 @@ def test_fetch_javbus_meta_same_host_redirect_accepted(monkeypatch):
     monkeypatch.setattr(javbus, "_http_get", fake_get)
     meta = javbus.fetch_javbus_meta("DASS-629")
     assert meta is not None and meta["title"].startswith("DASS-629")
+
+
+def test_enrich_fc2_code_skips_javbus_uses_getav(monkeypatch):
+    """FC2：JavBus 必 404，直接走 getav 详情兜底（title/genres/演员填充）。
+
+    getav 中文名与 missav 日文名按位配对成「中文名 (日文名)」。
+    """
+    import types
+
+    missav_stub = types.ModuleType("utils.missav")
+
+    def fake_getav(code):
+        assert code == "FC2-PPV-2761664"
+        return {"code": "FC2-PPV-2761664", "title": "FC2 中文标题",
+                "actresses": ["中文演员"], "genres": ["素人"], "badges": []}
+
+    missav_stub.find_getav_details_for_code = fake_getav
+    monkeypatch.setitem(sys.modules, "utils.missav", missav_stub)
+
+    javbus_calls = []
+
+    def fake_javbus(code):
+        javbus_calls.append(code)
+        return None
+
+    monkeypatch.setattr(javbus, "fetch_javbus_meta", fake_javbus)
+
+    d = {"code": "FC2-PPV-2761664", "title": "", "actresses": ["JP Name"], "genres": []}
+    out = javbus.enrich_details(
+        d, "https://missav.ai/fc2-ppv-2761664-uncensored-leak-chinese-subtitle")
+    assert javbus_calls == []                  # never hit javbus for FC2
+    assert out["title"] == "FC2 中文标题"
+    assert out["genres"] == ["素人"]
+    assert out["actresses"] == ["中文演员 (JP Name)"]

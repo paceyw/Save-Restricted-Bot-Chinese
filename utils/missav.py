@@ -530,23 +530,23 @@ def build_caption(details, max_len=1024):
     genres = [t for t in (_hashtag(x) for x in details.get("genres") or []) if t]
     badges = [t for t in (_hashtag(x) for x in details.get("badges") or []) if t]
 
+    if not code and not intro:
+        return ""  # nothing to show: caller falls back to a bold title
+
     blocks = []
     if code:
         blocks.append(code)
     if intro:
         blocks.append(intro)
 
-    tag_lines = []
-    if actresses:
-        tag_lines.append("演员：" + " ".join(actresses))
-    if genres:
-        tag_lines.append("标签：" + " ".join(genres))
-    if badges:
-        tag_lines.append("类别：" + " ".join(badges))
-    if tag_lines:
-        blocks.append("\n".join(tag_lines))
-    if not blocks:
-        return ""
+    # 骨架留空（用户定稿）：三行结构恒定渲染，缺数据的行留空占位，
+    # 便于手动补全（与 /single /batch /merge 的自动排版骨架一致）
+    tag_lines = [
+        "演员：" + " ".join(actresses),
+        "标签：" + " ".join(genres),
+        "类别：" + " ".join(badges),
+    ]
+    blocks.append("\n".join(tag_lines))
 
     def render(parts):
         return "\n\n".join(parts)
@@ -1576,15 +1576,13 @@ def _fetch_getav_subtitle(sub_entry, pinned_domain, dest_dir):
     return path
 
 
-def find_getav_subtitle_for_code(code, dest_dir):
-    """Best-effort official getav VTT for a missav video code; None on any miss.
+def _find_getav_movie_for_code(code):
+    """Locate a getav movie record by bare code; ``data`` dict or None.
 
-    When the missav HLS master carries no subtitle track, getav.net often
-    hosts the same release with a site-polished Chinese VTT. Build the
-    movie-API URL from the bare code, accept the payload ONLY when its
-    id/title strongly contains the code (never burn another title's
-    subs), then reuse the getav subtitle pipeline. Silent: subtitles are
-    never a download prerequisite.
+    Boundary-aware match (review: "ABC-12" must not accept "ABC-123"):
+    the record id must normalize to exactly the wanted code, or the
+    title's own CODE-123 token must normalize to it exactly. Single
+    attempt per mirror candidate, never raises.
     """
     code = (code or "").strip()
     if not code:
@@ -1598,33 +1596,70 @@ def find_getav_subtitle_for_code(code, dest_dir):
         except Exception:
             return None
         if resp is None or resp.status_code != 200:
-            logger.info("getav code-subtitle api miss %s: %s",
+            logger.info("getav code api miss %s: %s",
                         api_url, err or getattr(resp, "status_code", "?"))
             continue
         data = _parse_getav_json(resp.text or "")
         if data is None:
             continue
         haystack = f"{data.get('id') or ''} {data.get('title') or ''}".upper()
-        # boundary-aware match (review: "ABC-12" must not accept "ABC-123"):
-        # the record id must normalize to exactly the wanted code, or the
-        # title's own CODE-123 token must normalize to it exactly
         want = re.sub(r"[^A-Z0-9]", "", code.upper())
         ident = re.sub(r"[^A-Z0-9]", "", str(data.get("id") or "").upper())
         title_token = re.search(r"[A-Z][A-Z0-9]*-\d+", str(data.get("title") or "").upper())
         token_code = re.sub(r"[^A-Z0-9]", "", title_token.group(0)) if title_token else ""
         if want != ident and want != token_code:
-            logger.info("getav code-subtitle mismatch: %s vs %s", code, haystack[:80])
+            logger.info("getav code mismatch: %s vs %s", code, haystack[:80])
             continue
-        sub = select_getav_subtitle(data)
-        if not sub:
-            continue
-        # pin like download_getav: subtitle lives on the video CDN's domain
-        source_url, _fam = select_getav_source(data.get("videoSources") or [])
-        if not source_url:
-            continue
-        pinned = _registered_domain(urlparse(source_url).hostname or "")
-        return _fetch_getav_subtitle(sub, pinned, dest_dir)
+        return data
     return None
+
+
+def find_getav_subtitle_for_code(code, dest_dir):
+    """Best-effort official getav VTT for a missav video code; None on any miss.
+
+    When the missav HLS master carries no subtitle track, getav.net often
+    hosts the same release with a site-polished Chinese VTT. Accept the
+    payload ONLY on a strong code match (never burn another title's
+    subs), then reuse the getav subtitle pipeline. Silent: subtitles are
+    never a download prerequisite.
+    """
+    data = _find_getav_movie_for_code(code)
+    if not data:
+        return None
+    sub = select_getav_subtitle(data)
+    if not sub:
+        return None
+    # pin like download_getav: subtitle lives on the video CDN's domain
+    source_url, _fam = select_getav_source(data.get("videoSources") or [])
+    if not source_url:
+        return None
+    pinned = _registered_domain(urlparse(source_url).hostname or "")
+    return _fetch_getav_subtitle(sub, pinned, dest_dir)
+
+
+def find_getav_details_for_code(code):
+    """Best-effort getav caption ingredients for a missav code; None on miss.
+
+    FC2 and other codes missav pages leave sparse (no actress/genre
+    panel) often exist on getav with full Chinese metadata. Applies the
+    same /zh overlay as the getav pipeline (Chinese title/actresses
+    when the page is reachable) and returns the standard details dict.
+    Silent by design.
+    """
+    data = _find_getav_movie_for_code(code)
+    if not data:
+        return None
+    page_url = f"https://getav.net/zh/videos/{(code or '').strip()}"
+    try:
+        _augment_getav_zh(data, page_url, (GETAV_DEFAULT_MIRRORS[0],),
+                          urlparse(page_url).hostname)
+    except Exception:
+        logger.info("getav zh overlay failed for %s", code, exc_info=True)
+    try:
+        return extract_getav_details(data, page_url)
+    except Exception:
+        logger.info("getav details extract failed for %s", code, exc_info=True)
+        return None
 
 
 async def _fetch_subtitle_track(subtitle_uri, headers, pinned_domain, dest_dir):

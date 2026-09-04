@@ -313,18 +313,34 @@ def _enrich_details(details, url):
     if not isinstance(details, dict):
         return details
 
+    code = str(details.get("code") or "")
     cn_names = []
-    meta = fetch_javbus_meta(details["code"]) if details.get("code") else None
-    if meta:
-        if not details.get("studio") and meta.get("studio"):
-            details["studio"] = meta["studio"]
-        if not details.get("release_date") and meta.get("release_date"):
-            details["release_date"] = meta["release_date"]
-        if not details.get("title") and meta.get("title"):
-            details["title"] = meta["title"]
-        if not details.get("genres") and meta.get("genres"):
-            details["genres"] = list(meta["genres"][:GENRES_MAX])
-        cn_names = list(meta.get("actresses") or [])
+    if code.upper().startswith("FC2"):
+        # JavBus does not catalog FC2 (guaranteed 404) — getav usually
+        # carries the FC2 release with full Chinese metadata instead.
+        try:
+            from utils.missav import find_getav_details_for_code
+            g = find_getav_details_for_code(code)
+        except Exception:
+            g = None
+        if g:
+            if not details.get("title") and g.get("title"):
+                details["title"] = g["title"]
+            if not details.get("genres") and g.get("genres"):
+                details["genres"] = list(g["genres"][:GENRES_MAX])
+            cn_names = list(g.get("actresses") or [])
+    else:
+        meta = fetch_javbus_meta(code) if code else None
+        if meta:
+            if not details.get("studio") and meta.get("studio"):
+                details["studio"] = meta["studio"]
+            if not details.get("release_date") and meta.get("release_date"):
+                details["release_date"] = meta["release_date"]
+            if not details.get("title") and meta.get("title"):
+                details["title"] = meta["title"]
+            if not details.get("genres") and meta.get("genres"):
+                details["genres"] = list(meta["genres"][:GENRES_MAX])
+            cn_names = list(meta.get("actresses") or [])
 
     if not cn_names and url:
         cn_names = _missav_cn_actresses(url)
