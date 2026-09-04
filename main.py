@@ -90,8 +90,14 @@ async def main():
 
 
 if __name__ == "__main__":
+    # pyrofork's Dispatcher captures asyncio.get_event_loop() at import time
+    # (shared_client module level) and binds its worker tasks + handler
+    # registrations to that loop. asyncio.run() always creates a DIFFERENT
+    # loop, which froze the dispatcher silently (bot connected but deaf).
+    # Run main() on the same import-time loop instead.
     try:
-        asyncio.run(main())
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         logger.info("interrupted from keyboard")
     except Exception as e:
