@@ -370,6 +370,28 @@ seg-1.woff2
 """
 
 
+async def _concat_copy(src, dst):
+    """Byte copy; an ffconcat list input is resolved by concatenating the
+    listed part files (mirrors the concat demuxer — issue #19 core now
+    hands remux/burn a list.txt instead of a merged.ts)."""
+    with open(src, "rb") as fi:
+        head = fi.read(8)
+    if head.lstrip() == b"ffconcat":
+        chunks = []
+        with open(src, "r", encoding="utf-8") as fl:
+            for line in fl:
+                line = line.strip()
+                if line.startswith("file '") and line.endswith("'"):
+                    with open(line[6:-1], "rb") as fs:
+                        chunks.append(fs.read())
+        data = b"".join(chunks)
+    else:
+        with open(src, "rb") as fi:
+            data = fi.read()
+    with open(dst, "wb") as fo:
+        fo.write(data)
+
+
 def test_download_getav_roundtrip(monkeypatch, tmp_path):
     key = b"k" * 16
     iv = bytes.fromhex("0e92570270b04c4e4f0efc6eae7db5f2")
@@ -401,10 +423,7 @@ def test_download_getav_roundtrip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
 
-    async def fake_remux(src, dst):
-        with open(src, "rb") as fi, open(dst, "wb") as fo:
-            fo.write(fi.read())
-    monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_copy)
 
     events = []
 
@@ -557,7 +576,7 @@ def test_burn_subtitles_args(monkeypatch, tmp_path):
     vf = args[args.index("-vf") + 1]
     assert vf.startswith(f"subtitles={sub}:force_style=")
     assert "mov_text" not in " ".join(args)          # burn, not a text track
-    assert "libx264" in args and "veryfast" in args  # full re-encode
+    assert "libx264" in args and "superfast" in args  # full re-encode, config 默认档（issue #19）
     assert "-c:a" in args and args[args.index("-c:a") + 1] == "copy"
     assert "+faststart" in args and str(missav.BURN_CRF) in args
     style = vf.split("force_style='")[1]
@@ -729,8 +748,7 @@ def _hls_fixture(with_subtitle, tmp_path, monkeypatch):
     calls = []
 
     async def _copy(src, dst):
-        with open(src, "rb") as fi, open(dst, "wb") as fo:
-            fo.write(fi.read())
+        await _concat_copy(src, dst)
 
     async def fake_burn(src, dst, subtitle_path, task_id=None):
         calls.append(("burn", subtitle_path))
@@ -909,11 +927,7 @@ def test_download_getav_pins_chosen_source(monkeypatch, tmp_path):
         missav, "_http_get",
         lambda url, headers=None, timeout=None, max_bytes=None: (served.get(url) or FakeResp(404), None))
 
-    async def fake_remux(src, dst):
-        with open(src, "rb") as fi, open(dst, "wb") as fo:
-            fo.write(fi.read())
-
-    monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_copy)
     dest = tmp_path / "out.mp4"
     asyncio.run(missav.download_getav(
         "https://getav.net/zh/videos/cjod-159", str(dest),

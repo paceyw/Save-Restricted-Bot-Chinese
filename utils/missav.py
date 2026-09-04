@@ -45,7 +45,8 @@ from html import unescape as html_unescape
 import tempfile as _tempfile
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from config import BURN_CONCURRENCY, BURN_TIMEOUT_S, FFMPEG_BURN_THREADS
+from config import (BURN_CONCURRENCY, BURN_CRF, BURN_PRESET, BURN_TIMEOUT_S,
+                    FFMPEG_BURN_THREADS)
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 logger = logging.getLogger(__name__)
@@ -1275,13 +1276,23 @@ def extract_getav_details(data, url, family=None):
 async def _run_ffmpeg(args, timeout_s=None):
     """Await ffmpeg; thin seam for tests. Raises MissAVError on failure.
 
-    ``timeout_s`` (when > 0) bounds the wall-clock run: on expiry — and on
-    task cancellation — the child is killed and reaped so no orphan ffmpeg
-    keeps holding memory after the coroutine gives up. The raised MissAVError
-    carries ``exit_code`` for structured logging by callers.
+    The child runs demoted (`nice -n 19`, plus `ionice -c3` when
+    available) so a 20-40 minute burn always yields CPU/IO to downloads
+    and uploads — the "slow lane" contract. Missing wrappers degrade to
+    the raw command. ``timeout_s`` (when > 0) bounds the wall-clock run:
+    on expiry — and on task cancellation — the child is killed and
+    reaped so no orphan ffmpeg keeps holding memory after the coroutine
+    gives up. The raised MissAVError carries ``exit_code`` for
+    structured logging by callers.
     """
+    cmd = []
+    if shutil.which("nice"):
+        cmd += ["nice", "-n", "19"]
+    if shutil.which("ionice"):
+        cmd += ["ionice", "-c3"]
+    cmd += args
     proc = await asyncio.create_subprocess_exec(
-        *args,
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1304,12 +1315,31 @@ async def _run_ffmpeg(args, timeout_s=None):
         raise exc
 
 
+def _is_concat_list(src):
+    """True when src is the ffconcat list the HLS core writes (sniff)."""
+    try:
+        with open(src, "rb") as fh:
+            return fh.read(8).lstrip() == b"ffconcat"
+    except OSError:
+        return False
+
+
 async def remux_to_mp4(src, dst):
-    """Copy-remux TS -> MP4 (+faststart). Zero re-encode, seconds."""
+    """Copy-remux -> MP4 (+faststart). Zero re-encode, seconds.
+
+    ``src`` is the HLS core's ffconcat segment list (absolute paths, so
+    merged.ts never hits the disk — the single biggest per-job IO lever)
+    or, for direct callers, a plain media file: the input flags follow
+    the sniffed kind.
+    """
     if not shutil.which("ffmpeg"):
         raise MissAVError("服务器缺少 ffmpeg，无法封装 MP4")
+    input_flags = (
+        ["-f", "concat", "-safe", "0", "-fflags", "+genpts"]
+        if _is_concat_list(src) else []
+    )
     await _run_ffmpeg(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+        ["ffmpeg", "-y", "-loglevel", "error", *input_flags, "-i", src,
          "-c", "copy", "-bsf:a", "aac_adtstoasc",
          "-movflags", "+faststart", dst]
     )
@@ -1338,8 +1368,6 @@ _SUBTITLE_FORCE_STYLE = (
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
     "BorderStyle=1,Outline=1,Shadow=0.5,MarginV=10,Alignment=2"
 )
-BURN_PRESET = "veryfast"   # x264 speed preset: ~4x realtime on 3 vCPU
-BURN_CRF = 19              # visually lossless tier for a re-encode
 
 
 def _escape_filter_path(path):
@@ -1365,11 +1393,13 @@ _burn_slots = asyncio.Semaphore(BURN_CONCURRENCY)
 async def burn_subtitles_to_mp4(src, dst, subtitle_path, task_id=None):
     """Re-encode TS -> MP4 with Chinese subtitles rendered INTO the frame.
 
-    Full libx264 re-encode (the only way to burn subs): measured on the
-    3-vCPU box, veryfast/CRF19 runs ~4x realtime (~36 min for a 2.5h
-    movie), peak RSS ~0.5GB. The subtitles filter matches cues against
-    the 0-based frame timeline, which is exactly how getav's player
-    authors its VTTs, so no offset correction is needed.
+    Full libx264 re-encode (the only way to burn subs), config-tuned via
+    BURN_PRESET (default superfast, §8 定稿) / BURN_CRF (default 19) and
+    FFMPEG_BURN_THREADS; peak RSS ~0.5GB. The subtitles filter matches
+    cues against the 0-based frame timeline, which is exactly how
+    getav's player authors its VTTs, so no offset correction is needed.
+    ``src`` is the HLS core's ffconcat list or a plain media file (the
+    input flags follow the sniffed kind).
 
     Concurrency is bounded by BURN_CONCURRENCY; every run logs start/end
     with sizes, duration and exit status (task ids only — never URLs,
@@ -1391,7 +1421,10 @@ async def burn_subtitles_to_mp4(src, dst, subtitle_path, task_id=None):
     try:
         async with _burn_slots:
             await _run_ffmpeg([
-                "ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                "ffmpeg", "-y", "-loglevel", "error",
+                *(["-f", "concat", "-safe", "0", "-fflags", "+genpts"]
+                  if _is_concat_list(src) else []),
+                "-i", src,
                 "-vf", vf,
                 "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", str(BURN_CRF),
                 "-threads", str(threads),
@@ -1816,27 +1849,25 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
             raise
 
         await _report(total, total, "merge")
-        merged = os.path.join(temp_dir, "merged.ts")
-        with open(merged, "wb") as out:
+        # no merged.ts: remux/burn read the decrypted parts straight from
+        # this ffconcat list (-4..8 GB of copy IO per 2-4 GB job)
+        concat_list = os.path.join(temp_dir, "list.txt")
+        with open(concat_list, "w", encoding="utf-8") as fh:
+            fh.write("ffconcat version 1.0\n")
             for path in results:
-                with open(path, "rb") as fh:
-                    while True:
-                        chunk = fh.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+                fh.write("file '" + path.replace("'", "'\\''") + "'\n")
 
         burn_sub = subtitle_path or subtitle_track_path
         if burn_sub:
             await _report(0, 1, "burn")
             try:
-                await burn_subtitles_to_mp4(merged, dest_path, burn_sub, task_id=task_id)
+                await burn_subtitles_to_mp4(concat_list, dest_path, burn_sub, task_id=task_id)
             except MissAVError:
                 # a broken subtitle/font must never lose the video itself
                 logger.warning("字幕烧录失败，回退无字幕封装", exc_info=True)
-                await remux_to_mp4(merged, dest_path)
+                await remux_to_mp4(concat_list, dest_path)
         else:
-            await remux_to_mp4(merged, dest_path)
+            await remux_to_mp4(concat_list, dest_path)
         return {
             "title": info.get("title") or "",
             "thumbnail": info.get("thumbnail") or "",

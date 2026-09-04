@@ -819,9 +819,11 @@ def test_download_missav_roundtrip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
 
+    seen_src = {}
+
     async def fake_remux(src, dst):
-        with open(src, "rb") as fi, open(dst, "wb") as fo:
-            fo.write(fi.read())
+        seen_src["src"] = os.path.basename(src)
+        await _concat_aware_remux(src, dst)
 
     monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
 
@@ -835,7 +837,8 @@ def test_download_missav_roundtrip(monkeypatch, tmp_path):
         missav.download_missav("https://missav.ai/sone-543", str(dest), progress=progress)
     )
 
-    assert dest.read_bytes() == b"".join(parts)  # byte-exact decrypt + ordered merge
+    assert dest.read_bytes() == b"".join(parts)  # byte-exact decrypt + ordered concat
+    assert seen_src["src"] == "list.txt"  # issue #19: remux reads the ffconcat list, no merged.ts
     assert meta["title"] == "SONE-543"
     assert meta["thumbnail"] == "https://cdn.example/pic.jpg"
     assert meta["segments"] == 3
@@ -892,6 +895,100 @@ def test_remux_missing_ffmpeg_reports_clear_error(monkeypatch, tmp_path):
     monkeypatch.setattr(missav.shutil, "which", lambda name: None)
     with pytest.raises(missav.MissAVError, match="ffmpeg"):
         asyncio.run(missav.remux_to_mp4(str(tmp_path / "a.ts"), str(tmp_path / "a.mp4")))
+
+
+# ─── ffmpeg demotion / burn knobs / concat list (issue #19) ────────────────────
+
+def test_run_ffmpeg_prefixes_nice_ionice(monkeypatch):
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"", b"")
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _Proc()
+
+    monkeypatch.setattr(missav.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        missav.shutil, "which",
+        lambda name: f"/usr/bin/{name}" if name in ("nice", "ionice", "ffmpeg") else None)
+    asyncio.run(missav._run_ffmpeg(["ffmpeg", "-version"]))
+    cmd = captured["cmd"]
+    assert cmd[:3] == ("nice", "-n", "19")     # CPU demotion first
+    assert cmd[3:5] == ("ionice", "-c3")       # IO idle class when available
+    assert cmd[-2:] == ("ffmpeg", "-version")  # real command rides last
+    # missing wrappers degrade to the raw command
+    monkeypatch.setattr(missav.shutil, "which", lambda name: None)
+    asyncio.run(missav._run_ffmpeg(["ffmpeg", "-version"]))
+    assert captured["cmd"] == ("ffmpeg", "-version")
+
+
+def test_remux_burn_sniff_concat_list_input(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_run(args, timeout_s=None):
+        captured["args"] = list(args)
+
+    monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
+    monkeypatch.setattr(
+        missav.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+    lst = tmp_path / "list.txt"
+    lst.write_text("ffconcat version 1.0\nfile '/tmp/x/000000.ts'\n", encoding="utf-8")
+    dst = tmp_path / "o1.mp4"
+    dst.write_bytes(b"x")
+    asyncio.run(missav.remux_to_mp4(str(lst), str(dst)))
+    args = captured["args"]
+    idx = args.index("-i")
+    assert args[idx - 6:idx] == ["-f", "concat", "-safe", "0", "-fflags", "+genpts"]
+    assert args[idx + 1] == str(lst)
+    # a plain media file keeps the legacy direct -i (no concat flags)
+    plain = tmp_path / "in.ts"
+    plain.write_bytes(b"\x00" * 32)
+    dst2 = tmp_path / "o2.mp4"
+    dst2.write_bytes(b"x")
+    asyncio.run(missav.remux_to_mp4(str(plain), str(dst2)))
+    args = captured["args"]
+    assert args[args.index("-i") + 1] == str(plain)
+    assert "concat" not in args  # legacy direct input, no concat flags
+
+
+def test_is_concat_list_sniff(tmp_path):
+    lst = tmp_path / "l.txt"
+    lst.write_text("ffconcat version 1.0\n", encoding="utf-8")
+    assert missav._is_concat_list(str(lst)) is True
+    ts = tmp_path / "in.ts"
+    ts.write_bytes(b"\x47\x40\x00\x10" * 8)
+    assert missav._is_concat_list(str(ts)) is False
+    assert missav._is_concat_list(str(tmp_path / "missing")) is False
+
+
+def test_burn_uses_superfast_preset_and_concat_input(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_run(args, timeout_s=None):
+        captured["args"] = list(args)
+
+    sub = tmp_path / "zh.vtt"
+    sub.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n", encoding="utf-8")
+    src = tmp_path / "list.txt"
+    src.write_text("ffconcat version 1.0\nfile '/tmp/x/000000.ts'\n", encoding="utf-8")
+    dst = tmp_path / "out.mp4"
+    dst.write_bytes(b"x")
+    monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
+    monkeypatch.setattr(missav, "BURN_PRESET", "superfast")
+    monkeypatch.setattr(missav, "BURN_CRF", 19)
+    asyncio.run(missav.burn_subtitles_to_mp4(str(src), str(dst), str(sub)))
+    args = captured["args"]
+    assert args[args.index("-preset") + 1] == "superfast"
+    assert args[args.index("-crf") + 1] == "19"
+    idx = args.index("-i")
+    assert args[idx - 6:idx] == ["-f", "concat", "-safe", "0", "-fflags", "+genpts"]
+    assert "subtitles=" in args[args.index("-vf") + 1]
 
 
 # ─── security hardening (post-review) ─────────────────────────────────────────
@@ -1386,11 +1483,7 @@ def test_playlist_stall_retries_then_download_succeeds(monkeypatch, tmp_path):
     monkeypatch.setattr(missav, "_http_get", fake_get)
     monkeypatch.setattr(missav.time, "sleep", lambda s: None)
 
-    async def fake_remux(src, dst):
-        with open(src, "rb") as fi, open(dst, "wb") as fo:
-            fo.write(fi.read())
-
-    monkeypatch.setattr(missav, "remux_to_mp4", fake_remux)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
 
     dest = tmp_path / "out.mp4"
     missav.asyncio.run(missav.download_missav("https://missav.ai/sone-543", str(dest)))
