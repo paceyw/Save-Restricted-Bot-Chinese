@@ -649,10 +649,15 @@ def test_extract_video_details_degrades_without_panel():
     assert d2["badges"] == []
 
 
-def test_extract_video_details_uncensored_leaked_slug():
+def test_extract_video_details_uncensored_leak_slug():
+    # real missav suffix is "-uncensored-leak" (e.g. cawd-629-uncensored-leak);
+    # "-uncensored-leaked" legacy spelling resolves to the same 无码破解 badge
+    d = missav.extract_video_details(
+        "<html></html>", "https://missav.ai/cn/stars-804-uncensored-leak")
+    assert d["badges"] == ["无码破解"]
     d = missav.extract_video_details(
         "<html></html>", "https://missav.ai/cn/stars-804-uncensored-leaked")
-    assert d["badges"] == ["无码流出"]
+    assert d["badges"] == ["无码破解"]
 
 
 def test_build_caption_full_format():
