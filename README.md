@@ -2,16 +2,29 @@
 
 # Save Restricted Content Bot v3 · 中文优化版
 
-Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
+Telegram 私域内容转发与媒体下载机器人 · 番号搜索 / 多版本选择 / 中文字幕烧录
 
 </div>
 
-> 本仓库 Fork 自 [devgaganin/Save-Restricted-Content-Bot-v3](https://github.com/devgaganin/Save-Restricted-Content-Bot-v3)，并在其基础上做了关键 Bug 修复与中文本地化。
-> 所有 **合规使用** 仅限转发自己有权访问的内容；不得用于绕过他人设置的访问限制、抓取受版权保护内容等用途。
+> 本仓库 Fork 自 [devgaganin/Save-Restricted-Content-Bot-v3](https://github.com/devgaganin/Save-Restricted-Content-Bot-v3)，修复原版 v3 的架构性缺陷（命令注册在已关闭 loop 的 Telethon 上导致 9 个命令永久失效），并在此基础上完成中文本地化与大规模下载管线建设。
+> 所有**合规使用**仅限转发/下载自己有权访问的内容；不得用于绕过他人设置的访问限制、抓取受版权保护内容等用途。
 
 ---
 
-## 🚀 快速部署（人工版）
+## ⚡ 能力总览
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| 私域消息转发 | `/single` `/batch` `/merge` | 相册一比一保留（分组/缩略图/说明文字），支持服务端整组复制 |
+| 番号搜索 | `/search <番号>` 或直接发番号 | missav 站内搜索 → 封面+badge 交互卡片 → 选片即下 |
+| 多版本下载 | `/dl <missav/getav链接>` | 自动探测 原版/中文字幕/无码破解/组合 版本，版本卡片点选或「全部下载」 |
+| 中文字幕烧录 | `/dl -sub <链接>` | 站方字幕轨/getav 官方字幕按番号匹配，字幕组风格烧进画面 |
+| 通用站点下载 | `/dl` `/adl` | yt-dlp 支持的站点（YouTube/Instagram/Xvideos 等） |
+| 任务队列 | `/tasks` `/stop` | 后台串行执行、实时进度、非字幕任务优先、烧录不占并发槽 |
+
+---
+
+## 🚀 快速部署
 
 前置：Docker 24+ 与 Docker Compose v2；在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 `BOT_TOKEN`，在 [my.telegram.org](https://my.telegram.org) 拿到 `API_ID` / `API_HASH`。
 
@@ -25,7 +38,7 @@ docker compose exec bot curl -s http://127.0.0.1:5000/healthz   # {"ok": true}
 
 给 bot 发送 `/start`，收到欢迎菜单即部署完成。日常运维：`docker compose logs -f --tail=200 bot` 看日志；`docker compose restart` 重启；**回滚**：`git checkout <上一个版本tag> && docker compose up -d --build`。
 
-## 🤖 快速部署（AI 可读版）
+### AI 可读部署摘要
 
 ```yaml
 project: save-restricted-content-bot-v3
@@ -40,7 +53,8 @@ required_env: [API_ID, API_HASH, BOT_TOKEN, OWNER_ID, LOG_GROUP, MONGO_ROOT_USER
                DB_NAME, MASTER_KEY, IV_KEY]
 optional_env: [STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, YT_COOKIES,
                INSTA_COOKIES, MISSAV_MIRRORS, GETAV_MIRRORS, BURN_CONCURRENCY,
-               FFMPEG_BURN_THREADS, DISK_FREE_MIN_GB, LOG_LEVEL]
+               BURN_PRESET, BURN_CRF, FFMPEG_BURN_THREADS, BURN_TIMEOUT_S,
+               DISK_FREE_MIN_GB, LOG_LEVEL]
 steps:
   - "cp .env.example .env 并填满 required_env（__GENERATE_*__ 用 openssl rand -hex 32）"
   - "docker compose -p save-restricted-content-bot-v3 up -d --build"
@@ -58,6 +72,87 @@ forbidden:
   - "将 main.py 启动改为 asyncio.run()  # 与 pyrofork Dispatcher 的导入期 loop 绑定冲突，bot 会静默失聪（见 main.py 注释）"
 ```
 
+完整环境变量表（33 项必填/可选 + 默认值 + 用途）见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+---
+
+## 🎬 媒体下载管线
+
+### 站点路由
+
+`/dl` 按链接自动路由：**getav.net**（JSON API）→ **missav 系镜像**（页面解析）→ **yt-dlp 通用站点**。`/adl` 提取音频。
+
+### 番号搜索与多版本选择
+
+- **`/search <番号>`**（或直接发 `SSIS-405` 这类番号文本）：missav 站内搜索，结果以**封面 + 内联按钮卡片**呈现（每条带 `中文字幕`/`无码破解` badge，每页 6 条可翻页，≤10 条）；**唯一命中也出卡片**确认，防错下
+- **版本卡片**：选片（或直接 `/dl` 任意 missav 链接）后自动探测同一部片的全部姊妹版本——`原版` / `中文字幕`（`-chinese-subtitle`） / `无码破解`（`-uncensored-leak`） / `无码破解·中文字幕`（组合页）——探测方式为同 host 单次轻量 GET，404/被 Cloudflare 拦截的候选静默跳过
+- 卡片 ⭐ 推荐序：组合页 > 中文字幕 > 无码破解 > 原版；**「⏬ 全部下载」**：组合页存在只下组合页，否则中字+无码各入队一个任务
+- getav 链接的多版本卡片逻辑同源（中文字幕版/无码版/原版 × 分辨率，按源固定）
+- 卡片 10 分钟有效，`/stop` 一键取消全部未决卡片
+
+### 中文字幕烧录（`-sub`）
+
+`/dl -sub <getav或missav链接>`（`-sub` 可在链接前后）。字幕来源按优先级：
+
+1. **missav HLS 字幕轨**：中字版页面的 master playlist 内 `EXT-X-MEDIA TYPE=SUBTITLES` 轨，分段 VTT 下载合并（处理 `X-TIMESTAMP-MAP` MPEGTS 时间偏移 + 跨段重复 cue 去重），与视频天然同时间轴
+2. **getav 官方字幕兜底**：页面无字幕轨时，按番号查 getav 影片 API，**id/标题番号边界强匹配**才取其精校中文字幕（防止 `ABC-12` 误配 `ABC-123`）
+3. 任一来源失败静默降级为无字幕快速封装，绝不影响视频交付
+
+烧录为字幕组风格硬字幕（白色粗体 + 黑描边 + 柔和阴影，底部居中；**字号按画面高度等比缩放**——恒为高度约 4.5%，分辨率无关）。编码默认 `libx264 superfast / CRF 19 / 源分辨率`：3 核实测 40 分钟片约 13–27 分钟（画质感知无损档，`BURN_PRESET`/`BURN_CRF` 可调，`ultrafast` 可选但暗场渐变有 banding 风险）；音频流 copy 不重编码；烧录期间 ffmpeg 以 `nice 19 + ionice idle` 降权运行，不挤占下载/上传；`cn` 版本自带烧录字幕的不二次烧录。
+
+**资源语义**：烧录类任务（`-sub`）走慢车道——下载完成即释放 `MISSAV_MAX_JOBS` 并发槽（烧录在独立 `BURN_CONCURRENCY` 信号量排队），期间新任务（尤其非字幕任务）正常入场；worker 出队时**非字幕任务优先**。不带 `-sub` 一律秒级无损 remux。
+
+### 投递与文案
+
+- 投递路由：用户设置频道（`/setbot` 机器人发送）→ `LOG_GROUP` → 私聊回退；进度只发私聊
+- 成品以**一条相册**投递：封面 + 可直接播放的视频；>1.8GB 自动按关键帧无损分段（`-c copy`，每段独立 moov 可拖进度，最多 9 段）
+- caption 五段式：`番号 / 简介 / 演员# / 标签# / 类别#` + 可选 `片商：#片商 #发行日期`；版本 badge（中文字幕/无码破解等）从 slug 自动推导
+- **元数据增强**（尽力而为，失败静默）：JavBus 补全片商/发行日期/类型（标签截前 6 个主要标签）；演员名保留 **中文名 (日文名)** 双语（JavBus 优先，missav `/cn/` 页兜底）；进程内 LRU 缓存避免重复请求
+
+### 网络与资源防护
+
+- 镜像轮换过 Cloudflare（curl-cffi Chrome TLS 指纹）；全部请求 pin 到镜像/CDN 注册域，**重定向后的最终 host 复验**，私网/云元数据地址拒绝
+- 分段 502/503/504 深重试预算（8 次指数退避封顶 60s）、429 六次、其余快速失败；播放列表/密钥/JSON 4 次退避重试
+- 单任务守卫：20k 段 / 20GB 累计 / 8 小时时长 / 封装前磁盘复查（`DISK_FREE_MIN_GB` 水位）；跨用户并发由 `MISSAV_MAX_JOBS` 限制
+- IPv6 出口：compose 的 egress 网络启用 `enable_ipv6`——VPS IPv4 被逐连接限速而 IPv6 正常时自动走 IPv6 拉流
+
+---
+
+## 🤖 可用命令
+
+### 📥 内容下载
+| 命令 | 说明 |
+|---|---|
+| `/dl [-sub] <链接>` | 下载视频：missav 系 / getav.net 走内置 HLS 管线（含版本卡片），其余走 yt-dlp；`-sub` 烧录中文字幕 |
+| `/search <番号>` | 番号搜索 missav，封面卡片选择下载（直接发番号文本同样生效） |
+| `/adl <链接>` | 提取音频 |
+| `/tasks` | 任务队列实时进度（每 5 秒刷新，显示百分比/烧录/上传阶段） |
+| `/stop` | 取消排队任务与未决卡片（进行中的下载在当前步骤收尾） |
+
+### 🔑 账号与登录
+| 命令 | 说明 |
+|---|---|
+| `/login` / `/logout` | 登录以访问受限内容（支持混淆验证码格式） |
+| `/setbot` / `/rembot` | 添加/移除自定义处理机器人 |
+
+### 📥 私域转发
+| 命令 | 说明 |
+|---|---|
+| `/batch` | 批量提取：起始链接+数量，或多行链接逐条下载 |
+| `/single` | 单条提取（相册一比一转发） |
+| `/merge` | 多条合并为一条消息/相册（>10 项自动拆分） |
+| `/cancel` | 取消进行中的登录/批量/设置流程 |
+
+### ⚙️ 设置与会员
+| 命令 | 说明 |
+|---|---|
+| `/settings` | 重命名标签 / 标题 / 缩略图 / 会话 / 删除词 / 替换词 |
+| `/status` `/myplan` `/plan` `/pay` `/transfer` | 会员状态与方案（支付统一为联系管理员提示） |
+| `/start` `/help` `/terms` | 启动 / 帮助 / 条款 |
+| `/add <ID> <时长> <单位>` / `/rem <ID>` / `/set` | 仅管理员 |
+
+---
+
 ## 🏗️ 架构
 
 ```mermaid
@@ -69,7 +164,7 @@ flowchart LR
         SWEEP["缓存治理 sweeper 60s · 常驻<br/>任务历史/LRU/进度TTL/闲置驱逐"]
         CB["自定义 bot / 登录会话<br/>按需 · 闲置30分钟驱逐"]
         YTDLP["yt-dlp 子进程 · 按需"]
-        FF["ffmpeg/ffprobe 子进程 · 按需"]
+        FF["ffmpeg/ffprobe 子进程 · 按需<br/>remux/分段/烧录(nice降权)"]
     end
     subgraph mongo["mongo 容器 · C++ · 512M 上限"]
         MG[("MongoDB 8.0<br/>WiredTiger 缓存 0.25GB")]
@@ -80,293 +175,135 @@ flowchart LR
     MAIN --> MG
     APP --> TG["Telegram"]
     CB --> TG
-    YTDLP --> SRC["missav / getav 镜像"]
+    FF --> SRC["missav / getav 镜像<br/>JavBus(尽力而为)"]
+    YTDLP --> SRC
 ```
 
-### 常驻 vs 按需
-
-| 类别 | 组件 | 要点 |
-|---|---|---|
-| 常驻 | bot 客户端（pyrofork） | 唯一常驻 Telegram 会话 |
-| 常驻 | aiohttp 健康服务 | 与主循环同一事件循环，循环卡死则探针自然失败 |
-| 常驻 | 缓存治理 sweeper（60s） | 任务历史 10min/每人 20 条、消息来源 LRU 1000、进度状态 1h TTL、闲置客户端 30min 驱逐 |
-| 常驻 | pymongo 连接池 | 3 条常驻 TCP |
-| 按需 | 自定义 bot / 登录会话客户端 | 每任务拉起、用完驱逐、透明重建 |
-| 按需 | yt-dlp / ffmpeg / ffprobe 子进程 | `asyncio.create_subprocess_exec`，不常驻 |
-| 一次性 | mongo-init | 建库建索引后退出 |
-
-### 语言构成
-
-| 语言 | 组件 |
-|---|---|
-| Python | 主程序、全部插件、yt-dlp、418 项测试 |
-| C 扩展 | TgCrypto（MTProto AES 加速）、ffmpeg/ffprobe、pymediainfo |
-| C++ | MongoDB 8.0 / WiredTiger |
-| Rust | 无（重构计划明确否决全量 Rust 重写，仅保留瓶颈门禁触发后的 PoC 选项） |
-
-### 内存治理（实测）
-
-| 指标 | 重构前（运行 2 周） | 重构后 |
-|---|---|---|
-| 空闲基线 | 109MiB（持续爬升） | **86MiB** |
-| 大文件任务后 | 431MB + swap 142MB | 182MiB（其中页缓存 ~45MiB 可回收，进程 anon 仅 ~77MiB） |
-| cgroup 回收压力事件 | 939,558 次 | **0** |
-
----
-
-## 🔧 本 Fork 相对原版做了什么
-
-原版 v3 存在一个**架构性缺陷**：机器人的命令处理器一部分注册在 Telethon 客户端上，但 `shared_client.py` 为了让 Pyrogram 独占接收消息，主动关闭了 Telethon 的 update loop。结果所有写在 Telethon 上的命令**永远收不到消息**，处于完全失效状态。
-
-本 Fork 的核心修复如下：
-
-| 修复项 | 原版问题 | 本 Fork 处理 |
-|---|---|---|
-| **命令失效（核心）** | `/status`、`/transfer`、`/rem`、`/add`、`/settings`（含全部设置按钮）、`/adl`、`/dl` 共 9 个处理器注册在被关闭 loop 的 Telethon 上，全部无反应 | 全部迁移到正在收消息的 Pyrogram 客户端，命令恢复正常响应 |
-| **`/myplan` 幽灵命令** | help 文本宣传 `/myplan`，但代码库无任何实现 | 新增 `/myplan`，显示当前会员套餐与到期时间 |
-| **`pay.py` 崩溃** | 支付成功回调引用了未导入的 `OWNER_ID`，且 `send_message` 缺 chat_id 参数，必然抛异常 | 整个支付流程重写为统一提示文案 |
-| **菜单与实际不符** | `set_bot_commands` 注册了多个实际瘫痪的命令；help 列出 `/get` `/lock` `/session` 等不存在的命令 | 菜单与 help 全部对齐真实可用命令 |
-| **缺少 `.gitignore`** | 原仓库无 `.gitignore`，`telethonbot.session`（含登录态）等敏感文件易误提交 | 新增 `.gitignore`，排除 session/缓存/媒体/数据库文件 |
-| **`ytdl` cookie 传参错误** | 调用处传入字面量字符串 `"YT_COOKIES"`，而非已导入的 cookie 内容 | 已修正，传入实际 cookie 值 |
-| **`ytdl` 大文件阈值错误** | 大文件判断写成 `2*1024*1024`（2 MiB），与宣称的 2 GB 不符 | 已修正为 2 GB |
-| **`/single` 相册只下载一项** | 链接指向相册（media group）时只取链接中的单条，图片/视频/文字丢失 | 自动检测相册并拉取整组：优先服务端复制；受限内容下载后整组重传，**一比一保留分组、顺序、原缩略图与带 tag 的说明文字** |
-| **`/single` 公开链接报 MEDIA_EMPTY** | 抓取来源记录（`emp`）以用户名作键、下游按数字 chat ID 查询，永远失配：相册扩展错用自定义 bot（CHANNEL_INVALID 退化为单条），再用 user 会话的 file_id 让 bot 直发（跨客户端引用无效，MEDIA_EMPTY），且失败后不回退 | `emp` 统一按数字 chat ID 记录，相册扩展正确选用抓取客户端；file_id 直发失败自动回退下载重传；下载固定使用实际抓到消息的客户端 |
-| **相册大视频丢失（>2GB）** | 带说明文字的相册被强制走"下载后重传"：无 premium 会话时自定义 bot 上限 2000 MiB，4GB 视频整组与逐条发送均失败，频道里只剩图片；且自定义 bot 不在源频道时 `copy_media_group` 直接 `CHANNEL_INVALID` | 相册一律优先**服务端整组复制**（支持替换说明文字，不重新上传、不受 bot 上传上限约束）：先由自定义 bot 复制，失败自动改用实际抓取消息的登录会话重试；下载产物校验非空/大小一致（Pyrofork 超时可能落盘 0 字节文件），坏项跳过重试，不再拆散相册；上传中 mtime 心跳防误清 |
-| **`/setbot` 令牌"已保存却仍提示提供"** | 保存路径与读取路径的清洗逻辑不一致，合法 token 被判空 | 统一令牌读取与校验，`/single` 正常识别已保存的自定义 bot |
-| **pyrofork 相册解析崩溃（双发）** | `send_media_group` 在相册**已成功送达后**构造响应对象 `raw.types.messages.Messages(...)` 漏传本层必填的 `topics` 参数，抛 TypeError 被调用方误判为失败而重发，频道收到重复内容（pyrofork 2.3.69 全应用范围） | `shared_client` 导入期 monkeypatch 给 `topics` 兜底 `[]`，覆盖全部 `send_media_group` 调用点（含相册转发与 missav 投递） |
-| **进度消息刷屏频道** | 下载/上传进度条直接发在目标频道 | 进度报告一律发到用户与主 Bot 的私聊，频道只保留最终相册/文件 |
-| **`/login` 验证码被 Telegram 失效** | 直接发原始验证码会被 Telegram 立即作废，导致登录失败 | 支持混淆格式（`1 2 3 4 5`、`s12345`、`1-2-3-4-5`），自动提取数字；登录日志手机号脱敏 |
-| **`/batch` 不支持跳选链接** | 只支持"起始链接 + 数量"连续范围，无法一次提交多个不连续链接 | `/batch` 第一步直接粘贴**多条链接（每行一条）**即可逐条下载，遵守套餐条数上限，支持 /stop 取消 |
-| **相册健壮性** | 无音轨视频混入相册被 Telegram 整组拒绝（MEDIA_EMPTY）；限流（FLOOD_WAIT）直接跳过该链接 | 上传前自动检测视频音轨，**无音轨视频用 ffmpeg 重封装静音 AAC 轨（流拷贝不重编码）**，整组正常成相册；仍失败时逐条回退兜底（部分成功优于全灭）；捕获 FloodWait 按等待时长自动重试 |
-| **`/merge` 多条合并** | 原版无此功能 | 多条链接合并为一条消息/相册发送；自定义文字替换原文；超过 10 项自动拆分时每组附带 `(1/N)` 进度标记 |
-| **任务队列** | 批量/合并/单条同步阻塞，FloodWait 等待期间用户完全无法操作 bot；`/dl`/`/adl` 不在队列内，一人一次只能一个下载 | 每用户独立后台 worker 串行执行（含 `/dl`/`/adl`）；任务入队立即返回；`/tasks` 查看进度并**每 5 秒自动实时刷新**（显示下载百分比、烧录/上传等阶段，全部任务结束后定格终态）；`/stop` 取消排队任务（进行中的下载在当前步骤收尾）；FloodWait 不再阻塞交互 |
-| **速率控制** | 硬编码 `sleep(10)` 等间隔不可调 | 批量/计数任务间隔自适应（AIMD）：无 FloodWait 时从 `BATCH_MIN_INTERVAL`（默认 2s）起步，触发 FloodWait 按 3 倍退避（封顶 `BATCH_INTERVAL` 默认 10s）再逐步回落；设 `BATCH_MIN_INTERVAL=10` 可恢复旧固定间隔；合并/频道/上传间隔仍由 `MERGE_INTERVAL`、`CHANNEL_INTERVAL`、`UPLOAD_INTERVAL` 配置；`MAX_FLOOD_RETRIES` 可调 |
-
-### 2026-08 重构（安全基线 / 磁盘自愈 / 依赖瘦身 / 内存有界化 / DB 优化 / 消息获取优化 / batch.py 拆分 / 吞吐提升）
-
-| 维度 | 改动 |
-|---|---|
-| **加密加固** | 会话/token 加密改为每条记录随机 salt 的 AES-GCM（`b64(salt+nonce+tag+ct)`），旧格式自动兼容解密；用户自定义 bot token 由明文改为加密落库，读取时自动迁移；篡改/损坏的密文拒绝启动且不清库 |
-| **磁盘自愈** | 临时文件生命周期：下载产物在任务结束（成功/失败/兜底）即删除，服务端复制路径全程不落盘；异常残留（进程被杀、容器崩溃）由清扫兜底——启动时清 `downloads/` 超 1 小时文件，容器内每小时清超 4 小时孤儿文件（含 `.temp` 半成品、相册缩略图），`tmp/` 超 24 小时，ffmpeg 截图超 7 天；上传中 mtime 心跳（5s 节流）防止大文件被误删；用户头像缩略图 `{uid}.jpg` 与 session 文件不参与清理 |
-| **依赖瘦身** | 移除死代码 Telethon 栈与 OpenCV（视频元数据改 ffprobe 读取）；全部依赖锁定版本（Werkzeug 2.2.2→2.2.3 修复 CVE-2023-25577） |
-| **内存有界化** | 后台 sweeper（60s 周期）统一治理全部进程内缓存：任务历史完成 10 分钟后清除且每用户上限 20 条；用户 bot/session client 闲置 30 分钟自动断开驱逐（再次使用时透明重建，进行中的任务不受干扰）；消息来源标记与 linked-chat 缓存改 LRU（上限 1000）；进度状态 1 小时超时清理；登录中间态/登录锁/设置对话态均带 TTL 自动过期 |
-| **DB 优化** | 任务开始执行时对 `users` 集合一次 `find_one` 快照全部设置（caption/chat_id/替换词/删除词/重命名标签），随任务贯穿下载-处理-投递全链路，替代原每条消息 3-5 次查询（稳态每任务恰好 1 次查询）；快照只保留声明过的设置键（session 等敏感字段不入任务历史）；注意：任务开始执行后修改的设置对该任务不生效，排队中的任务按开始时快照生效；`users.user_id` 与 `premium_users.user_id` 唯一索引及会员过期 TTL 索引改为启动时一次性创建（存量重复数据导致唯一索引失败时仅告警不阻断启动） |
-| **消息获取优化** | 私聊抓取新增 per-user peer 缓存（输入 chat key → 可访问的 chat_id 形式，TTL 24 小时、每用户上限 500 条）：缓存命中时跳过原每条消息一次的 `get_dialogs` 全量遍历直接取消息（同一私聊批量 10 条 `get_dialogs` 调用 ≤1 次）；缓存失效/过期自动降级原预热兜底链，行为与旧版完全一致；随 sweeper 在 client 驱逐时联动清理 |
-| **代码结构拆分** | 原 2130 行上帝文件 `batch.py` 拆分为 `plugins/fetch.py`（client 缓存/消息获取/peer 缓存）、`plugins/tasks.py`（任务队列/后台 sweeper）、`plugins/deliver.py`（媒体下载与投递）+ 命令层 `batch.py`（297 行）；全局单字母变量改语义名（`UB→user_bots`、`UC→user_clients`、`emp→fetch_origin`、`P→progress_state`、`Z→pending_flows`、`E→parse_link` 等）；相册/合并的逐条发送降级逻辑合一、手写 FloodWait 重试统一收敛到 `with_flood_retry`、视频/音频扩展名列表统一收敛到 `utils.func`；纯移动零功能变更 |
-| **吞吐提升** | 批量/计数任务改流水线执行：预取窗口=1（链接 j+1 的抓取+下载与链接 j 的重命名+上传重叠，投递顺序不变——prepare 阶段零内容发送，全部发送留在 finish 串行段）；固定 `sleep(10)` 改为 AIMD 自适应间隔（`RateLimiter`：下限 `BATCH_MIN_INTERVAL` 默认 2s，FloodWait 3 倍退避封顶 `BATCH_INTERVAL` 默认 10s，安静时逐步回落；`BATCH_MIN_INTERVAL=10` 恢复旧行为）；进度消息由百分比步进改为时间节流（≥`PROGRESS_MIN_INTERVAL` 默认 3s 编辑一次，100% 必发），减少 edit RPC；`process_msg` 拆分 prepare/finish 两阶段支撑流水线，临时文件全程 time_ns 唯一命名，取消/外部中断时预取产物（文件+进度消息）保证排空清理 |
-| **稳定性修复** | 修复视频上传 width/height 实参历史互换（非方形视频曾以转置尺寸渲染）；修复非会员批量/合并条数上限检查的 `FREMIUM_LIMIT` 拼写错误（原触发 NameError 致流程中断）；premium/stats 全部会员到期日格式化路径补测试覆盖（`%Y` 曾被全局改名误伤）；批量任务结束与限流退避新增分析日志（wall/成功数/终期间隔，便于吞吐观测） |
-
-> ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
-
-### 支付/会员入口调整
-
-本 Fork 将所有支付与会员开通入口（`/start`、`/pay`、`/plan`、`/myplan` 非会员分支）统一改为提示：
-
-> 私密消息转发BOT（限私域使用），如需使用请联系管理员付费。
-
-`/terms`（条款）页面的联系按钮和付费文案通过环境变量 `PAY_NOTICE`、`ADMIN_CONTACT` 配置（见 `config.py`），部署时在 `.env` 中填写自己的联系方式。
-
----
-
-## ⚡ 可用命令
-
-本 Fork 中**实际可用**的命令（全部已验证注册到 Pyrogram 客户端）：
-
-### 🔑 账号与登录
-| 命令 | 说明 |
-|---|---|
-| `/login` | 登录以访问受限内容 |
-| `/logout` | 退出登录 |
-| `/setbot` | 添加自定义处理机器人（用户自己的 Bot Token） |
-| `/rembot` | 移除自定义机器人 |
-
-### 📥 内容提取
-| 命令 | 说明 |
-|---|---|
-| `/batch` | 批量提取帖子（登录后使用）：发**一个起始链接** → 按数量连续下载；或发**多条链接（每行一条）** → 逐条下载（相册同样整组转发） |
-| `/single` | 单条提取（相册消息一比一转发，保留分组、原缩略图与说明文字） |
-| `/merge` | 多条链接合并为一条消息/相册发送；支持自定义文字替换原文；超 10 项自动拆分并附 `(1/N)` 标记 |
-| `/tasks` | 查看任务队列状态和进度（含 `/dl`/`/adl`）；列表每 5 秒自动刷新，实时显示下载百分比/烧录/上传阶段，全部任务结束后定格终态 |
-| `/cancel` | 取消进行中的登录/批量/设置流程 |
-| `/stop` | 取消排队中的任务（进行中的下载在当前步骤收尾） |
-
-### ⚙️ 个性化设置
-| 命令 | 说明 |
-|---|---|
-| `/settings` | 设置重命名标签 / 标题 / 缩略图 / 会话 / 删除词语 / 替换词语等 |
-
-### 💎 会员
-| 命令 | 说明 |
-|---|---|
-| `/status` | 查看登录与会员状态 |
-| `/myplan` | 查看您的会员套餐 |
-| `/plan` | 查看会员方案（本 Fork 显示联系提示） |
-| `/pay` | 开通 / 续费会员（本 Fork 显示联系提示） |
-| `/transfer` | 将会员转赠他人（仅高级会员） |
-
-### 🎬 媒体下载
-| 命令 | 说明 |
-|---|---|
-| `/dl [-sub] <链接>` | 下载视频（支持 YouTube、Instagram、Xvideos 等 yt-dlp 支持的站点，以及 missav.ai / getav.net 视频页 —— 两者走内置 HLS 提取管线，见下）。getav 加 `-sub` 把中文字幕烧录进画面（约 40 分钟重编码）。所有站点的成品统一按投递规则发布：用户设置频道 → LOG_GROUP → 当前聊天，频道目标用 `/setbot` 机器人发送；通用站点的 caption 由网页元数据生成（标题 + 上传者/分辨率/时长/大小 + tags/类别 hashtag，各取前 10）。任务进入统一队列排队执行，`/tasks` 看实时进度 |
-| `/adl <链接>` | 提取音频。任务进入统一队列排队执行，`/tasks` 看实时进度 |
-
-<details>
-<summary><b>missav.ai 下载说明（issue #13）</b></summary>
-
-- 支持 `missav.ai / missav.ws / missav.live / missav123.com` 的视频页链接（含 `cn/en` 等语言前缀与 `dm\d+` 路由前缀），自动镜像轮询过 Cloudflare
-- 流程：页面提取（Dean Edwards packed JS 解包）→ m3u8 → 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4（+faststart 流媒体优化）→ 以**一条相册消息**投递（封面 + 可直接播放的视频）
-- 投递：与提取流程一致（`/settings` 投递频道 → `LOG_GROUP` → 私聊回退），频道优先用 `/setbot` 机器人发送；封面用页面 og:image；下载/上传进度只发私聊
-- caption 五段式：番号 / 简介 / 演员# / 标签# / 类别#（中文字幕、无码等从 URL 徽章推导，缺失块自动省略）
-- 转发自动排版：`/single` `/batch` `/merge` 的原文字若含结构化元素（番号、`演员：` `标签：` `类别：` 等标签行、≥2 个 #hashtag），自动重排为固定五行骨架便于手动补全；纯文本与自定义说明（命令后缀 `oc`）不受影响。骨架形式（缺项留空占位、位置恒定）：
-
-  ```
-  GVH-690
-
-  【无码破解】巨乳女教师的课后辅导 中文字幕
-
-  演员：#夕美しおん
-  标签：#巨乳 #女教师
-  类别：
-  ```
-
-- >2GB 视频：ffmpeg **关键帧分段**（`-c copy` 无损 + 每段独立时间轴 + moov 前置），每段都是可直接播放、可拖进度的 Telegram 流媒体视频，整组仍在同一条相册内（1.8GB/段目标，最多 9 段）
-- 内置资源防护：单任务 20k 段 / 20GB / 8 小时上限，私网与云元数据地址拒绝访问，跨用户最多同时 2 个 missav 任务
-- 依赖：`curl-cffi`（Chrome TLS 指纹）、`m3u8`；`MISSAV_MIRRORS` / `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS` 可调
-
-</details>
-
-<details>
-<summary><b>getav.net 下载说明</b></summary>
-
-- 支持 `getav.net` 视频页链接（`[/<语言>/]videos/<番号>`，如 `/zh/videos/cjod-159`；语言前缀可省略），镜像域名可用 `GETAV_MIRRORS` 覆盖
-- 流程与 missav 相同的 HLS 管线：站点 JSON API（`/api/movies/<番号>`）取播放源 → **多版本视频弹出选项卡片，用户点选版本**（单版本直接下载）→ 分段并发下载（AES-128 自动解密）→ ffmpeg 封装 MP4（+faststart）→ 以**一条相册消息**投递（封面 + 可直接播放的视频）
-- **版本选择卡片**：影片存在多个播放源（中文字幕版/无码版/原版 × 各分辨率）时，`/dl` 先探测版本列表并发一张内联按钮卡片（⭐ 标记自动推荐的默认版本，10 分钟内有效，`/stop` 可取消）；用户点选后任务携带指定源入队下载。未点选过期或探测失败则维持旧行为；不弹卡片的场景（单版本、missav、yt-dlp 站点）流程完全不变
-- **中文字幕烧录为可选**（`/dl -sub <getav链接>`，标志可在链接前后）：默认 `/dl` 走秒级无损封装、不含字幕；`-sub` 时把站方精校中文字幕以字幕组风格渲染进画面（白色粗体 + 黑描边 + 柔和阴影，底部居中；**字号按视频分辨率等比缩放**——字形恒为画面高度的约 4.5%，360p/720p/1080p 实测 10/20/31px，双行块约占屏 7%，行间距随分辨率同步缩放），经 `subtitles` 滤镜 + Noto Sans CJK SC 字体完整 libx264 重编码（veryfast/CRF19，实测 3 vCPU 约 4× 实时速度，2 小时正片约 40 分钟，峰值内存 ~0.5GB，编码线程自动留 1 核给 bot）；`cn` 版本自带烧录字幕不再二次烧录，字幕下载/烧录失败自动回退无字幕封装，不影响视频交付
-- 投递路由、caption 五段式、>2GB 关键帧分段、资源防护（20k 段 / 20GB / 8 小时 / 私网地址拒绝 / 任务并发上限）全部与 missav 一致；分段并发与任务上限复用 `MISSAV_SEGMENT_CONCURRENCY` / `MISSAV_MAX_JOBS`
-- 封面取影片的 `localImg`（static.worldstatic.com 封面图），中文字幕/无码徽章依据所选播放源与字幕轨自动推导
-- **中文简介/演员名**：getav 的影片 JSON API 语言写死为日文（Accept-Language/cookie 均无法协商），中文数据只存在于 `/zh` 页面——下载前自动补抓 `/zh` 页的 `<title>` 与 meta description，caption 的标题/主演以中文优先（如「肛门和蜜穴双穴中出OK！贪求快感的淫乱女仆 妃月琉衣」+ 主演「妃月琉衣」，日文原名保留为第二行）、标签本就来自 API 的中文分类；页面抓取失败自动回退 API 原字段，不影响下载。missav 的 `og:title` 本身即中文（`/cn` 简体、无前缀繁体），无需处理
-- **CDN 网络韧性**（实测 2026-08-16 worldstatic 抖动两类故障）：分段下载对 **502/503/504 网关故障用最深重试预算**（8 次指数退避封顶 60s，熬过 1-2 分钟的边缘节点抖动；429 限流 6 次、404/网络错误 3 次快速失败）；**播放列表/AES 密钥/影片 JSON 等任务启动请求**带 4 次退避重试（3s/8s/15s，仅重试传输失败与 5xx，403/404 立即返回），慢速抖动（curl 28 式停滞）不再直接杀死任务
-- **IPv6 出口**：`docker-compose.yml` 的 egress 网络启用 `enable_ipv6`（ULA 子网 + Docker 29 自动 NAT66）——当 VPS 的 IPv4 路径被运营商逐连接限速（实测 ~130KB/s/连接，8 并发仅 1.2MB/s）而 IPv6 正常（10-40MB/s）时，容器自动走 IPv6 拉流，实测提速约 230 倍；仅影响本 compose 项目，无需改 docker 全局配置
-
-</details>
-
-
-### ℹ️ 其他
-| 命令 | 说明 |
-|---|---|
-| `/start` | 启动机器人（本 Fork 显示联系提示） |
-| `/help` | 查看帮助（分页） |
-| `/terms` | 条款和条件 |
-| `/add <ID> <时长> <单位>` | 添加会员（仅管理员） |
-| `/rem <ID>` | 移除会员（仅管理员） |
-| `/set` | 设置机器人命令菜单（仅管理员） |
-
----
-
-## 🔑 必需的环境变量
-
-| 变量 | 说明 | 获取方式 |
-|---|---|---|
-| `API_ID` | Telegram API ID | [my.telegram.org](https://my.telegram.org/apps) |
-| `API_HASH` | Telegram API Hash | 同上 |
-| `BOT_TOKEN` | 机器人 Token | [@BotFather](https://t.me/botfather) |
-| `OWNER_ID` | 管理员用户 ID（可多个，空格分隔） | [@userinfobot](https://t.me/userinfobot) |
-| `MONGO_DB` | MongoDB 连接 URI | 自建 MongoDB，格式见部署指南 |
-| `DB_NAME` | 数据库名，默认 `telegram_downloader` | — |
-| `MASTER_KEY` | 会话加密密钥（32 字节十六进制） | 自行生成随机值，**勿用源码默认值** |
-| `IV_KEY` | 解密密钥（16 字节十六进制） | 自行生成随机值，**勿用源码默认值** |
-
-### 可选变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `STRING` | 空 | 高级账号 Pyrogram V2 会话字符串，启用后支持 4GB 上传 |
-| `LOG_GROUP` | `-1001234456` | **默认投递频道**：提取的文件发到该频道，由 `/setbot` 的自定义 bot 发送（须将其加入频道并授予发帖权限）；未配置 `/setbot` 时回退私聊投递 |
-| `FORCE_SUB` | `-10012345567` | 强制订阅频道 ID；填 `0` 不启用 |
-| `FREEMIUM_LIMIT` | `0` | 免费用户提取上限，`0` 表示不允许 |
-| `PREMIUM_LIMIT` | `500` | 高级用户批量上限 |
-| `YT_COOKIES` | 空 | YouTube 下载用 Netscape cookie |
-| `INSTA_COOKIES` | 空 | Instagram 下载用 cookie |
-| `JOIN_LINK` | `t.me/team_spy_pro` | 加入链接 |
-| `ADMIN_CONTACT` | — | 管理员联系方式 |
-| `MISSAV_MAX_JOBS` | `2` | 同时进行的 missav 任务数上限（跨用户） |
-| `GETAV_MIRRORS` | `getav.net` | getav 镜像域名，逗号分隔；分段并发/任务上限复用 missav 配置 |
-| `BATCH_MIN_INTERVAL` | `2` | 批量/计数任务自适应间隔下限/起始值（秒）；设为 `10` 恢复旧固定间隔行为 |
-| `BATCH_INTERVAL` | `10` | 批量/计数任务自适应间隔上限（秒），FloodWait 退避封顶值 |
-| `PROGRESS_MIN_INTERVAL` | `3` | 下载/上传进度消息编辑节流（秒），100% 时必发 |
-| `MERGE_INTERVAL` | `5` | 合并提取每条链接间隔（秒） |
-| `CHANNEL_INTERVAL` | `5` | 频道遍历间隔（秒） |
-| `UPLOAD_INTERVAL` | `2` | 媒体上传间隔（秒） |
-| `MAX_FLOOD_RETRIES` | `3` | FloodWait 最大重试次数 |
-| `MISSAV_MIRRORS` | 内置列表 | missav 镜像域名，逗号分隔；留空用 `missav.ai/.ws/.live` + `missav123.com` |
-| `MISSAV_SEGMENT_CONCURRENCY` | `8` | missav 分段下载并发数（1–32） |
-| `MISSAV_MAX_JOBS` | `2` | 同时进行的 missav 任务数上限（跨用户） |
-| `BURN_CONCURRENCY` | `1` | 字幕烧录（libx264 重编码，峰值约 0.5GB）同时进行的任务数上限，独立于 MISSAV_MAX_JOBS |
-| `FFMPEG_BURN_THREADS` | `0` | 烧录编码线程数；`0` 为自动（按 CPU 数取 2–8） |
-| `BURN_TIMEOUT_S` | `10800` | 单次烧录墙钟超时（秒）；超时终止 ffmpeg 并回退无字幕封装，`0` 不限时 |
-| `DISK_FREE_MIN_GB` | `10` | 任务准入磁盘水位（GB）：运行卷剩余低于该值时拒绝新任务（进行中的任务不受影响） |
-
-> ⚠️ **安全**：`config.py` 中 `MASTER_KEY`/`IV_KEY` 的默认值仅用于演示。生产部署务必通过环境变量覆盖为随机值，否则任何人都能解密你的用户会话。
-
----
-
-## 🚀 快速部署
-
-详见 [**部署指南**](DEPLOYMENT.md)。最简流程（Docker Compose）：
-
-```bash
-git clone https://github.com/paceyw/Save-Restricted-Bot-Chinese.git
-cd Save-Restricted-Bot-Chinese
-cp .env.example .env
-# 编辑 .env 填入真实凭证
-docker compose up -d --build
-```
+- **常驻**：bot 客户端（pyrofork，唯一接收更新）、aiohttp 健康服务、60s 缓存治理 sweeper、pymongo 连接池
+- **按需**：自定义 bot/登录会话客户端（闲置 30 分钟驱逐）、yt-dlp/ffmpeg/ffprobe 子进程
+- **下载队列**：每用户独立 worker 串行；missav/getav 任务受跨用户 `MISSAV_MAX_JOBS` 信号量约束，烧录阶段释放该槽并改由 `BURN_CONCURRENCY` 约束；worker 出队非字幕任务优先
+- **测试**：`tests/` 553 项 pytest 全离线（`_http_get` monkeypatch + 手造 HTML/m3u8/VTT fixture，含真 ffmpeg 烧录冒烟），运行 `cd src && python3 -m pytest tests/ -q`
 
 ---
 
 ## 📁 项目结构
 
 ```
-├── main.py              # 启动入口：共享客户端 + 插件加载 + 进程内健康服务（/、/healthz）
+├── main.py              # 启动入口：共享客户端 + 插件加载 + 进程内健康服务
 ├── shared_client.py     # Pyrogram（主 Bot + 可选用户账号）客户端
+├── config.py            # 全部环境变量读取；BURN_PRESET/BURN_CRF 等烧录档位
 ├── docker-compose.yml   # 一体化部署（mongo + mongo-init + bot）
 ├── docker/              # 容器入口与运行时清理脚本
-├── Dockerfile           # 机器人镜像（python:3.10-slim + ffmpeg）
-├── config.py            # 从环境变量读取配置；PAY_NOTICE 统一提示文案
-├── utils/health.py      # aiohttp 进程内健康/欢迎页服务（替代独立 Flask 进程）
 ├── plugins/
 │   ├── start.py         # /start /help /plan /terms /set 菜单
 │   ├── login.py         # 用户登录、会话保存、自定义 Bot 管理
-│   ├── batch.py         # /batch /single /merge /cancel /tasks 命令层
+│   ├── batch.py         # /batch /single /merge /cancel /tasks 命令层 + 番号文本路由
 │   ├── fetch.py         # 用户 client 缓存、消息获取、peer/linked-chat 缓存
-│   ├── ytdl.py          # /dl /adl 命令层（yt-dlp + missav/getav HLS 管线入口）
+│   ├── ytdl.py          # /dl /adl /search + 番号/版本卡片 + HLS 管线入口与队列编排
+│   ├── tasks.py         # 任务队列（非字幕优先）+ 后台 sweeper
 │   ├── deliver.py       # 媒体下载、相册/合并投递、FloodWait 重试
-│   ├── settings.py      # 用户个性化设置（重命名/标题/缩略图/会话）
-│   ├── premium.py       # /add 会员管理、/start 处理
-│   ├── pay.py           # 付费入口（统一提示文案）
-│   └── stats.py         # /status /myplan /transfer /rem
+│   ├── settings.py premium.py pay.py stats.py
 ├── utils/
-│   ├── func.py          # MongoDB 集合、文件处理、视频元数据
-│   ├── encrypt.py       # 会话加密（AES-GCM）
-│   ├── missav.py        # missav.ai / getav.net HLS 下载管线（镜像轮询/packed JS/JSON API/AES-128/remux，issue #13）
-│   └── custom_filters.py# 登录流程过滤器
-├── tests/               # pytest 回归测试（登录流程 / 设置路由 / 自定义 bot 流程 / 磁盘清理 / 加密 / 内存有界 / DB 快照与索引 / peer 缓存 / missav 与 getav 下载及路由）
+│   ├── missav.py        # missav/getav HLS 管线：镜像轮换/版本探测/字幕轨/烧录
+│   ├── javbus.py        # JavBus 元数据补全（尽力而为，LRU 缓存，失败静默）
+│   ├── func.py encrypt.py health.py caption.py custom_filters.py logging_setup.py ratelimit.py
+├── tests/               # 553 项 pytest 离线回归
 └── templates/welcome.html
 ```
 
-### 架构说明
+---
 
-机器人运行时统一使用 Pyrogram：
-- **Pyrogram**（`app`）：主 Bot 客户端，**唯一注册命令处理器并接收 Bot 消息**。
-- **Pyrogram**（`userbot`）：配置 `STRING` 时启动的用户账号客户端，用于访问和转发受限内容。
+## 🔧 Fork 相对原版的核心修复（历史）
 
-`shared_client.py` 负责按顺序启动主 Bot 与可选用户账号；所有命令处理器都注册在 `app` 上，避免多个客户端争用主 Bot 的更新流。
+<details>
+<summary><b>架构性缺陷与命令修复</b></summary>
+
+| 修复项 | 原版问题 | 本 Fork 处理 |
+|---|---|---|
+| **命令失效（核心）** | 9 个处理器注册在被关闭 loop 的 Telethon 上，全部无反应 | 全部迁移到 Pyrogram 客户端 |
+| **`/myplan` 幽灵命令** | help 宣传但无实现 | 新增实现 |
+| **`pay.py` 崩溃** | 未导入 `OWNER_ID`、缺 chat_id | 重写为统一提示文案 |
+| **菜单与实际不符** | 注册瘫痪命令、help 列不存在命令 | 菜单与 help 对齐真实命令 |
+| **`ytdl` cookie/大文件阈值错误** | cookie 传字面量；2MiB 误写为 2GB | 已修正 |
+| **`/single` 相册与 MEDIA_EMPTY 系列** | 相册只下一项、file_id 跨客户端失效、>2GB 丢视频 | 服务端整组复制优先 + 抓取客户端正确选型 + 下载重传回退（详见 git 历史） |
+| **`/setbot` 令牌识别** | 保存/读取清洗不一致 | 统一校验 |
+| **pyrofork 相册双发** | 2.3.69 `send_media_group` 漏 `topics` 参数 | 导入期 monkeypatch 兜底 |
+| **进度消息刷频道 / `/login` 验证码失效 / 无 .gitignore** | 各自独立缺陷 | 进度只发私聊；混淆验证码提取；新增 .gitignore |
+
+</details>
+
+<details>
+<summary><b>2026-08 重构（安全/磁盘/内存/DB/结构/吞吐）</b></summary>
+
+| 维度 | 改动 |
+|---|---|
+| **加密加固** | 会话/token AES-GCM（随机 salt），旧格式自动迁移 |
+| **磁盘自愈** | 任务产物即用即删 + 多级孤儿清扫 + 上传心跳防误删 |
+| **依赖瘦身** | 移除死代码 Telethon 栈与 OpenCV；全依赖锁版本 |
+| **内存有界化** | sweeper 统一治理：任务历史/LRU/进度 TTL/闲置客户端驱逐（空闲基线 109→86MiB，cgroup 回收事件 93 万→0） |
+| **DB 优化** | 每任务一次设置快照替代逐消息查询；唯一索引与 TTL 索引启动期创建 |
+| **消息获取** | per-user peer 缓存（24h TTL，上限 500）跳过全量遍历 |
+| **代码拆分** | 2130 行上帝文件拆为 fetch/tasks/deliver + 命令层 batch.py，零功能变更 |
+| **吞吐** | 流水线预取 + AIMD 自适应间隔 + 进度时间节流 |
+| **稳定性** | 视频宽高实参互换、FREMIUM_LIMIT 拼写、到期日格式化等修复 |
+
+</details>
+
+<details>
+<summary><b>2026-09 下载管线 Wave（本轮）</b></summary>
+
+| Issue | 内容 |
+|---|---|
+| #17 | missav 姊妹版本探测（slug 变体数学 + 存在性探测）与 `mav:` 版本卡片（含「全部下载」） |
+| #18 | missav HLS 字幕轨捕获 + 分段 VTT 合并烧录 + getav 官方字幕按番号强匹配兜底 |
+| #19 | 烧录 superfast 化（同画质提速 1.5–1.8×）、ffconcat 直读分片消灭 merged.ts（省 4–8GB IO/job）、ffmpeg nice/ionice 降权 |
+| #20 | 队列慢车道：烧录挪出 job 槽 + worker 非-sub 优先 |
+| #16 | `/search` 番号搜索 + 封面交互卡片 + 纯番号文本路由 |
+| #21 | JavBus 元数据补全（主标签 ≤6）+ 演员 CN/JP 双名 |
+| #22 | 依赖核对升级（yt-dlp 2026.8.19 / curl-cffi 0.16.3 / cryptography 50.0.1）+ 部署文档 env 全表 |
+| #14 | CodeQL：URL 路由 hostname 匹配，script 正则大小写不敏感 |
+
+对抗审查修复（reviewer + security-reviewer 双向）：字幕/getav/javbus 三条抓取路径的**重定向最终 host 复验**、getav 兜底番号边界匹配防误配、加密分段预算 check/reserve 原子化、封装前磁盘二次复查、封面 URL 域白名单（SSRF 加固）、hashtag markdown 字符清洗。
+
+</details>
+
+> ⚠️ 安全提示：老版本部署过的 session 文件与 bot token 应视为已暴露，建议在 Telegram 内终止旧会话并重置 bot token；`IV_KEY` 现仅用于解密旧格式数据，仍需保留原值直至全部旧数据迁移完成。
+
+---
+
+## 📋 环境变量
+
+完整表见 [DEPLOYMENT.md](DEPLOYMENT.md)（36 项：必填/可选/默认值/用途）。高频项速查：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MISSAV_MIRRORS` | 内置列表 | missav 镜像域名，逗号分隔 |
+| `GETAV_MIRRORS` | `getav.net` | getav 镜像域名 |
+| `MISSAV_SEGMENT_CONCURRENCY` | `8` | 分段下载并发（1–32） |
+| `MISSAV_MAX_JOBS` | `2` | 跨用户同时下载任务上限（烧录阶段不占槽） |
+| `BURN_CONCURRENCY` | `1` | 烧录并发上限 |
+| `BURN_PRESET` | `superfast` | 烧录 x264 preset（同 CRF 下 veryfast 更慢、ultrafast 有 banding 风险） |
+| `BURN_CRF` | `19` | 烧录恒定质量因子 |
+| `FFMPEG_BURN_THREADS` | `0`（自动 2–8） | 烧录线程数 |
+| `BURN_TIMEOUT_S` | `10800` | 单次烧录超时（超时回退无字幕封装） |
+| `DISK_FREE_MIN_GB` | `10` | 任务准入与封装前磁盘水位（GB） |
+| `PAY_NOTICE` / `ADMIN_CONTACT` | — | 支付提示与联系方式 |
+
+> ⚠️ `MASTER_KEY`/`IV_KEY` 源码默认值仅演示，生产务必用随机值覆盖。
+
+---
+
+## 🛠️ 开发约定
+
+- **测试**：全部离线。网络层以 `_http_get` 为唯一 seam monkeypatch，页面/m3u8/VTT/搜索结果均为手造 fixture；`cd src && python3 -m pytest tests/ -q`
+- **分支流**：`main` 为集成分支；功能分支 `feat/*`、修复分支 `fix/*`（issue 编号后缀）；多任务并行开发使用 `git worktree`
+- **安全基线**：新网络面必须 pin 注册域并复验重定向最终 host；页面可控内容（标题/演员/标签）进入 caption 前必须清洗；新增回调必须绑定 uid + TTL + sweeper
 
 ---
 
 ## ⚖️ 免责声明
 
-- 本机器人仅用于转发 **您自己有权访问** 的 Telegram 内容。
+- 本机器人仅用于转发/下载 **您自己有权访问** 的内容。
 - 不对用户行为负责，不推广受版权保护的内容。
 - 使用非官方客户端登录的账号可能受到 Telegram 的额外审查，请只使用合法授权的账号。
 - 遵守 [Telegram API Terms of Service](https://core.telegram.org/api/terms)。
@@ -376,10 +313,4 @@ docker compose up -d --build
 ## 🙏 致谢
 
 - 原作者：[devgagan / Team SPY](https://github.com/devgaganin)
-- 本 Fork 仅做 Bug 修复与中文本地化，核心功能源自原项目。
-
-<div align="center">
-
-本 Fork 由 [paceyw](https://github.com/paceyw) 维护 · 基于 devgaganin 的原项目
-
-</div>
+- 本 Fork 由 [paceyw](https://github.com/paceyw) 维护：Bug 修复、中文本地化与下载管线建设
