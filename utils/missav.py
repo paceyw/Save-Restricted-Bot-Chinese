@@ -461,6 +461,9 @@ def extract_video_details(page_html, url):
                "badges": [], "studio": "", "release_date": ""}
 
     code = _panel_plain(_panel_section(page_html, "code"))
+    # 变体页的面板 code 带版本尾巴（如 ROYD-159-UNCENSORED-LEAK）：剥到纯番号
+    code = re.sub(r"(?:-(?:uncensored-leak|chinese-subtitle|ch-sub|uncensored|leaked|leak))+$",
+                  "", code, flags=re.IGNORECASE)
     details["code"] = code.upper() if code else ""
 
     og_title = _meta_content(page_html, r'property=["\']og:title') or ""

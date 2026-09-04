@@ -68,6 +68,12 @@ from utils.missav import (
     missav_slug_family,
     parse_missav_url,
 )
+from utils.avsea import (
+    AVSEA_HOST,
+    discover_avsea_variants,
+    download_avsea,
+    is_avsea_url,
+)
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import aiofiles
@@ -408,6 +414,20 @@ async def dl_handler(client, message):
     # a selection card instead of silently downloading whatever variant was
     # pasted (single-version pages keep the direct-enqueue path; a blocked
     # probe degrades to the pasted page alone inside discover_missav_variants).
+    if is_avsea_url(url):
+        variants = await discover_avsea_variants(url)
+        if len(variants) > 1:
+            await _send_missav_card(message, user_id, url, want_subtitle, variants)
+            return
+        task = create_task(user_id, 'dl', 1, url=url, want_subtitle=want_subtitle, message=message)
+        if await enqueue_task(user_id, task):
+            qpos = get_queue_size(user_id)
+            await message.reply_text(
+                '📦 下载任务已加入队列。\n'
+                f'位置：{"执行中" if qpos <= 1 else f"队列第 {qpos - 1} 位"}\n'
+                '使用 /tasks 查看进度。')
+        return
+
     missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
     if is_missav_url(url, missav_hosts):
         try:
@@ -1094,6 +1114,15 @@ async def search_action_callback(client, query):
     if not picked:
         return
     await _edit_search_card(prompt, f"✅ 已选择：{picked['title'][:80]}")
+    if picked.get("source") == "avsea":
+        variants = await discover_avsea_variants(picked["href"])
+        if len(variants) > 1:
+            await _send_missav_card(prompt["message"], uid, picked["href"],
+                                    False, variants)
+            return
+        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                                want_subtitle=False)
+        return
     if picked.get("source") == "getav":
         # getav 结果：走 getav 管线（多播放源时出 getav 版本卡片）
         getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
@@ -1195,6 +1224,8 @@ async def run_dl(message, url, want_subtitle=False, task_id=None, source_url=Non
     if is_getav_url(url, getav_hosts):
         await process_getav(message, url, getav_hosts, want_subtitle,
                             task_id=task_id, source_url=source_url)
+    elif is_avsea_url(url):
+        await process_avsea(message, url, task_id=task_id)
     elif is_missav_url(url, missav_hosts):
         await process_missav(message, url, missav_hosts, task_id=task_id,
                              want_subtitle=want_subtitle)
@@ -1390,6 +1421,12 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
         for temp_path in (thumbnail_file, screenshot_file):
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+
+
+async def process_avsea(message, url, task_id=None):
+    """avsea.site 结果：线路提取后走通用 HLS 核心（复用 missav 队列语义）。"""
+    await _process_hls_site(message, url, (AVSEA_HOST,), download_avsea, "avsea",
+                            task_id=task_id)
 
 
 async def process_missav(message, url, hosts, task_id=None, want_subtitle=False):
