@@ -104,7 +104,7 @@ Telegram 私域消息转发机器人 · 修复原版 v3 命令失效问题
 ### 🎬 媒体下载
 | 命令 | 说明 |
 |---|---|
-| `/dl [-sub] <链接>` | 下载视频（支持 YouTube、Instagram 等 yt-dlp 支持的站点，以及 missav.ai / getav.net 视频页 —— 两者走内置 HLS 提取管线，见下）。getav 加 `-sub` 把中文字幕烧录进画面（约 40 分钟重编码）。任务进入统一队列排队执行，`/tasks` 看实时进度 |
+| `/dl [-sub] <链接>` | 下载视频（支持 YouTube、Instagram、Xvideos 等 yt-dlp 支持的站点，以及 missav.ai / getav.net 视频页 —— 两者走内置 HLS 提取管线，见下）。getav 加 `-sub` 把中文字幕烧录进画面（约 40 分钟重编码）。所有站点的成品统一按投递规则发布：用户设置频道 → LOG_GROUP → 当前聊天，频道目标用 `/setbot` 机器人发送；通用站点的 caption 由网页元数据生成（标题 + 上传者/分辨率/时长/大小 + tags/类别 hashtag，各取前 10）。任务进入统一队列排队执行，`/tasks` 看实时进度 |
 | `/adl <链接>` | 提取音频。任务进入统一队列排队执行，`/tasks` 看实时进度 |
 
 <details>
