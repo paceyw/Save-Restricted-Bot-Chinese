@@ -14,6 +14,8 @@ Routes:
              fails the probe naturally — no extra liveness logic needed.
 """
 
+import asyncio
+import io
 import os
 from pathlib import Path
 
@@ -30,10 +32,20 @@ async def healthz_handler(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def debug_tasks_handler(_request: web.Request) -> web.Response:
+    """Dump every asyncio task with its stack. Diagnostic aid only."""
+    buf = io.StringIO()
+    for t in sorted(asyncio.all_tasks(), key=lambda x: x.get_name()):
+        buf.write(f"=== {t.get_name()} done={t.done()}\n")
+        t.print_stack(file=buf)
+    return web.Response(text=buf.getvalue() or "no tasks", content_type="text/plain")
+
+
 def build_app() -> web.Application:
     http_app = web.Application()
     http_app.router.add_get("/", welcome_handler)
     http_app.router.add_get("/healthz", healthz_handler)
+    http_app.router.add_get("/debug/tasks", debug_tasks_handler)
     return http_app
 
 
