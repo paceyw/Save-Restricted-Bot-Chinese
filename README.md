@@ -207,8 +207,8 @@ https://t.me/xxx/2
 | 按钮 | 行为 |
 |------|------|
 | 🌐 预览网页 | 浏览器直接打开原页面 |
-| 🔥 外挂字幕 | 开/关切换（= `/dl -sub` 语义：missav HLS 字幕轨 / getav 官方 VTT 烧录；avsea 无字幕源不生效），状态在本轮搜索内保留 |
-| ⬇️ 下载 | 探测版本 → 多版本出版本卡片 / 单版本直接入队（携带字幕开关状态） |
+| 🔥 外挂字幕 | 手动开/关（= `/dl -sub` 语义：missav HLS 字幕轨 / getav 官方 VTT 烧录；avsea 无字幕源不生效），状态在本轮搜索内保留 |
+| ⬇️ 下载 | 检测到外挂字幕（getav 官方中字 / missav HLS 字幕轨）且未手动表态时，先询问「烧录 / 不烧录 / 返回」；随后探测版本 → 版本卡片或直接入队（携带字幕状态） |
 | ↩️ 返回搜索结果 | 恢复结果卡片重选（分页状态保留） |
 
 - 卡片 10 分钟有效，`/stop` 取消
@@ -396,7 +396,7 @@ flowchart LR
 │   ├── avdict_seed.py   # 词库种子：117 条标签别名表（运行时以库为准）
 │   ├── javbus.py        # JavBus/JavLibrary 元数据补全（尽力而为，LRU）
 │   ├── func.py encrypt.py health.py caption.py custom_filters.py logging_setup.py ratelimit.py
-├── tests/               # 628 项 pytest 离线回归
+├── tests/               # 639 项 pytest 离线回归
 └── templates/welcome.html
 ```
 

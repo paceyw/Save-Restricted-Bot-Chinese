@@ -45,7 +45,7 @@ from pyrogram.types import (
 from utils.func import get_video_metadata, screenshot, touch_file, task_downloads_dir
 from utils.javbus import enrich_details
 from utils.missav import (
-    _hashtag,
+_hashtag,
     _registered_domain,
     _CHROME_UA,
     _http_get,
@@ -67,6 +67,8 @@ from utils.missav import (
     missav_base_slug,
     missav_slug_family,
     parse_missav_url,
+    getav_has_zh_subtitle,
+    probe_missav_subtitle,
 )
 from utils.avsea import (
     AVSEA_HOST,
@@ -1083,6 +1085,78 @@ async def _edit_search_card(prompt, text, markup=None):
         pass  # 卡片编辑是尽力而为：失败不影响入队
 
 
+async def _search_dl_route(prompt, uid, picked, want):
+    """搜索下载路由：探测版本 → 版本卡片 / 入队（携带字幕开关状态）。
+
+    终态（入队/版本卡片发出）后清除 _SEARCH_PROMPTS 现场。
+    烧录询问由 dl 分支负责（询问期间 _SEARCH_PROMPTS 保留现场）。
+    """
+    source = picked.get("source")
+    if source == "avsea":
+        _SEARCH_PROMPTS.pop(uid, None)
+        variants = await asyncio.to_thread(discover_avsea_variants, picked["href"])
+        if len(variants) > 1:
+            await _send_missav_card(prompt["message"], uid, picked["href"],
+                                    want, variants)
+            return
+        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                                want_subtitle=want)
+        return
+    if source == "getav":
+        data = prompt.get("_gav_data")
+        if data is None:
+            getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
+            try:
+                data, _host = await asyncio.to_thread(
+                    fetch_getav_movie, picked["href"], tuple(getav_hosts))
+            except MissAVError as e:
+                _SEARCH_PROMPTS.pop(uid, None)
+                await prompt["message"].reply_text(f"**__getav 视频信息获取失败：{e}__**")
+                return
+        _SEARCH_PROMPTS.pop(uid, None)
+        versions = list_getav_sources(data.get("videoSources") or [])
+        if len(versions) > 1:
+            await _send_version_card(prompt["message"], uid, picked["href"],
+                                     want, versions)
+            return
+        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                                want_subtitle=want)
+        return
+    # missav（含未知来源缺省）
+    _SEARCH_PROMPTS.pop(uid, None)
+    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
+    variants = await discover_missav_variants(picked["href"], tuple(missav_hosts))
+    if len(variants) > 1:
+        await _send_missav_card(prompt["message"], uid, picked["href"],
+                                want, variants)
+        return
+    # 唯一版本（或探测全挂时退化的当前页）：直接入队
+    await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
+                            want_subtitle=want)
+
+
+async def _ask_search_burn(prompt, picked, detected):
+    """检测到外挂字幕且用户未表态：询问是否烧录（内嵌）进视频。"""
+    prompt["_awaiting_burn"] = detected
+    label = ("getav 官方中文字幕" if detected == "getav"
+             else "HLS 外挂字幕轨")
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 烧录字幕并下载",
+                              callback_data=f"srchburn:{prompt['token']}:yes")],
+        [InlineKeyboardButton("⬇️ 不烧录，直接下载",
+                              callback_data=f"srchburn:{prompt['token']}:no")],
+        [InlineKeyboardButton("↩️ 返回搜索结果",
+                              callback_data=f"srchburn:{prompt['token']}:back")],
+    ])
+    await _edit_search_card(
+        prompt,
+        f"✅ 已选择：{picked['title'][:80]}\n"
+        f"来源：{picked.get('source', 'missav')}\n"
+        f"🎯 检测到外挂字幕（{label}），是否烧录（内嵌）到视频？\n"
+        "__（也可在预览网页确认原视频自带字幕情况）__",
+        markup)
+
+
 def _picked_action_markup(token, picked, want_subtitle=False):
     """选中结果后的操作卡片：预览（浏览器打开）/ 字幕开关 / 下载 / 返回。
 
@@ -1179,7 +1253,6 @@ async def search_action_callback(client, query):
         return
     picked = prompt.get("picked")
     want_subtitle = prompt.get("want_subtitle", False)
-    _SEARCH_PROMPTS.pop(uid, None)
     try:
         await query.answer()
     except Exception:
@@ -1191,41 +1264,70 @@ async def search_action_callback(client, query):
         f"✅ 已选择：{picked['title'][:80]}\n"
         f"来源：{picked.get('source', 'missav')}\n⏳ 正在获取版本信息…",
     )
-    if picked.get("source") == "avsea":
-        variants = await asyncio.to_thread(discover_avsea_variants, picked["href"])
-        if len(variants) > 1:
-            await _send_missav_card(prompt["message"], uid, picked["href"],
-                                    want_subtitle, variants)
-            return
-        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
-                                want_subtitle=want_subtitle)
-        return
-    if picked.get("source") == "getav":
-        # getav 结果：走 getav 管线（多播放源时出 getav 版本卡片）
+
+    # 外挂字幕检测（用户未用开关表态时）：命中则先询问是否烧录
+    detected = None
+    source = picked.get("source")
+    if source == "getav":
         getav_hosts = GETAV_MIRRORS or list(_GETAV_DEFAULT_MIRRORS)
         try:
             data, _host = await asyncio.to_thread(
                 fetch_getav_movie, picked["href"], tuple(getav_hosts))
         except MissAVError as e:
+            _SEARCH_PROMPTS.pop(uid, None)
             await prompt["message"].reply_text(f"**__getav 视频信息获取失败：{e}__**")
             return
-        versions = list_getav_sources(data.get("videoSources") or [])
-        if len(versions) > 1:
-            await _send_version_card(prompt["message"], uid, picked["href"],
-                                     want_subtitle, versions)
-            return
-        await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
-                                want_subtitle=want_subtitle)
+        prompt["_gav_data"] = data  # 询问回调恢复时免二次请求
+        if getav_has_zh_subtitle(data):
+            detected = "getav"
+    elif source != "avsea":
+        try:
+            if await probe_missav_subtitle(picked["href"]):
+                detected = "missav"
+        except Exception:
+            pass
+    if detected and not want_subtitle:
+        await _ask_search_burn(prompt, picked, detected)
         return
-    missav_hosts = MISSAV_MIRRORS or list(_MISSAV_DEFAULT_MIRRORS)
-    variants = await discover_missav_variants(picked["href"], tuple(missav_hosts))
-    if len(variants) > 1:
-        await _send_missav_card(prompt["message"], uid, picked["href"],
-                                want_subtitle, variants)
+    await _search_dl_route(prompt, uid, picked, want_subtitle)
+
+
+@app.on_callback_query(filters.regex(r"^srchburn:([0-9a-f]+):(yes|no|back)$"))
+async def search_burn_callback(client, query):
+    """烧录询问回调：yes/no 恢复下载路由；back 回搜索结果重选。"""
+    uid = query.from_user.id
+    token, choice = query.matches[0].group(1), query.matches[0].group(2)
+    prompt = _SEARCH_PROMPTS.get(uid)
+    if _search_prompt_expired(prompt, token) or not prompt.get("_awaiting_burn"):
+        try:
+            await query.answer("状态已过期，请重新搜索", show_alert=True)
+        except Exception:
+            pass
         return
-    # 唯一版本（或探测全挂时退化的当前页）：直接入队
-    await _enqueue_dl_tasks(uid, prompt["message"], [picked["href"]],
-                            want_subtitle=want_subtitle)
+    picked = prompt.get("picked")
+    detected = prompt.get("_awaiting_burn")
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if choice == "back":
+        prompt.pop("_awaiting_burn", None)
+        prompt.pop("picked", None)
+        prompt.pop("_gav_data", None)
+        await _edit_search_card(
+            prompt, prompt.get("caption", "🔍 搜索结果"),
+            _search_page_markup(token, prompt["results"], prompt.get("page", 0)))
+        return
+    want = choice == "yes"
+    prompt["want_subtitle"] = want
+    prompt.pop("_awaiting_burn", None)
+    await _edit_search_card(
+        prompt,
+        f"✅ 已选择：{picked['title'][:80]}\n"
+        f"来源：{picked.get('source', 'missav')}\n"
+        f"外挂字幕：{'🔥 烧录' if want else '不烧录'}\n⏳ 正在准备下载…",
+    )
+    await _search_dl_route(prompt, uid, picked, want)
 
 
 @app.on_callback_query(filters.regex(r"^srchpage:([0-9a-f]+):(\d+)$"))

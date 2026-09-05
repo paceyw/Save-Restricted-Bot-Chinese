@@ -1362,6 +1362,18 @@ def getav_cover_url(data):
     return ""
 
 
+def getav_has_zh_subtitle(data):
+    """getav 影片 JSON 是否带中文外挂字幕（语言码 zh*）。"""
+    if not isinstance(data, dict):
+        return False
+    subs = data.get("subtitles")
+    return isinstance(subs, list) and any(
+        isinstance(s, dict) and str(s.get("language") or "").lower().startswith("zh")
+        for s in subs
+    )
+
+
+
 def extract_getav_details(data, url, family=None):
     """Movie JSON -> caption ingredients (details dict v2 契约字段表).
 
@@ -1418,12 +1430,7 @@ def extract_getav_details(data, url, family=None):
         details["genres"] = seen
 
     badges = []
-    subtitles = data.get("subtitles")
-    has_zh_sub = isinstance(subtitles, list) and any(
-        isinstance(s, dict) and str(s.get("language") or "").lower().startswith("zh")
-        for s in subtitles
-    )
-    if family == "cn" or has_zh_sub:
+    if family == "cn" or getav_has_zh_subtitle(data):
         badges.append("中文字幕")
     if family == "uc" or data.get("uc") == 1:
         badges.append("无码")
@@ -2189,6 +2196,33 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
                 os.remove(subtitle_track_path)
             except OSError:
                 pass
+
+
+async def probe_missav_subtitle(url, hosts=DEFAULT_MIRRORS):
+    """探测 missav 页视频是否带 HLS 外挂字幕轨（下载前询问用，尽力而为）。
+
+    页面 packed-JS → m3u8 → 主清单 EXT-X-MEDIA SUBTITLES。返回
+    True=检测到字幕轨；False=无/探测失败（下载期 -sub 仍有运行时兜底）。
+    """
+    try:
+        page_html, host = await asyncio.to_thread(
+            fetch_video_page, url, tuple(hosts))
+        m3u8_url = extract_m3u8_url(page_html)
+        if not m3u8_url:
+            return False
+        m3u8_host = urlparse(m3u8_url).hostname or ""
+        pinned_domain = _registered_domain(m3u8_host)
+        if not _host_allowed(m3u8_url, pinned_domain):
+            return False
+        headers = {"Referer": f"https://{host}/"}
+        playlist, playlist_url, master_url, subtitle_uri = await _resolve_media_playlist(
+            m3u8_url, headers, pinned_domain
+        )
+        return bool(subtitle_uri)
+    except Exception:
+        logger.debug("missav subtitle probe failed %s", url, exc_info=True)
+        return False
+
 
 
 async def download_missav(url, dest_path, *, hosts=DEFAULT_MIRRORS,

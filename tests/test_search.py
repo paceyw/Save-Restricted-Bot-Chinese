@@ -647,3 +647,161 @@ def test_search_dl_carries_subtitle_flag_to_enqueue(ytdl, monkeypatch):
 
 def state_tasks_want_subtitle(state):
     return [t.get("want_subtitle") for t in state["created"]]
+
+
+# ─── 外挂字幕检测询问（用户裁决：检测到即询问是否烧录）────────────────────────
+
+_BURN_RE = _re.compile(r"^srchburn:([0-9a-f]+):(yes|no|back)$")
+
+
+def _gav_result():
+    return {"title": "G-1", "href": "https://getav.net/zh/videos/abc-1",
+            "thumb": "", "badges": "中文字幕", "source": "getav"}
+
+
+def _search_getav_dl_setup(ytdl, monkeypatch, gav_data):
+    # 注意：_queue_state 由各测试先行建立（setup 不得重置收集器）
+    monkeypatch.setattr(ytdl, "_missav_search", lambda code, hosts: ([], None))
+    monkeypatch.setattr(ytdl, "_getav_search",
+                        lambda code, hosts: ([_gav_result()], None))
+    monkeypatch.setattr(ytdl, "fetch_getav_movie",
+                        lambda url, hosts: (gav_data, "getav.net"))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ABC-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    return prompt
+
+
+def test_search_getav_dl_asks_burn_when_zh_sub_detected(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    gav_data = {"videoSources": [{"type": "raw_1080p", "url": "https://cdn/raw"}],
+                "subtitles": [{"language": "zh"}]}
+    prompt = _search_getav_dl_setup(ytdl, monkeypatch, gav_data)
+    assert "检测到外挂字幕" in prompt["card"].text
+    assert "getav 官方中文字幕" in prompt["card"].text
+    labels = [b.text for row in prompt["card"].reply_markup.buttons for b in row]
+    assert "🔥 烧录字幕并下载" in labels
+    assert "⬇️ 不烧录，直接下载" in labels
+    assert state["created"] == []            # 询问期不入队
+    assert 42 in ytdl._SEARCH_PROMPTS        # 现场保留
+    # yes → 烧录入队
+    burn = _FakeQuery(42, f"srchburn:{prompt['token']}:yes", _BURN_RE)
+    asyncio.run(ytdl.search_burn_callback(None, burn))
+    assert [t["want_subtitle"] for t in state["created"]] == [True]
+    assert 42 not in ytdl._SEARCH_PROMPTS
+
+
+def test_search_getav_dl_no_burn_enqueues_plain(ytdl, monkeypatch):
+    state = _queue_state(monkeypatch)
+    gav_data = {"videoSources": [{"type": "raw_1080p", "url": "https://cdn/raw"}],
+                "subtitles": [{"language": "zh"}]}
+    prompt = _search_getav_dl_setup(ytdl, monkeypatch, gav_data)
+    burn = _FakeQuery(42, f"srchburn:{prompt['token']}:no", _BURN_RE)
+    asyncio.run(ytdl.search_burn_callback(None, burn))
+    assert [t["want_subtitle"] for t in state["created"]] == [False]
+
+
+def test_search_getav_toggle_on_skips_ask(ytdl, monkeypatch):
+    """开关已表态（开）→ 不询问，直接烧录入队。"""
+    state = _queue_state(monkeypatch)
+    gav_data = {"videoSources": [{"type": "raw_1080p", "url": "https://cdn/raw"}],
+                "subtitles": [{"language": "zh"}]}
+    monkeypatch.setattr(ytdl, "_missav_search", lambda code, hosts: ([], None))
+    monkeypatch.setattr(ytdl, "_getav_search",
+                        lambda code, hosts: ([_gav_result()], None))
+    monkeypatch.setattr(ytdl, "fetch_getav_movie",
+                        lambda url, hosts: (gav_data, "getav.net"))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ABC-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    toggle = _FakeQuery(42, f"srchact:{prompt['token']}:sub",
+                        _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, toggle))
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    assert "检测到外挂字幕" not in prompt["card"].text
+    assert [t["want_subtitle"] for t in state["created"]] == [True]
+
+
+def test_search_getav_multi_version_burn_yes_passes_flag(ytdl, monkeypatch):
+    """询问 yes 后多播放源 → 版本卡片携带 want_subtitle=True。"""
+    state = _queue_state(monkeypatch)
+    gav_data = {"videoSources": [{"type": "raw_1080p", "url": "https://cdn/raw"},
+                                 {"type": "cn_1080p", "url": "https://cdn/cn"}],
+                "subtitles": [{"language": "zh"}]}
+    prompt = _search_getav_dl_setup(ytdl, monkeypatch, gav_data)
+    burn = _FakeQuery(42, f"srchburn:{prompt['token']}:yes", _BURN_RE)
+    asyncio.run(ytdl.search_burn_callback(None, burn))
+    assert 42 in ytdl._GETAV_PROMPTS
+    assert ytdl._GETAV_PROMPTS[42]["want_subtitle"] is True
+    assert state["created"] == []
+
+
+def test_search_missav_probe_hit_asks_burn(ytdl, monkeypatch):
+    """missav 探测到 HLS 字幕轨 → 询问；probe 失败/无轨 → 直接路由。"""
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda code, hosts: (_search_results(ytdl, n=1), None))
+
+    async def fake_probe(url, hosts=None):
+        return True
+
+    monkeypatch.setattr(ytdl, "probe_missav_subtitle", fake_probe)
+
+    async def fake_discover(url, hosts=None):
+        return [("raw", url, "原版")]
+
+    monkeypatch.setattr(ytdl, "discover_missav_variants", fake_discover)
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    assert "检测到外挂字幕" in prompt["card"].text
+    assert "HLS 外挂字幕轨" in prompt["card"].text
+    # back → 回结果卡片，现场清理
+    burn = _FakeQuery(42, f"srchburn:{prompt['token']}:back", _BURN_RE)
+    asyncio.run(ytdl.search_burn_callback(None, burn))
+    assert "_awaiting_burn" not in prompt
+    assert "picked" not in prompt
+
+
+def test_search_missav_probe_miss_routes_directly(ytdl, monkeypatch):
+    """无字幕轨：不询问直接入队（回归）。"""
+    state = _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda code, hosts: (_search_results(ytdl, n=1), None))
+
+    async def fake_probe(url, hosts=None):
+        return False
+
+    monkeypatch.setattr(ytdl, "probe_missav_subtitle", fake_probe)
+
+    async def fake_discover(url, hosts=None):
+        return [("raw", url, "原版")]
+
+    monkeypatch.setattr(ytdl, "discover_missav_variants", fake_discover)
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "SSIS-405"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    assert [t["want_subtitle"] for t in state["created"]] == [False]
