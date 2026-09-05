@@ -565,7 +565,7 @@ def test_fetch_getav_subtitle_degrades(monkeypatch, tmp_path, resp):
 def test_burn_subtitles_args(monkeypatch, tmp_path):
     calls = []
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         calls.append(args)
 
     sub = str(tmp_path / "zh.vtt")
@@ -592,7 +592,7 @@ def test_burn_subtitles_args(monkeypatch, tmp_path):
 def test_burn_subtitles_escapes_filter_path(monkeypatch, tmp_path):
     captured = {}
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         captured["vf"] = args[args.index("-vf") + 1]
 
     monkeypatch.setattr(missav.shutil, "which", lambda name: "/usr/bin/ffmpeg")

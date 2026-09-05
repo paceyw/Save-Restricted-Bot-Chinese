@@ -1441,7 +1441,7 @@ def extract_getav_details(data, url, family=None):
 
 # ─── ffmpeg remux ──────────────────────────────────────────────────────────────
 
-async def _run_ffmpeg(args, timeout_s=None):
+async def _run_ffmpeg(args, timeout_s=None, env=None):
     """Await ffmpeg; thin seam for tests. Raises MissAVError on failure.
 
     The child runs demoted (`nice -n 19`, plus `ionice -c3` when
@@ -1463,6 +1463,7 @@ async def _run_ffmpeg(args, timeout_s=None):
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         if timeout_s and timeout_s > 0:
@@ -1477,10 +1478,19 @@ async def _run_ffmpeg(args, timeout_s=None):
         proc.kill()
         await proc.wait()
         raise
+    err_text = err.decode(errors="replace")
     if proc.returncode != 0:
-        exc = MissAVError(f"ffmpeg remux 失败: {err.decode(errors='replace')[-300:]}")
+        exc = MissAVError(f"ffmpeg remux 失败: {err_text[-300:]}")
         exc.exit_code = proc.returncode
         raise exc
+    # 字体环境告警必须可见：libass 在「无缓存目录/字体缺失」时静默
+    # 渲染 0 条字幕（exit 0，ADN-538 实案——烧录 31 分钟全片无字）
+    for marker in ("No writable cache directories", "Fontconfig error",
+                   "fontselect"):
+        hits = [ln for ln in err_text.splitlines() if marker in ln]
+        if hits:
+            logger.warning("ffmpeg 字体环境告警: %s", hits[:2])
+            break
 
 
 def _is_concat_list(src):
@@ -1558,6 +1568,20 @@ def _burn_threads():
 _burn_slots = asyncio.Semaphore(BURN_CONCURRENCY)
 
 
+def _burn_env():
+    """烧录子进程 env：XDG 缓存目录不可写时切到可写临时目录。
+
+    fontconfig 拿不到可写缓存时 libass 静默渲染 0 条字幕（exit 0）。
+    返回 None 表示继承当前环境即可。
+    """
+    xdg = os.environ.get("XDG_CACHE_HOME") or ""
+    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+        return None
+    env = dict(os.environ)
+    env["XDG_CACHE_HOME"] = _tempfile.mkdtemp(prefix="fc_burn_")
+    return env
+
+
 async def burn_subtitles_to_mp4(src, dst, subtitle_path, task_id=None):
     """Re-encode TS -> MP4 with Chinese subtitles rendered INTO the frame.
 
@@ -1588,7 +1612,7 @@ async def burn_subtitles_to_mp4(src, dst, subtitle_path, task_id=None):
     )
     try:
         async with _burn_slots:
-            await _run_ffmpeg([
+            await _run_ffmpeg(env=_burn_env(), args=[
                 "ffmpeg", "-y", "-loglevel", "error",
                 *(["-f", "concat", "-safe", "0", "-fflags", "+genpts"]
                   if _is_concat_list(src) else []),

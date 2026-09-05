@@ -966,7 +966,7 @@ def test_run_ffmpeg_prefixes_nice_ionice(monkeypatch):
 def test_remux_burn_sniff_concat_list_input(monkeypatch, tmp_path):
     captured = {}
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         captured["args"] = list(args)
 
     monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
@@ -1006,7 +1006,7 @@ def test_is_concat_list_sniff(tmp_path):
 def test_burn_uses_superfast_preset_and_concat_input(monkeypatch, tmp_path):
     captured = {}
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         captured["args"] = list(args)
 
     sub = tmp_path / "zh.vtt"
@@ -1928,3 +1928,32 @@ def test_segment_bust_values_unique_when_origin_also_404(monkeypatch, tmp_path):
         [u for u in calls if "_cfbust=" in u]
     assert len(busted) == missav.SEGMENT_RETRIES_404 - 2  # 第 3 次起全部 bust
     assert len(set(busted)) == len(busted)                 # 值唯一
+
+
+# ─── 烧录字体环境自愈（ADN-538 实案：libass 无缓存静默渲染 0 条字幕）───────────
+
+def test_burn_env_none_when_xdg_writable(monkeypatch, tmp_path):
+    ok_dir = tmp_path / "fc"
+    ok_dir.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(ok_dir))
+    assert missav._burn_env() is None
+
+
+def test_burn_env_falls_back_when_xdg_unwritable(monkeypatch, tmp_path):
+    import stat as _stat
+    bad = tmp_path / "root-owned"
+    bad.mkdir()
+    bad.chmod(0o555)  # 只读目录（模拟镜像层 root:root 污染）
+    monkeypatch.setenv("XDG_CACHE_HOME", str(bad))
+    try:
+        env = missav._burn_env()
+    finally:
+        bad.chmod(0o755)
+    assert env is not None
+    assert os.path.isdir(env["XDG_CACHE_HOME"]) and os.access(env["XDG_CACHE_HOME"], os.W_OK)
+
+
+def test_burn_env_falls_back_when_xdg_missing(monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", "/nonexistent/fc-xyz")
+    env = missav._burn_env()
+    assert env is not None and os.path.isdir(env["XDG_CACHE_HOME"])

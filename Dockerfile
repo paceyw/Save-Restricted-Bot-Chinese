@@ -13,11 +13,17 @@ RUN mkdir -p /usr/share/fonts/opentype/noto \
     && fc-cache -fs \
     && fc-list | grep -i "noto sans cjk sc" \
     && chmod -R a+rX /var/cache/fontconfig
-ENV XDG_CACHE_HOME=/tmp/.fcache
+# XDG 缓存必须落在 bot 可写的持久卷上：早期版本指向 /tmp/.fcache，
+# 但 `pip3 install wheel`（当时无 --no-cache-dir）以 root 在构建期写入
+# 该目录，镜像层 root:root → 运行时 uid 1000 不可写 → fontconfig 报
+# "No writable cache directories" → libass 静默渲染 0 条字幕（-sub 烧录
+# 空 white 平面，ADN-538 实案）。/data 为挂载卷（bot 属主）且跨重启
+# 保留缓存。
+ENV XDG_CACHE_HOME=/data/.fcache
 WORKDIR /app
 COPY requirements.txt .
 
-RUN pip3 install wheel
+RUN pip3 install --no-cache-dir wheel
 RUN pip3 install --no-cache-dir -U -r requirements.txt
 COPY . .
 EXPOSE 5000

@@ -7,6 +7,8 @@ set -u
 # media still write to /data. Idempotent: refresh on every start.
 ln -sfn /app/plugins /data/plugins
 mkdir -p /data/logs
+# fontconfig/libass 可写缓存（字幕烧录依赖；幂等，权限漂移自愈）
+mkdir -p "${XDG_CACHE_HOME:-/data/.fcache}/fontconfig" 2>/dev/null || true
 
 bot_pid=""
 cleanup_pid=""

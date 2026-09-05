@@ -39,7 +39,7 @@ def ffmpeg_present(monkeypatch):
 def test_burn_semaphore_serializes_concurrent_encodes(monkeypatch, tmp_path):
     events = []
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         events.append("start")
         await asyncio.sleep(0.05)
         events.append("end")
@@ -64,7 +64,7 @@ def test_burn_semaphore_serializes_concurrent_encodes(monkeypatch, tmp_path):
 def test_burn_threads_config_override(monkeypatch, tmp_path):
     calls = []
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         calls.append(args)
 
     monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
@@ -143,7 +143,7 @@ def test_run_ffmpeg_cancellation_kills_child(monkeypatch):
 
 
 def test_burn_failure_logs_exit_code_and_raises(monkeypatch, caplog):
-    async def failing_run(args, timeout_s=None):
+    async def failing_run(args, timeout_s=None, env=None):
         exc = missav.MissAVError("ffmpeg remux 失败: boom")
         exc.exit_code = 3
         raise exc
@@ -169,7 +169,7 @@ def test_burn_failure_logs_exit_code_and_raises(monkeypatch, caplog):
 def test_burn_success_logs_sizes_and_duration(monkeypatch, caplog):
     sizes = {"a.ts": 100, "a.mp4": 80}
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         pass
 
     monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
@@ -190,7 +190,7 @@ def test_burn_success_logs_sizes_and_duration(monkeypatch, caplog):
 def test_burn_passes_timeout_to_ffmpeg_runner(monkeypatch):
     timeouts = []
 
-    async def fake_run(args, timeout_s=None):
+    async def fake_run(args, timeout_s=None, env=None):
         timeouts.append(timeout_s)
 
     monkeypatch.setattr(missav, "_run_ffmpeg", fake_run)
