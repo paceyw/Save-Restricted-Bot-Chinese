@@ -584,8 +584,8 @@ def test_burn_subtitles_args(monkeypatch, tmp_path):
     assert "+faststart" in args and str(missav.BURN_CRF) in args
     style = vf.split("force_style='")[1]
     assert "Noto Sans CJK SC" in style            # fansub look
-    assert "FontSize=13" in style                 # ≈4.5% of frame height
-    assert "Outline=1" in style and "Shadow=0.5" in style
+    assert "FontSize=26" in style                 # ≈9% of frame height (用户裁决加倍)
+    assert "Outline=2" in style and "Shadow=0.5" in style
     assert "MarginV=10" in style                  # ≈3.5% above bottom
 
 
@@ -634,7 +634,7 @@ def test_burn_subtitle_size_scales_with_resolution(tmp_path, height):
     the row bands of white pixels:
       - exactly 2 bands → the two cue lines are visibly separated
         (line spacing, not glued/overlapping),
-      - band height ≈ 4.5% of the frame height (was 18% with FontSize=52),
+      - band height ≈ 9% of the frame height (FontSize=26, 用户裁决加倍; 13≈4.5% 偏小, 52≈18% 过大),
       - band height halves at 360p vs 720p → resolution-proportional.
     Pairs with test_burn_subtitle_proportionality_ratio below.
     """
@@ -672,9 +672,9 @@ def test_burn_subtitle_size_scales_with_resolution(tmp_path, height):
     band_h = max(h for _y, h in bands)
     gap = bands[1][0] - (bands[0][0] + bands[0][1])
     assert gap >= 1, "no visible gap between the two subtitle lines"
-    # glyph em ≈ 4.5% of height; caps/latin ink ≈ 0.55-0.85 em
-    assert height * 0.02 <= band_h <= height * 0.07, \
-        f"band {band_h}px is not ~4.5% of {height}px frame"
+    # glyph em ≈ 9% of height; caps/latin ink ≈ 0.55-0.85 em
+    assert height * 0.04 <= band_h <= height * 0.14, \
+        f"band {band_h}px is not ~9% of {height}px frame"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

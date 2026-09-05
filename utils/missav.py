@@ -1532,19 +1532,18 @@ async def remux_to_mp4(src, dst):
 # PlayResY=288 and libass renders every style unit as unit/288 of the
 # frame HEIGHT — so the constants below are the same fraction of the
 # picture at 480p, 1080p and 4K, no per-video probing needed.
-#   FontSize 13 ≈ 4.5% of height  (52 before ≈ 18%: unreadably huge,
-#                                  two-line cues filled a third of the
-#                                  screen — reworked 2026-08-16)
-#   Outline   1 ≈ 0.35%           (≈ 3.7px at 1080p)
+#   FontSize 26 ≈ 9%   of height  (用户裁决 2026-09-05：13≈4.5% 偏小，
+#                                  加倍；52≈18% 仍判过大）
+#   Outline   2 ≈ 0.7% of height  (随字号等比加倍，大字配粗描边)
 #   Shadow  0.5 ≈ 0.17%           (≈ 1.9px at 1080p, soft)
 #   MarginV 10 ≈ 3.5%             (≈ 38px above the bottom edge at 1080p)
 # Multi-line pitch follows the font's own metrics (ASS styles carry no
-# line-height field); at 4.5% glyphs the site's two-line cues render with
-# standard streaming-service spacing.
+# line-height field); at 9% glyphs the site's two-line cues render like
+# large-print streaming subs.
 _SUBTITLE_FORCE_STYLE = (
-    "FontName=Noto Sans CJK SC,Bold=1,FontSize=13,"
+    "FontName=Noto Sans CJK SC,Bold=1,FontSize=26,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-    "BorderStyle=1,Outline=1,Shadow=0.5,MarginV=10,Alignment=2"
+    "BorderStyle=1,Outline=2,Shadow=0.5,MarginV=10,Alignment=2"
 )
 
 
