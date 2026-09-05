@@ -34,6 +34,28 @@ class _Result:
     upserted_id = None
 
 
+class _FakeCursor:
+    """find() 链式游标最小面：sort/skip/limit + 迭代。"""
+
+    def __init__(self, docs):
+        self._docs = docs
+
+    def sort(self, key, direction):
+        self._docs.sort(key=lambda d: d.get(key) or 0, reverse=direction < 0)
+        return self
+
+    def skip(self, n):
+        self._docs = self._docs[n:]
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[:n]
+        return self
+
+    def __iter__(self):
+        return iter(self._docs)
+
+
 class FakeCol:
     """dict-backed 最小 mongo collection：find_one / update_one。"""
 
@@ -73,6 +95,15 @@ class FakeCol:
             elif value != cond:
                 return False
         return True
+
+    def find(self, query):
+        self._check()
+        self.calls.append(("find", dict(query)))
+        return _FakeCursor(list(self.rows.values()))
+
+    def count_documents(self, query):
+        self._check()
+        return len(self.rows)
 
     def update_one(self, query, update, upsert=False):
         self._check()
@@ -196,25 +227,58 @@ def test_normalize_tag_plain_row_is_not_canonical(cols):
 # classify
 # ---------------------------------------------------------------------------
 
-def test_classify_order_and_unknown_preserved(cols):
-    _, _, _ = cols
-    tags, cats = avdict.classify(["中出し", "巨乳", "未知の遊び", "巨乳", "　"])
-    assert tags == ["中出", "巨乳", "未知の遊び"]  # 保序去重，unknown 原样
-    assert cats == ["巨乳系", "中出·受孕"]  # SEED_CATEGORY_ORDER 出现序
-
-
-def test_classify_db_category_override(cols):
+def test_select_tags_normalizes_dedupes(cols):
+    assert avdict.select_tags(
+        ["中出し", "巨乳", "未知の遊び", "巨乳", "　"]) == ["中出", "巨乳", "未知の遊び"]
+    # 全量频率沉淀：三个规范名都入库计数（含未知/被去重的不再重复计）
     _, tag, _ = cols
-    tag.rows["巨乳"] = {"_id": "巨乳", "category": "SM·束缚"}  # db 覆盖
-    tag.rows["痴女"] = {"_id": "痴女", "category": "怪类别"}  # 不在 ORDER → 不产出
-    tags, cats = avdict.classify(["痴女", "巨乳"])
-    assert tags == ["痴女", "巨乳"]
-    assert cats == ["SM·束缚"]
+    assert tag.rows["中出"]["hits"] == 1
+    assert tag.rows["巨乳"]["hits"] == 1
+    assert tag.rows["未知の遊び"]["hits"] == 1
 
 
-def test_classify_empty_input(cols):
-    assert avdict.classify([]) == ([], [])
-    assert avdict.classify(None) == ([], [])
+def test_select_tags_ranks_by_global_frequency(cols):
+    """频率降序 top-N：先验高频排前；同频保持源顺序（稳定）。"""
+    _, tag, _ = cols
+    tag.rows["巨乳"] = {"_id": "巨乳", "hits": 10}
+    tag.rows["中出"] = {"_id": "中出", "hits": 50}
+    out = avdict.select_tags(["巨乳", "未知の遊び", "中出"])
+    assert out == ["中出", "巨乳", "未知の遊び"]  # 50 > 10(record 后 11) > 1
+    assert avdict.select_tags(["未知A", "巨乳"], limit=1) == ["巨乳"]
+
+
+def test_select_tags_blacklist_and_restore(cols):
+    """拉黑词永不进入影片信息；解除后恢复资格。"""
+    assert avdict.blacklist_tag("巨乳") is True
+    assert avdict.select_tags(["中出し", "巨乳"]) == ["中出"]
+    assert avdict.restore_tag("巨乳") is True
+    assert avdict.select_tags(["巨乳"]) == ["巨乳"]
+
+
+def test_select_tags_empty_input(cols):
+    assert avdict.select_tags([]) == []
+    assert avdict.select_tags(None) == []
+
+
+def test_list_tags_pages_by_frequency(cols):
+    _, tag, _ = cols
+    for i, name in enumerate(["甲", "乙", "丙"]):
+        tag.rows[name] = {"_id": name, "hits": i + 1}
+    rows, total = avdict.list_tags(page=0, per_page=2)
+    assert total == 3
+    assert [r["_id"] for r in rows] == ["丙", "乙"]  # 频率降序
+    rows, _ = avdict.list_tags(page=1, per_page=2)
+    assert [r["_id"] for r in rows] == ["甲"]
+
+
+def test_blacklisted_word_keeps_frequency_for_restore(cols):
+    """拉黑前历史频率保留：解除拉黑后可回到原排序位。"""
+    _, tag, _ = cols
+    tag.rows["巨乳"] = {"_id": "巨乳", "hits": 99}
+    avdict.blacklist_tag("巨乳")
+    assert tag.rows["巨乳"]["hits"] == 99      # 拉黑不清频
+    avdict.restore_tag("巨乳")
+    assert avdict.select_tags(["新词", "巨乳"]) == ["巨乳", "新词"]
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +301,8 @@ def test_enhance_end_to_end(cols):
 
     assert out is details  # 原地修改并返回
     assert details["actresses_cn"] == ["百永纱里奈"]  # 日名补 cn；未知子无 cn 不产
-    assert details["genres"] == ["中出", "巨乳", "未知タグ"]  # 归一 + 保序去重
-    assert details["categories"] == ["巨乳系", "中出·受孕"]  # 派生类别
-    assert details["badges"] == ["中文字幕"]  # 无关字段不动
+    assert details["genres"] == ["中出", "巨乳", "未知タグ"]  # 归一 + 保序去重（首见同频）
+    assert details["badges"] == ["中文字幕"]  # badges 过滤后原样（入 tag 库计数）
 
     # unknown 日名回写 av_actress 学习
     assert "未知子" in actress.rows
@@ -247,9 +310,9 @@ def test_enhance_end_to_end(cols):
     assert actress.rows["未知子"]["sources"] == ["test"]
     # known 日名（已命中）不回写
     assert "百永サリナ" not in actress.rows
-    # unknown tag 回写 av_tag；种子/库已知 tag 不回写
-    assert set(tag.rows) == {"未知タグ"}
-    assert tag.rows["未知タグ"]["category"] is None
+    # 所有获取到的标签（含 badges）全量入库计数
+    assert set(tag.rows) == {"中出", "巨乳", "未知タグ", "中文字幕"}
+    assert all(r["hits"] == 1 for r in tag.rows.values())
 
 
 def test_enhance_keeps_existing_cn_and_positions(cols):
@@ -375,111 +438,57 @@ def test_all_public_funcs_swallow_db_failure(monkeypatch):
     avdict.record_actress("百永さりな", cn="名")  # 不抛
     assert avdict.normalize_tag("中出し") == "中出"  # 种子兜底仍可用
     assert avdict.normalize_tag("巨乳") == "巨乳"
-    avdict.record_tag("未知タグ")  # 不抛
+    avdict.record_tag_seen("未知タグ")  # 不抛
 
-    tags, cats = avdict.classify(["中出し", "巨乳"])
-    assert (tags, cats) == (["中出", "巨乳"], ["巨乳系", "中出·受孕"])
+    # 库故障 → 频率全 0 → 保持源顺序，绝不清空标签
+    assert avdict.select_tags(["中出し", "巨乳"]) == ["中出", "巨乳"]
+    assert avdict.filter_badges(["中文字幕", "无码破解"]) == ["中文字幕", "无码破解"]
 
-    details = {"actresses": ["未知子"], "genres": ["中出し", "未知タグ"]}
+    details = {"actresses": ["未知子"], "genres": ["中出し", "未知タグ"],
+               "badges": ["中文字幕"]}
     out = avdict.enhance(details, source="x")
     assert out is details
     assert details["genres"] == ["中出", "未知タグ"]  # 本地归一不受库故障影响
-    assert "categories" not in details or details["categories"] == ["中出·受孕"]
+    assert details["badges"] == ["中文字幕"]
 
     assert avdict.code_meta_load("GVH-690") is None
     avdict.code_meta_save("GVH-690", {"code": "GVH-690"})  # 不抛
 
 
-def test_enhance_db_failure_keeps_seed_categories(monkeypatch):
+def test_enhance_db_failure_keeps_local_normalization(monkeypatch):
     boom = FakeCol(fail=True)
     monkeypatch.setattr(avdict, "_cols", lambda: (boom, boom))
     monkeypatch.setattr(avdict, "_code_col", lambda: boom)
-    details = {"genres": ["巨乳", "痴女"]}
+    details = {"genres": ["中出し", "巨乳"]}
     avdict.enhance(details)
-    assert details["genres"] == ["巨乳", "痴女"]
-    assert details["categories"] == ["巨乳系", "痴女·荡妇"]
+    assert details["genres"] == ["中出", "巨乳"]
 
 
 # ---------------------------------------------------------------------------
-# 种子数据一致性自查
+# 种子数据一致性自查（别名表）
 # ---------------------------------------------------------------------------
 
-def _canonical_tags():
-    return {t for tags in avdict_seed.SEED_TAG_CATEGORIES.values() for t in tags}
-
-
-def test_seed_shape():
-    cats = avdict_seed.SEED_TAG_CATEGORIES
-    total = sum(len(v) for v in cats.values())
-    assert 15 <= len(cats) <= 20
-    assert 150 <= total <= 250
-    # ORDER 与 SEED_TAG_CATEGORIES 键完全同序
-    assert avdict_seed.SEED_CATEGORY_ORDER == list(cats.keys())
-
-
-def test_seed_tag_single_category():
-    seen = {}
-    for cat, tags in avdict_seed.SEED_TAG_CATEGORIES.items():
-        for tag in tags:
-            assert tag not in seen, f"{tag!r} 同时属于 {seen.get(tag)!r} 与 {cat!r}"
-            seen[tag] = cat
-
-
-def test_seed_alias_targets_canonical():
-    canonical = _canonical_tags()
+def test_seed_alias_targets_differ_and_no_dup():
     for alias, target in avdict_seed.SEED_TAG_ALIASES.items():
-        assert target in canonical, f"别名 {alias!r} 指向非规范名 {target!r}"
+        assert isinstance(target, str) and target, f"别名 {alias!r} 目标为空"
         assert target != alias, f"别名 {alias!r} 是恒等映射"
 
 
-def test_seed_alias_keys_not_canonical():
-    canonical = _canonical_tags()
-    for alias in avdict_seed.SEED_TAG_ALIASES:
-        assert alias not in canonical, f"别名键 {alias!r} 与规范名冲突"
-
-
 def test_seed_no_duplicate_literal_keys():
-    """AST 层检查：dict/列表字面量无重复字符串键/元素（防静默覆盖）。"""
+    """AST 层检查：别名 dict 字面量无重复键（防静默覆盖）。"""
     src = (SRC / "utils" / "avdict_seed.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
-    lits = {
-        "SEED_CATEGORY_ORDER": None,
-        "SEED_TAG_CATEGORIES": None,
-        "SEED_TAG_ALIASES": None,
-    }
+    aliases_value = None
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
-                if isinstance(t, ast.Name) and t.id in lits:
-                    lits[t.id] = node.value
-    for name, value in lits.items():
-        assert value is not None, f"{name} 缺失"
-
-    def assert_no_dup_strings(items, where):
-        strs = [k.value for k in items if isinstance(k, ast.Constant)
-                and isinstance(k.value, str)]
-        assert len(strs) == len(set(strs)), f"{where} 存在重复字面量"
-
-    order = lits["SEED_CATEGORY_ORDER"]
-    assert_no_dup_strings(order.elts, "SEED_CATEGORY_ORDER")
-    cats = lits["SEED_TAG_CATEGORIES"]
-    assert_no_dup_strings(cats.keys, "SEED_TAG_CATEGORIES")
-    for k, v in zip(cats.keys, cats.values):
-        assert_no_dup_strings(v.elts, f"类别 {k.value}")
-    aliases = lits["SEED_TAG_ALIASES"]
-    assert_no_dup_strings(aliases.keys, "SEED_TAG_ALIASES")
-
-    # 运行时长度 == 字面量长度（重复键会被 Python 静默吞掉）
-    assert len(aliases.keys) == len(avdict_seed.SEED_TAG_ALIASES)
-    assert len(cats.keys) == len(avdict_seed.SEED_TAG_CATEGORIES)
-
-
-def test_seed_end_to_end_derivation(cols):
-    """种子映射可独立支撑 classify（冷启动路径）。"""
-    _, _, _ = cols
-    tags, cats = avdict.classify(["人妻", "中出し", "拘束", "单体作品"])
-    assert tags == ["人妻", "中出", "拘束", "单体作品"]
-    assert cats == ["人妻·熟女", "SM·束缚", "中出·受孕", "企划·综合"]
+                if isinstance(t, ast.Name) and t.id == "SEED_TAG_ALIASES":
+                    aliases_value = node.value
+    assert aliases_value is not None, "SEED_TAG_ALIASES 缺失"
+    keys = [k.value for k in aliases_value.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+    assert len(keys) == len(set(keys)), "别名表存在重复字面量键"
+    assert len(keys) == len(avdict_seed.SEED_TAG_ALIASES)
 
 
 # ---------------------------------------------------------------------------
@@ -510,8 +519,9 @@ def test_circuit_breaker_trips_and_blocks(cols, monkeypatch):
     assert len(calls) == n                        # 未触库
 
 
-def test_enhance_clears_stale_categories(cols):
-    """genres 归一后无类可派时，必须清掉与 genres 不再对应的旧 categories。"""
-    d = {"genres": ["未知标签"], "categories": ["巨乳系"]}
-    out = avdict.enhance(d)
-    assert out["categories"] == []
+def test_import_surface_has_no_category_apis():
+    """类别派生机制已按用户裁决移除：不留死代码。"""
+    assert not hasattr(avdict, "classify")
+    assert not hasattr(avdict, "record_tag")
+    assert not hasattr(avdict_seed, "SEED_TAG_CATEGORIES")
+    assert not hasattr(avdict_seed, "SEED_CATEGORY_ORDER")

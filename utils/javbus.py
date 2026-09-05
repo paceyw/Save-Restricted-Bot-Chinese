@@ -15,7 +15,7 @@ caption 原料（studio / release_date / title / genres 只补缺不覆盖），
 中文演员名写入独立的 ``actresses_cn``（javbus CN star 名优先，missav
 ``/cn/`` 页探测兜底）；``actresses`` 保留源 JP 名，不再拼接。序位对应
 的 jp/cn 对回写词库学习（:mod:`utils.avdict`），genres 归一为 CN 规范
-名并派生 ``categories``。成功补全后落 av_code 番号快照；网络源全失败
+并按词库频率取 top-20（黑名单过滤）。成功补全后落 av_code 番号快照；网络源全失败
 时回放快照补缺。任何异常都被吞掉并原样返回 ``details``——补全永不致
 失败下载。
 
@@ -557,15 +557,16 @@ def _enrich_details(details, url):
             if jp and cn and cn != jp:
                 avdict.record_actress(jp, cn, source="javbus")
 
-    # genres 归一为 CN 规范名 + 派生 categories
+    # 标签：归一去重 + 黑名单过滤 + 全量频率沉淀 + 频率降序 top-20
     genres = details.get("genres")
     if isinstance(genres, list) and genres:
-        tags, cats = avdict.classify(genres)
-        if tags:
-            gained = gained or tags != genres
-            details["genres"] = tags
-        if cats:
-            details["categories"] = cats
+        tags = avdict.select_tags(genres)
+        gained = gained or tags != genres
+        details["genres"] = tags
+    # 类别行（badges）：归一 + 黑名单过滤 + 频率沉淀
+    badges = details.get("badges")
+    if isinstance(badges, list) and badges:
+        details["badges"] = avdict.filter_badges(badges)
 
     if code and not hit:
         # 网络源全失败：回放番号快照，只补缺不覆盖；补到的 genres 也归一
@@ -576,13 +577,9 @@ def _enrich_details(details, url):
                     details[key] = value
             replay = details.get("genres")
             if isinstance(replay, list) and replay:
-                tags, cats = avdict.classify(replay)
-                if tags:
-                    details["genres"] = tags
-                if cats:
-                    details["categories"] = cats
+                details["genres"] = avdict.select_tags(replay)
 
-    if code and (gained or merged or details.get("categories")):
+    if code and (gained or merged or details.get("actresses_cn")):
         # 成功 enrich（有增量或 cn/分类非空）：落番号快照，供下次全失败回放
         avdict.code_meta_save(code, details)
     return details

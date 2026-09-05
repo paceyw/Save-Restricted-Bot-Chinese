@@ -1,10 +1,33 @@
+# ─── Caption v3 骨架：三行恒定渲染 ────────────────────────────────────────────
+
+def test_build_caption_three_lines_with_blank_slots():
+    d = {
+        "code": "GVH-690",
+        "title": "intro",
+        "actresses_cn": ["百永纱里奈"],
+        "actresses": ["百永さりな"],
+        "genres": ["巨乳", "中出"],
+        "badges": ["中文字幕"],
+    }
+    assert missav.build_caption(d) == (
+        "GVH-690\n\nintro\n\n"
+        "演员：#百永纱里奈 #百永さりな\n"
+        "标签：#巨乳 #中出\n"
+        "类别：#中文字幕"
+    )
+    # 缺数据留空占位：结构恒定
+    sparse = missav.build_caption({"code": "FC2-PPV-1", "badges": ["无码"]})
+    assert sparse.split("\n\n")[-1].split("\n") == [
+        "演员：", "标签：", "类别：#无码"]
+
+
 """Offline tests for the av-dict Caption v2 contract (契约 Caption v2 节).
 
 Covers the C integration points:
 - P0: getav zh 简介 主演 劈分不再产出「讲述…」假演员
       （_GETAV_ZH_STARS_RE 收紧 + _looks_like_name 白名单）。
 - details dict v2 字段分离：starsZh → actresses_cn，stars → actresses。
-- build_caption 四行骨架（演员/原名/标签/类别=badges+categories），
+- build_caption 三行骨架（演员=中日名同行/标签=内容标签/类别=badges），
   缺数据留空占位。
 - parse_details 与 build_caption 的 round-trip 稳定。
 
@@ -132,62 +155,37 @@ def test_missav_panel_actresses_cn_starts_empty():
     assert d["actresses"] == [] and d["actresses_cn"] == []
 
 
-def test_build_caption_category_merges_badges_and_categories():
-    """类别 = badges + categories 合并去重，badges 在前。"""
-    d = {
-        "code": "GVH-690",
-        "title": "t",
-        "badges": ["中文字幕", "无码"],
-        "categories": ["巨乳系", "中文字幕"],   # 中文字幕重复：去重保前
-    }
+def test_build_caption_ignores_categories_key():
+    """类别行语义回归 badge：categories 键（旧派生机制）不再渲染。"""
+    d = {"code": "GVH-690", "genres": ["巨乳"],
+         "badges": ["无码破解"], "categories": ["巨乳系"]}
     cap = missav.build_caption(d)
-    assert cap.endswith("类别：#中文字幕 #无码 #巨乳系")
-    # 无 categories 时类别行退化为纯 badges
-    assert missav.build_caption({"code": "A-1", "badges": ["中文字幕"]}).endswith(
-        "类别：#中文字幕")
+    assert "类别：#无码破解" in cap
+    assert "巨乳系" not in cap
 
 
-# ─── Caption v2 骨架：四行恒定渲染 ────────────────────────────────────────────
-
-def test_build_caption_four_lines_with_blank_slots():
-    d = {
-        "code": "GVH-690",
-        "title": "intro",
-        "actresses_cn": ["百永纱里奈"],
-        "actresses": ["百永さりな"],
-        "genres": ["巨乳", "中出"],
-        "badges": ["中文字幕"],
-    }
-    assert missav.build_caption(d) == (
-        "GVH-690\n\nintro\n\n"
-        "演员：#百永纱里奈\n"
-        "原名：#百永さりな\n"
-        "标签：#巨乳 #中出\n"
-        "类别：#中文字幕"
-    )
-    # 缺数据留空占位：结构恒定
-    sparse = missav.build_caption({"code": "FC2-PPV-1", "badges": ["无码"]})
-    assert sparse.split("\n\n")[-1].split("\n") == [
-        "演员：", "原名：", "标签：", "类别：#无码"]
-
-
-# ─── parse_details v2 标签映射 + round-trip ──────────────────────────────────
-
-def test_parse_details_v2_label_mapping():
+def test_parse_details_v3_label_mapping():
     det = caption.parse_details(
-        "GVH-690\n\n简介\n\n演员：#小美 #小林\n原名：#Mei #Rin\n"
+        "GVH-690\n\n简介\n\n演员：#小美 #小林 #Mei\n"
         "标签：#巨乳\n类别：#中文字幕")
-    assert det["actresses_cn"] == ["小美", "小林"]
-    assert det["actresses"] == ["Mei", "Rin"]
+    # v3：演员行不区分语种，全部进 render 桶（enrich 前无法判定中日）
+    assert det["actresses_cn"] == ["小美", "小林", "Mei"]
+    assert det["actresses"] == []
     assert det["genres"] == ["巨乳"]
     assert det["badges"] == ["中文字幕"]
 
 
+def test_parse_details_legacy_merged_pair_split():
+    """旧「中文名 (日文名)」合并格式自动拆桶（兼容转发旧文案）。"""
+    det = caption.parse_details("GVH-690\n\n演员：小美 (Mei)、小林 (Rin)\n标签：#巨乳")
+    assert det["actresses_cn"] == ["小美", "小林"]
+    assert det["actresses"] == ["Mei", "Rin"]
+
+
 def test_parse_details_accepts_plain_label_values():
     # 非 hashtag 的裸值 + 分隔符劈分同样按字段归位
-    det = caption.parse_details("GVH-690\n\n演员： 小美、小林\n原名：Mei\n类别： #高潮")
+    det = caption.parse_details("GVH-690\n\n演员： 小美、小林\n类别： #高潮")
     assert det["actresses_cn"] == ["小美", "小林"]
-    assert det["actresses"] == ["Mei"]
     assert det["badges"] == ["高潮"]
     # 中隔点 · 是译名一部分，不再劈分
     det = caption.parse_details("GVH-690\n\n演员：玛丽亚·小林")
@@ -208,8 +206,8 @@ def test_round_trip_build_parse_build_stable():
     assert caption.restructure_caption(once) == once
 
 
-def test_round_trip_forwarded_v2_text_stable():
-    """转发别人手写的 v2 格式文本：原样回流，不 mangling。"""
-    text = ("GVH-690\n\n标题简介\n\n演员：#小美\n原名：#Mei\n"
-            "标签：#巨乳\n类别：#中文字幕")
-    assert caption.restructure_caption(text) == text
+def test_round_trip_forwarded_legacy_pair_text_stable():
+    """转发旧「中文名 (日文名)」合并格式：拆桶后重排稳定（不再二次变形）。"""
+    text = "GVH-690\n\n标题简介\n\n演员：小美 (Mei)\n标签：#巨乳\n类别：#中文字幕"
+    once = caption.restructure_caption(text)
+    assert caption.restructure_caption(once) == once

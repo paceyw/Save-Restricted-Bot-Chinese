@@ -61,6 +61,7 @@ def settings_menu():
          IK('🚪 退出登录', callback_data='logout')],
         [IK('🖼️ 设置缩略图', callback_data='setthumb'),
          IK('❌ 移除缩略图', callback_data='remthumb')],
+        [IK('📚 词库管理', callback_data='lexicon')],
         [IK('🆘 报告错误', url='https://t.me/team_spy_pro')]
     ])
 
@@ -371,3 +372,71 @@ async def _sweep_active_conversations():
 
 
 
+
+
+# ─── 词库管理（av_dict：查看/拉黑/恢复）───────────────────────────────────────
+
+LEX_PAGE_SIZE = 10
+
+
+def _lexicon_kb(rows, page, pages):
+    kb = []
+    for i, r in enumerate(rows):
+        mark = '🚫' if r.get('blacklisted') else '✅'
+        kb.append([IK(f"{mark} {r['_id']} · {r.get('hits') or 0}次",
+                      callback_data=f'lexb:{page}:{i}')])
+    nav = []
+    if page > 0:
+        nav.append(IK('‹ 上一页', callback_data=f'lexp:{page - 1}'))
+    nav.append(IK(f'{page + 1}/{max(pages, 1)}', callback_data=f'lexp:{page}'))
+    if page < pages - 1:
+        nav.append(IK('下一页 ›', callback_data=f'lexp:{page + 1}'))
+    kb.append(nav)
+    kb.append([IK('↩️ 返回设置', callback_data='lexback')])
+    return IKM(kb)
+
+
+async def _render_lexicon(query, page, notice=''):
+    """词库分页视图（频率降序）；点击词条切换拉黑状态。"""
+    from utils import avdict
+    page = max(page, 0)
+    rows, total = await asyncio.to_thread(avdict.list_tags, page, LEX_PAGE_SIZE)
+    pages = (total + LEX_PAGE_SIZE - 1) // LEX_PAGE_SIZE
+    if not rows:
+        text = ('📚 词库为空\n\n__下载影片后自动沉淀标签与演员对照，'
+                '届时可在此拉黑不想出现的词语。__' + notice)
+        kb = [[IK('↩️ 返回设置', callback_data='lexback')]]
+    else:
+        text = (f'📚 词库（按使用频率排序，共 {total} 条，第 {page + 1}/{max(pages, 1)} 页）'
+                f'{notice}\n\n__点击词条：拉黑 / 恢复。拉黑后该词不再进入影片信息。__')
+        kb = _lexicon_kb(rows, page, pages)
+    await query.message.edit_text(text, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r'^(lexicon|lexback)$|^lexp:(\d+)$|^lexb:(\d+):(\d+)$'))
+async def lexicon_callback(client, query):
+    data = query.data
+    try:
+        if data == 'lexback':
+            await query.message.edit_text(MESS, reply_markup=settings_menu())
+        elif data == 'lexicon':
+            await _render_lexicon(query, 0)
+        elif data.startswith('lexp:'):
+            await _render_lexicon(query, int(data.split(':')[1]))
+        else:  # lexb:<page>:<idx>
+            _, pg, idx = data.split(':')
+            page, idx = int(pg), int(idx)
+            from utils import avdict
+            rows, _ = await asyncio.to_thread(avdict.list_tags, page, LEX_PAGE_SIZE)
+            if 0 <= idx < len(rows):
+                tag = rows[idx]['_id']
+                if rows[idx].get('blacklisted'):
+                    ok = await asyncio.to_thread(avdict.restore_tag, tag)
+                    notice = f'\n\n✅ 已恢复：{tag}' if ok else '\n\n⚠️ 词库暂不可用，稍后再试'
+                else:
+                    ok = await asyncio.to_thread(avdict.blacklist_tag, tag)
+                    notice = f'\n\n🚫 已拉黑：{tag}' if ok else '\n\n⚠️ 词库暂不可用，稍后再试'
+                await _render_lexicon(query, page, notice=notice)
+    except Exception:
+        await _render_lexicon(query, 0)
+    await query.answer()

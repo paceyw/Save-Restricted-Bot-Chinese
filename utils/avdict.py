@@ -29,11 +29,7 @@ import time
 from datetime import datetime, timezone
 
 import config
-from utils.avdict_seed import (
-    SEED_CATEGORY_ORDER,
-    SEED_TAG_ALIASES,
-    SEED_TAG_CATEGORIES,
-)
+from utils.avdict_seed import SEED_TAG_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +60,8 @@ def _on_err(exc: Exception) -> None:
     else:
         logger.debug("avdict 操作失败: %s", exc, exc_info=True)
 
-# 种子派生（冷启动兜底；运行时以库为准）
-_SEED_TAG2CAT = {
-    tag: cat for cat, tags in SEED_TAG_CATEGORIES.items() for tag in tags
-}
+# 种子别名（冷启动兜底；运行时以库为准）
 _SEED_ALIASES = dict(SEED_TAG_ALIASES)
-_ORDER_INDEX = {cat: i for i, cat in enumerate(SEED_CATEGORY_ORDER)}
 
 # 全角 ASCII（U+FF01–U+FF5E）→ 半角；表意空格另在 _norm_key 处理
 _FULLWIDTH_TABLE = {cp: cp - 0xFEE0 for cp in range(0xFF01, 0xFF5F)}
@@ -204,60 +196,160 @@ def normalize_tag(name: str) -> str:
         return _norm_key(name)
 
 
-def record_tag(name: str, source: str = "") -> None:
-    """unknown tag 学习：upsert {category: None}（已有 category 不覆盖）。"""
+def record_tag_seen(name: str, source: str = "") -> None:
+    """每个获取到的标签都计数沉淀（频率 = 跨影片出现次数，全局）。
+
+    别名变体归并到规范名 _id 上计数（「中出し」与「中出」同条）；别名
+    收进 aliases；失败静默。
+    """
+    if _down():
+        return
     try:
-        key = _norm_key(name)
-        if not key:
+        canonical = normalize_tag(name)
+        if not canonical:
             return
-        _, tag_col = _cols()
+        _, col = _cols()
         update = {
-            "$setOnInsert": {"category": None},
             "$set": {"updated_at": datetime.now(timezone.utc)},
             "$inc": {"hits": 1},
+            "$addToSet": {"aliases": _norm_key(name)},
         }
         if source:
-            update["$addToSet"] = {"sources": source}
-        tag_col.update_one({"_id": key}, update, upsert=True)
-    except Exception:
-        logger.info("avdict.record_tag 写入失败 name=%r", name, exc_info=True)
+            update["$addToSet"]["sources"] = source
+        col.update_one({"_id": canonical}, update, upsert=True)
+    except Exception as e:
+        _on_err(e)
 
 
-def _category_of(tag: str) -> str | None:
-    """tag → category：db 有 category 值则优先，否则查种子；都没有为 None。"""
+def blacklist_tag(name: str) -> bool:
+    """拉黑标签（词库黑名单/负面清单）；返回是否生效。失败静默 False。"""
+    if _down():
+        return False
     try:
-        _, tag_col = _cols()
-        row = tag_col.find_one({"_id": tag})
-        if isinstance(row, dict) and row.get("category"):
-            return str(row["category"])
-    except Exception:
-        pass
-    return _SEED_TAG2CAT.get(tag)
+        canonical = normalize_tag(name)
+        if not canonical:
+            return False
+        _, col = _cols()
+        col.update_one(
+            {"_id": canonical},
+            {"$set": {"blacklisted": True,
+                      "updated_at": datetime.now(timezone.utc)},
+             "$setOnInsert": {"hits": 0}},
+            upsert=True)
+        return True
+    except Exception as e:
+        _on_err(e)
+        return False
 
 
-def classify(genres: list[str]) -> tuple[list[str], list[str]]:
-    """-> (规范化 tags 保序去重, categories 按 SEED_CATEGORY_ORDER 排序去重)。
+def restore_tag(name: str) -> bool:
+    """解除拉黑。失败静默 False。"""
+    if _down():
+        return False
+    try:
+        canonical = normalize_tag(name)
+        if not canonical:
+            return False
+        _, col = _cols()
+        col.update_one(
+            {"_id": canonical},
+            {"$set": {"blacklisted": False,
+                      "updated_at": datetime.now(timezone.utc)}})
+        return True
+    except Exception as e:
+        _on_err(e)
+        return False
 
-    逐个 normalize_tag 后查类别（db 覆盖优先）；不在 SEED_CATEGORY_ORDER
-    里的类别值不产出。
+
+def _is_blacklisted(canonical: str) -> bool:
+    """规范名是否在黑名单（库内标记；词库降级时按未拉黑处理）。"""
+    try:
+        _, col = _cols()
+        row = col.find_one({"_id": canonical})
+        return bool(isinstance(row, dict) and row.get("blacklisted"))
+    except Exception as e:
+        _on_err(e)
+        return False
+
+
+def list_tags(page: int = 0, per_page: int = 10):
+    """词库分页（频率降序）：-> (rows, total)。row 含 hits/blacklisted。"""
+    try:
+        _, col = _cols()
+        total = col.count_documents({})
+        rows = list(col.find({}).sort("hits", -1).skip(max(page, 0) * per_page)
+                    .limit(per_page))
+        return rows, total
+    except Exception as e:
+        _on_err(e)
+        return [], 0
+
+
+def select_tags(genres, limit: int = 20) -> list[str]:
+    """标签行产出：归一去重 → 拉黑过滤 → 全量频率沉淀 → 频率降序 top-N。
+
+    - 归一合并相似标签（别名/分词变体同条计数，天然去重）；
+    - 黑名单词永不进入影片信息；
+    - 所有获取到的标签都入库计数（含最终被舍弃/拉黑的——拉黑前历史
+      频率保留，解除拉黑后可恢复排序资格）；
+    - 超过 limit 按频率从高到低舍弃（同频保持源顺序，稳定排序）。
     """
     try:
-        tags, cats = [], []
-        for raw in genres or []:
-            tag = normalize_tag(raw)
-            if not tag or tag in tags:
+        cleaned, seen = [], set()
+        for g in genres or []:
+            if not isinstance(g, str):
                 continue
-            tags.append(tag)
-            cat = _category_of(tag)
-            if cat and cat not in cats:
-                cats.append(cat)
-        known = sorted(
-            (c for c in cats if c in _ORDER_INDEX), key=_ORDER_INDEX.__getitem__
-        )
-        return tags, known
-    except Exception:
-        logger.info("avdict.classify 失败 genres=%r", genres, exc_info=True)
-        return [], []
+            canonical = normalize_tag(g)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            if _is_blacklisted(canonical):
+                continue
+            cleaned.append(canonical)
+        if not cleaned:
+            return []
+        freq = {}
+
+        def _freq(tag):
+            # 库故障降级为 0（全部同频 → 保持源顺序），绝不清空标签
+            if tag not in freq:
+                try:
+                    _, col = _cols()
+                    row = col.find_one({"_id": tag})
+                    freq[tag] = int(row.get("hits") or 0) if isinstance(row, dict) else 0
+                except Exception as e:
+                    _on_err(e)
+                    freq[tag] = 0
+            return freq[tag]
+
+        for tag in cleaned:
+            record_tag_seen(tag)
+        ranked = sorted(cleaned, key=_freq, reverse=True)
+        return ranked[:max(limit, 0)]
+    except Exception as e:
+        _on_err(e)
+        return []
+
+
+def filter_badges(badges) -> list[str]:
+    """类别行产出：badge 归一（别名表）+ 黑名单过滤 + 频率沉淀。"""
+    try:
+        out, seen = [], set()
+        for b in badges or []:
+            if not isinstance(b, str):
+                continue
+            canonical = normalize_tag(b)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            if _is_blacklisted(canonical):
+                continue
+            record_tag_seen(canonical)
+            out.append(canonical)
+        return out
+    except Exception as e:
+        _on_err(e)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -265,14 +357,14 @@ def classify(genres: list[str]) -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 
 def enhance(details: dict, source: str = "") -> dict:
-    """词库总编排：演员补 cn、genres 归一、派生 categories、unknown 回写库。
+    """词库总编排：演员补 cn、标签归一/黑名单/top-20、badges 过滤。
 
     原地修改并返回 ``details``：
 
     - ``actresses`` 日文名 → 词库查 cn 补 ``actresses_cn``（已有 cn 不覆盖；
       位置对应，javbus/getav 先填的序位优先）；查不到的日名回写 av_actress。
-    - ``genres`` 全量 normalize；unknown tag（种子与库都无类别）回写 av_tag。
-    - 派生 ``categories``（有产出才写 key）。
+    - ``genres`` 归一去重 + 黑名单过滤 + 全量频率沉淀 + 频率降序 top-20。
+    - ``badges``（类别行）归一 + 黑名单过滤 + 频率沉淀。
     """
     try:
         if not isinstance(details, dict):
@@ -302,18 +394,14 @@ def enhance(details: dict, source: str = "") -> dict:
         if cn_names:
             details["actresses_cn"] = cn_names
 
-        # ② 标签：全量归一 + 派生类别 + unknown 回写
+        # ② 标签：归一去重 + 黑名单过滤 + 全量频率沉淀 + top-20
         genres = [g for g in (details.get("genres") or []) if isinstance(g, str)]
-        tags, cats = classify(genres)
-        if tags:
-            details["genres"] = tags
-        for tag in tags:
-            if _category_of(tag) is None:
-                record_tag(tag, source=source)
         if genres:
-            # 派生类别恒定跟随当前 genres 重算：归一后无类可派也要清掉
-            # 旧值，否则残留与 genres 不再对应的陈旧 categories
-            details["categories"] = cats
+            details["genres"] = select_tags(genres)
+        # ③ 类别行（badges）：归一 + 黑名单过滤 + 频率沉淀
+        badges = details.get("badges")
+        if isinstance(badges, list) and badges:
+            details["badges"] = filter_badges(badges)
         return details
     except Exception as e:
         _on_err(e)

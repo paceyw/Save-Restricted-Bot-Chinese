@@ -520,14 +520,16 @@ def _hashtag(text):
 
 
 def build_caption(details, max_len=1024):
-    """Caption v2（契约 Caption v2 节）：
+    """Caption 骨架（用户定稿 v3）：
 
-        DASS-629\n\n<intro>\n\n演员：#中文名…\n原名：#日文名…\n标签：#…\n类别：#…
+        DASS-629\n\n<intro>\n\n演员：#中文名 #日文名…\n标签：#…\n类别：#无码破解 #中文字幕…
 
-    四行 hashtag 行合成一个块（单换行），与简介之间空一行。骨架恒定
-    渲染：缺数据的行留空占位，便于手动补全。类别行 = badges +
-    categories 合并去重（badges 在前）。hashtag lines are trimmed from
-    the tail when the whole caption would exceed Telegram's 1024 limit.
+    三行 hashtag 行合成一个块（单换行），与简介之间空一行。骨架恒定
+    渲染：缺数据的行留空占位，便于手动补全。演员行 = 中文名 + 日文名
+    同行（同名去重）；标签行 = 内容标签（enrich 阶段按词库频率取
+    top-20）；类别行 = 有无码/字幕等版本标识（badges，经词库黑名单
+    过滤）。hashtag lines are trimmed from the tail when the whole
+    caption would exceed Telegram's 1024 limit.
     """
     def _uniq(seq):
         out = []
@@ -538,11 +540,14 @@ def build_caption(details, max_len=1024):
 
     code = (details.get("code") or "").strip()
     intro = (details.get("title") or "").strip()
-    actresses_cn = _uniq(t for t in (_hashtag(x) for x in details.get("actresses_cn") or []) if t)
-    actresses = _uniq(t for t in (_hashtag(x) for x in details.get("actresses") or []) if t)
+    # 演员行：中文名 + 日文名同行（同名去重；中文名在前）
+    actress_names = _uniq(
+        n.strip() for n in
+        [*(details.get("actresses_cn") or []), *(details.get("actresses") or [])]
+        if isinstance(n, str))
+    actresses = _uniq(t for t in (_hashtag(x) for x in actress_names) if t)
     genres = _uniq(t for t in (_hashtag(x) for x in details.get("genres") or []) if t)
     badges = _uniq(t for t in (_hashtag(x) for x in details.get("badges") or []) if t)
-    categories = _uniq(t for t in (_hashtag(x) for x in details.get("categories") or []) if t)
 
     if not code and not intro:
         return ""  # nothing to show: caller falls back to a bold title
@@ -553,15 +558,14 @@ def build_caption(details, max_len=1024):
     if intro:
         blocks.append(intro)
 
-    # 骨架留空（用户定稿）：四行结构恒定渲染，缺数据的行留空占位，
-    # 便于手动补全（与 /single /batch /merge 的自动排版骨架一致）
-    # 类别 = badges + categories 合并（badges 在前、去重）
-    cats = badges + [c for c in categories if c not in badges]
+    # 骨架留空（用户定稿）：三行结构恒定渲染，缺数据的行留空占位，
+    # 便于手动补全（与 /single /batch /merge 的自动排版骨架一致）。
+    # 演员 = 中文名 + 日文名同行；类别 = 有无码/字幕等版本标识（badges）；
+    # 标签 = 内容标签（enrich 阶段已按词库频率取 top-20）。
     tag_lines = [
-        "演员：" + " ".join(actresses_cn),
-        "原名：" + " ".join(actresses),
+        "演员：" + " ".join(actresses),
         "标签：" + " ".join(genres),
-        "类别：" + " ".join(cats),
+        "类别：" + " ".join(badges),
     ]
     blocks.append("\n".join(tag_lines))
 
@@ -571,8 +575,8 @@ def build_caption(details, max_len=1024):
     # hashtag lines carry a 「label：」prefix; trim their tails (keep the
     # label + one tag) until the caption fits Telegram's limit
     def is_tag_line(line):
-        return line.startswith(("演员：", "原名：", "标签：", "类别：",
-                                "演员:", "原名:", "标签:", "类别:"))
+        return line.startswith(("演员：", "标签：", "类别：",
+                                "演员:", "标签:", "类别:"))
 
     while len(render(blocks)) > max_len:
         tag_block_idx = next(

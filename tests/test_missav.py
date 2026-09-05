@@ -1275,12 +1275,11 @@ def test_build_caption_full_format():
         "badges": ["中文字幕"],
     }
     cap = missav.build_caption(d)
-    # caption v2：演员（中文名）/ 原名（日文名）分离为两行
+    # caption v3：演员行 = 中文名 + 日文名同行（同名去重）
     assert cap == (
         "DASS-629\n\n"
         "想不想被我饲养？实录\n\n"
-        "演员：#百永纱里奈 #千石桃香\n"
-        "原名：#百永さりな #千石もなか\n"
+        "演员：#百永纱里奈 #千石桃香 #百永さりな #千石もなか\n"
         "标签：#女同性恋 #潮吹 #多人运动\n"
         "类别：#中文字幕"
     )
@@ -1295,7 +1294,7 @@ def test_build_caption_sanitizes_and_keeps_blank_skeleton():
         "badges": ["无码"],
     }
     cap = missav.build_caption(d)
-    assert cap == "ABP-1\n\n演员：\n原名：#Sarina_Momonaga\n标签：\n类别：#无码"
+    assert cap == "ABP-1\n\n演员：#Sarina_Momonaga\n标签：\n类别：#无码"
 
 
 def test_build_caption_trims_to_telegram_limit():
@@ -1335,7 +1334,7 @@ def test_extract_video_details_release_date_and_genres_cap():
 
 
 def test_build_caption_ignores_studio_and_release_date():
-    # 用户定稿：caption 只保留 演员/原名/标签/类别 四行结构，片商与发行日期不渲染
+    # 用户定稿：caption 只保留 演员/标签/类别 三行结构，片商与发行日期不渲染
     # （javbus enrich 仍负责补中文名，studio/date 字段仅作数据保留）
     d = {
         "code": "DASS-629",
@@ -1351,8 +1350,7 @@ def test_build_caption_ignores_studio_and_release_date():
     assert cap == (
         "DASS-629\n\n"
         "想不想被我饲养？实录\n\n"
-        "演员：#桃永纱里奈\n"
-        "原名：#百永さりな\n"
+        "演员：#桃永纱里奈 #百永さりな\n"
         "标签：#苗条\n"
         "类别：#无码破解"
     )
@@ -1745,7 +1743,6 @@ def test_build_caption_blank_skeleton_from_sparse_details():
         "FC2-PPV-2761664\n\n"
         "【無码破解】FC2 作品标题 中文字幕\n\n"
         "演员：\n"
-        "原名：\n"
         "标签：\n"
         "类别：#无码破解 #中文字幕"
     )

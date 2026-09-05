@@ -35,6 +35,28 @@ class _Result:
     upserted_id = None
 
 
+class _FakeCursor:
+    """find() 链式游标最小面：sort/skip/limit + 迭代。"""
+
+    def __init__(self, docs):
+        self._docs = docs
+
+    def sort(self, key, direction):
+        self._docs.sort(key=lambda d: d.get(key) or 0, reverse=direction < 0)
+        return self
+
+    def skip(self, n):
+        self._docs = self._docs[n:]
+        return self
+
+    def limit(self, n):
+        self._docs = self._docs[:n]
+        return self
+
+    def __iter__(self):
+        return iter(self._docs)
+
+
 class FakeCol:
     """dict-backed 最小 mongo collection：find_one / update_one。"""
 
@@ -59,6 +81,15 @@ class FakeCol:
                 if isinstance(v, list) and value in v:
                     return doc
         return None
+
+    def find(self, query):
+        self._check()
+        self.calls.append(("find", dict(query)))
+        return _FakeCursor(list(self.rows.values()))
+
+    def count_documents(self, query):
+        self._check()
+        return len(self.rows)
 
     def update_one(self, query, update, upsert=False):
         self._check()
@@ -192,14 +223,13 @@ def test_positional_pairs_learned_into_dict(cols, monkeypatch):
     assert row is actress_row  # noqa: F841 — 别名仅保证上面断言读的是同一行
 
 
-# ─── genres 归一 + categories 派生 ─────────────────────────────────────────────
+# ─── genres 归一（词库选择）────────────────────────────────────────────────────
 
 def test_genres_normalized_and_categories_derived(cols, monkeypatch):
     _all_fail(monkeypatch)
     d = _details(title="t", genres=["中出し", "巨乳", "未知标签"])
     javbus.enrich_details(d, None)
-    assert d["genres"] == ["中出", "巨乳", "未知标签"]  # 别名归一，unknown 原样
-    assert d["categories"] == ["巨乳系", "中出·受孕"]  # SEED_CATEGORY_ORDER 序
+    assert d["genres"] == ["中出", "巨乳", "未知标签"]  # 别名归一，unknown 原样（同频保序）
 
 
 # ─── code_meta 快照：成功存 / 全失败补缺 ───────────────────────────────────────
@@ -212,7 +242,6 @@ def test_successful_enrich_saves_code_meta(cols, monkeypatch):
     assert snap["actresses_cn"] == ["百永纱里奈", "桃乃木かな"]
     assert snap["studio"] == "SOD create"
     assert snap["genres"] == ["中出", "巨乳"]
-    assert snap["categories"] == ["巨乳系", "中出·受孕"]
 
 
 def test_all_sources_fail_replays_snapshot_fill_only(cols, monkeypatch):
@@ -232,8 +261,7 @@ def test_all_sources_fail_replays_snapshot_fill_only(cols, monkeypatch):
     assert d["title"] == "自己的标题"  # 只补缺不覆盖
     assert d["studio"] == "已有片商"
     assert d["release_date"] == "2025-05-09"
-    assert d["genres"] == ["中出"]  # 补到的 genres 也过 classify
-    assert d["categories"] == ["中出·受孕"]
+    assert d["genres"] == ["中出"]  # 补到的 genres 也过 select_tags
 
 
 # ─── 库故障不响下载 ─────────────────────────────────────────────────────────────

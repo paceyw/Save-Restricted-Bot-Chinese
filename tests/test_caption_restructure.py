@@ -3,6 +3,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# utils.caption -> utils.missav -> config：config 导入期硬性要求这两个键，
+# 独立运行本文件时先置默认（与 test_missav 同款，保持 hermetic）。
+os.environ.setdefault("MASTER_KEY", "caption-restructure-test-master")
+os.environ.setdefault("IV_KEY", "caption-restructure-test-iv")
 caption = importlib.import_module('utils.caption')
 
 
@@ -58,8 +62,7 @@ def test_lowercase_code_normalized():
 
 def test_already_formatted_is_stable():
     """Re-forwarding a bot-generated caption must not mangle it."""
-    text = ("GVH-690\n\n标题简介\n\n演员：#小美\n原名：#Mei\n"
-            "标签：#巨乳\n类别：#中文字幕")
+    text = "GVH-690\n\n标题简介\n\n演员：#小美 #Mei\n标签：#巨乳\n类别：#中文字幕"
     out = caption.restructure_caption(text)
     assert out == text
 
@@ -76,7 +79,7 @@ def test_long_intro_truncated():
     assert len(out) <= 1024
     # six-line skeleton: intro truncated, then the fixed four label lines
     assert out.count("\n\n") == 2 and "…" in out
-    assert out.split("\n")[-4:] == ["演员：", "原名：", "标签：#测试", "类别："]
+    assert out.split("\n")[-3:] == ["演员：", "标签：#测试", "类别："]
 
 
 def test_code_inside_filename_detected():
@@ -85,13 +88,13 @@ def test_code_inside_filename_detected():
 
 
 def test_skeleton_keeps_empty_slots():
-    """All six lines + two blank separators, missing items as bare labels
+    """All skeleton lines + two blank separators, missing items as bare labels
     or empty lines so the user can fill them in by hand."""
     out = caption.restructure_caption("GVH-690 只有番号 #无码")
     lines = out.split("\n")
     assert lines[0] == "GVH-690"
     assert lines[2].startswith("只有番号")
-    assert lines[4:] == ["演员：", "原名：", "标签：#无码", "类别："]
+    assert lines[4:] == ["演员：", "标签：#无码", "类别："]
     assert out.count("\n\n") == 2
 
 
@@ -100,4 +103,4 @@ def test_skeleton_no_code_no_leading_blanks():
     assert not out.startswith("\n")
     lines = out.split("\n")
     assert lines[0] == "演员："
-    assert lines == ["演员：", "原名：", "标签：#痴女", "类别：#中文字幕"]
+    assert lines == ["演员：", "标签：#痴女", "类别：#中文字幕"]

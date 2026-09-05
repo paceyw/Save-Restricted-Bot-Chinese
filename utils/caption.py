@@ -1,7 +1,7 @@
 """Structured caption reformatting for forwarded messages (契约 Caption v2).
 
 When a /single /batch /merge source text already carries catalog-ish
-elements (JAV 番号, labelled 演员/原名/标签/类别 lines, bare hashtags),
+elements (JAV 番号, labelled 演员/标签/类别 lines, bare hashtags),
 reformat it into the missav caption v2 layout
 
     <番号>
@@ -9,7 +9,6 @@ reformat it into the missav caption v2 layout
     <原文剩余内容作为简介>
 
     演员：#中文名
-    原名：#日文名
     标签：#…
     类别：#…
 
@@ -26,7 +25,7 @@ import re
 from utils.missav import _hashtag
 
 # 旧双名格式：「中文名 (日文名)」（build_caption v2 之前的产物）
-_LEGACY_PAIR_RE = re.compile(r'(.+?)\s*\(([^()]+)\)$')
+_LEGACY_PAIR_SCAN = re.compile(r'([^\s、，,／/|·]+)\s*\(([^()]+)\)')
 
 # JAV 番号: 2-7 letters, dash, 2-5 digits — "GVH-690", "DASS-629".
 # The dash is REQUIRED: dashless forms ("gvh690") produce far too many
@@ -42,8 +41,6 @@ _CODE_BLACKLIST = {
     'H265', 'X264', 'X265', 'HEVC', 'AVC', 'AAC', 'FLAC', 'MP3',
 }
 _ACTRESS_LABELS = ('女主角', '演员', '演員', '出演', '主演', '女优', '女優', '主役', '女主')
-# 契约 v2：原名 行是独立字段（源语言名，日文为主），不再与 演员 行混同
-_ORIG_LABELS = ('原名',)
 _TAG_LABELS = ('标签', '標籤', 'tags', 'tag')
 _CAT_LABELS = ('类别', '類別', '分类', '分類', '类型', '類型', '题材', '題材', 'categories', 'category')
 
@@ -53,7 +50,6 @@ def _label_re(labels):
     return re.compile(r'^\s*(?:' + alts + r')\s*[：:=＝]\s*(.*)$', re.IGNORECASE)
 
 _ACTRESS_RE = _label_re(_ACTRESS_LABELS)
-_ORIG_RE = _label_re(_ORIG_LABELS)
 _TAG_RE = _label_re(_TAG_LABELS)
 _CAT_RE = _label_re(_CAT_LABELS)
 
@@ -97,8 +93,8 @@ def _find_code(text):
 def parse_details(text):
     """Extract caption ingredients from arbitrary forwarded text.
 
-    Returns the ``build_caption`` details dict (v2: 演员→actresses_cn,
-    原名→actresses, 标签→genres, 类别→badges), or ``None`` when nothing
+    Returns the ``build_caption`` details dict (演员→actresses_cn +
+    actresses[旧合并格式拆分], 标签→genres, 类别→badges), or ``None`` when nothing
     structured is present (callers then keep the original text).
     """
     if not text or not text.strip():
@@ -110,20 +106,21 @@ def parse_details(text):
     for line in text.splitlines():
         m = _ACTRESS_RE.match(line)
         if m:
-            # 兼容旧双名格式「中文名 (日文名)」：拆桶——括号内日文名归
-            # actresses（原名行），其余归 actresses_cn（演员行）
-            for item in _split_values(m.group(1)):
-                mm = _LEGACY_PAIR_RE.fullmatch(item.strip())
-                if mm:
-                    actresses_cn.append(mm.group(1))
-                    actresses.append(mm.group(2))
-                else:
-                    actresses_cn.append(item)
-            labelled = True
-            continue
-        m = _ORIG_RE.match(line)
-        if m:
-            actresses.extend(_split_values(m.group(1)))
+            # 兼容旧双名格式「中文名 (日文名)」：先挖出配对（括号内日文名
+            # 归 actresses），余量再按分隔符劈分归 actresses_cn（演员行）
+            pairs = {}
+
+            def _take_pair(mm):
+                pairs[mm.group(2).strip()] = mm.group(1).strip()
+                return " "
+
+            remainder = _LEGACY_PAIR_SCAN.sub(_take_pair, m.group(1))
+            for item in _split_values(remainder):
+                if item.strip():
+                    actresses_cn.append(item.strip())
+            for jp, cn in pairs.items():
+                actresses_cn.append(cn)
+                actresses.append(jp)
             labelled = True
             continue
         m = _TAG_RE.match(line)
@@ -184,7 +181,6 @@ def _render_skeleton(details, max_len=1024):
         <简介>
 
         演员：#中文名…
-        原名：#日文名…
         标签：#…
         类别：#…
 
@@ -193,9 +189,16 @@ def _render_skeleton(details, max_len=1024):
     """
     code = (details.get('code') or '').strip()
     intro = (details.get('title') or '').strip()
+    # 演员行：中文名 + 日文名同行（同名去重，中文名在前）
+    seen, names = set(), []
+    for n in [*(details.get('actresses_cn') or []),
+              *(details.get('actresses') or [])]:
+        n = (n or '').strip()
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
     tail = '\n'.join([
-        _hashtag_line('演员', details.get('actresses_cn') or []),
-        _hashtag_line('原名', details.get('actresses') or []),
+        _hashtag_line('演员', names),
         _hashtag_line('标签', details.get('genres') or []),
         _hashtag_line('类别', details.get('badges') or []),
     ])

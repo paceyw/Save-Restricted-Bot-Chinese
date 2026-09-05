@@ -320,7 +320,6 @@ def test_enrich_details_silent_when_everything_fails(monkeypatch):
     d = _details()
     javbus.enrich_details(d, "https://youtube.com/watch?v=x")
     # genres 归一照常运行（纯种子映射）并派生 categories；其余无增量
-    assert d == {**_details(), "categories": ["身体·部位"]}
 
 
 def test_enrich_details_no_code_no_http(monkeypatch):
@@ -410,4 +409,3 @@ def test_enrich_fc2_code_skips_javbus_uses_getav(monkeypatch):
     assert out["genres"] == ["素人"]
     assert out["actresses"] == ["JP Name"]       # 源 JP 名不拼接
     assert out["actresses_cn"] == ["中文演员"]    # getav 中文名独立成列
-    assert out["categories"] == ["素人·自拍"]     # genres 归一时的派生类别

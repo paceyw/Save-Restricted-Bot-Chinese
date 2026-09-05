@@ -267,8 +267,8 @@ def test_getav_details_feed_build_caption():
         details_movie(), "https://getav.net/zh/videos/cjod-159", family="raw")
     cap = missav.build_caption(d)
     assert cap.startswith("CJOD-159")
-    assert "演员：\n" in cap              # 无 zh 中文名：演员行留空占位
-    assert "原名：#妃月るい" in cap       # 日文名走原名行（v2）
+    assert "演员：#妃月るい" in cap       # v3：日文名直接进演员行
+    assert "原名：" not in cap            # 原名行已按用户裁决移除
     assert "标签：#肛交 #中出" in cap
     assert "类别：#中文字幕" in cap
 
