@@ -1,15 +1,16 @@
-"""Structured five-block caption reformatting for forwarded messages.
+"""Structured caption reformatting for forwarded messages (契约 Caption v2).
 
 When a /single /batch /merge source text already carries catalog-ish
-elements (JAV 番号, labelled 演员/标签/类别 lines, bare hashtags), reformat
-it into the missav five-block layout
+elements (JAV 番号, labelled 演员/原名/标签/类别 lines, bare hashtags),
+reformat it into the missav caption v2 layout
 
     <番号>
 
     <原文剩余内容作为简介>
 
-    演员：#… 
-    标签：#… 
+    演员：#中文名
+    原名：#日文名
+    标签：#…
     类别：#…
 
 so the user can fill the missing ones in by hand (per the 2026-08-15
@@ -24,6 +25,9 @@ import re
 
 from utils.missav import _hashtag
 
+# 旧双名格式：「中文名 (日文名)」（build_caption v2 之前的产物）
+_LEGACY_PAIR_RE = re.compile(r'(.+?)\s*\(([^()]+)\)$')
+
 # JAV 番号: 2-7 letters, dash, 2-5 digits — "GVH-690", "DASS-629".
 # The dash is REQUIRED: dashless forms ("gvh690") produce far too many
 # false positives in ordinary prose. Lookarounds keep the match off the
@@ -37,8 +41,9 @@ _CODE_BLACKLIST = {
     'EP', 'TV', 'PC', 'VR', 'NO', 'ID', 'ISBN', 'PART', 'VOL', 'TOP', 'H264',
     'H265', 'X264', 'X265', 'HEVC', 'AVC', 'AAC', 'FLAC', 'MP3',
 }
-
 _ACTRESS_LABELS = ('女主角', '演员', '演員', '出演', '主演', '女优', '女優', '主役', '女主')
+# 契约 v2：原名 行是独立字段（源语言名，日文为主），不再与 演员 行混同
+_ORIG_LABELS = ('原名',)
 _TAG_LABELS = ('标签', '標籤', 'tags', 'tag')
 _CAT_LABELS = ('类别', '類別', '分类', '分類', '类型', '類型', '题材', '題材', 'categories', 'category')
 
@@ -48,15 +53,16 @@ def _label_re(labels):
     return re.compile(r'^\s*(?:' + alts + r')\s*[：:=＝]\s*(.*)$', re.IGNORECASE)
 
 _ACTRESS_RE = _label_re(_ACTRESS_LABELS)
+_ORIG_RE = _label_re(_ORIG_LABELS)
 _TAG_RE = _label_re(_TAG_LABELS)
 _CAT_RE = _label_re(_CAT_LABELS)
 
 # bare hashtags in the leftover text: keep chars that Telegram hashtags
 # tolerate inside a word, stop at CJK/ASCII punctuation and whitespace
 _HASHTAG_RE = re.compile(r'#([^\s#,，.。:：;；!！?？~“”"\'()（）\[\]【】{}<>《》|/\\]+)')
-_VALUE_SPLIT_RE = re.compile(r'[\s、，,／/|·]+')
+_VALUE_SPLIT_RE = re.compile(r'[\s、，,／/|]+')
 
-# 简介 cap: leaves ~400 chars of budget for the three hashtag lines
+# 简介 cap: leaves ~400 chars of budget for the hashtag lines
 # inside Telegram's 1024 caption limit.
 _INTRO_MAX = 600
 
@@ -91,17 +97,31 @@ def _find_code(text):
 def parse_details(text):
     """Extract caption ingredients from arbitrary forwarded text.
 
-    Returns the ``build_caption`` details dict, or ``None`` when nothing
+    Returns the ``build_caption`` details dict (v2: 演员→actresses_cn,
+    原名→actresses, 标签→genres, 类别→badges), or ``None`` when nothing
     structured is present (callers then keep the original text).
     """
     if not text or not text.strip():
         return None
 
-    actresses, genres, badges = [], [], []
+    actresses, actresses_cn, genres, badges = [], [], [], []
     labelled = False
     kept_lines = []
     for line in text.splitlines():
         m = _ACTRESS_RE.match(line)
+        if m:
+            # 兼容旧双名格式「中文名 (日文名)」：拆桶——括号内日文名归
+            # actresses（原名行），其余归 actresses_cn（演员行）
+            for item in _split_values(m.group(1)):
+                mm = _LEGACY_PAIR_RE.fullmatch(item.strip())
+                if mm:
+                    actresses_cn.append(mm.group(1))
+                    actresses.append(mm.group(2))
+                else:
+                    actresses_cn.append(item)
+            labelled = True
+            continue
+        m = _ORIG_RE.match(line)
         if m:
             actresses.extend(_split_values(m.group(1)))
             labelled = True
@@ -135,6 +155,7 @@ def parse_details(text):
         'code': code,
         'title': '',
         'actresses': _dedup(actresses),
+        'actresses_cn': _dedup(actresses_cn),
         'genres': _dedup(genres),
         'badges': _dedup(badges),
     }
@@ -156,13 +177,14 @@ def _hashtag_line(label, values):
 
 
 def _render_skeleton(details, max_len=1024):
-    """Fixed skeleton — FIVE content lines with TWO blank separators:
+    """Fixed skeleton — SIX content lines with TWO blank separators:
 
         <番号>
 
         <简介>
 
-        演员：#…
+        演员：#中文名…
+        原名：#日文名…
         标签：#…
         类别：#…
 
@@ -172,7 +194,8 @@ def _render_skeleton(details, max_len=1024):
     code = (details.get('code') or '').strip()
     intro = (details.get('title') or '').strip()
     tail = '\n'.join([
-        _hashtag_line('演员', details.get('actresses') or []),
+        _hashtag_line('演员', details.get('actresses_cn') or []),
+        _hashtag_line('原名', details.get('actresses') or []),
         _hashtag_line('标签', details.get('genres') or []),
         _hashtag_line('类别', details.get('badges') or []),
     ])
@@ -193,7 +216,7 @@ def _render_skeleton(details, max_len=1024):
 
 
 def restructure_caption(text):
-    """Five-line skeleton caption for ``text``, or ``None`` to keep the
+    """Caption v2 skeleton for ``text``, or ``None`` to keep the
     original text (nothing structured detected / user oc override)."""
     details = parse_details(text)
     if details is None:

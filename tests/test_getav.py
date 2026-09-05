@@ -193,6 +193,7 @@ def test_extract_getav_details_full():
     assert d["code"] == "CJOD-159"
     assert d["title"] == "アナルとマ○コの両穴中出しOK 妃月るい"
     assert d["actresses"] == ["妃月るい"]        # deduped, blanks dropped
+    assert d["actresses_cn"] == []               # v2: 无 zh overlay 时不产出中文名
     assert d["genres"] == ["肛交", "中出"]       # dict + str mix, deduped
     assert d["badges"] == ["中文字幕"]           # zh subtitle track present
 
@@ -219,8 +220,9 @@ def test_extract_getav_details_prefers_zh_overlay():
             starsZh=["妃月琉衣"]),
         "https://getav.net/zh/videos/cjod-159", family="cn")
     assert d["title"] == "肛门和蜜穴双穴中出OK 贪求快感的淫乱女仆 妃月琉衣"
-    # zh actress first, Japanese star kept as secondary
-    assert d["actresses"] == ["妃月琉衣", "妃月るい"]
+    # v2 字段分离：zh 中文名 → actresses_cn，日文名留在 actresses
+    assert d["actresses_cn"] == ["妃月琉衣"]
+    assert d["actresses"] == ["妃月るい"]
 
 
 def test_augment_getav_zh_parses_page(monkeypatch):
@@ -265,7 +267,8 @@ def test_getav_details_feed_build_caption():
         details_movie(), "https://getav.net/zh/videos/cjod-159", family="raw")
     cap = missav.build_caption(d)
     assert cap.startswith("CJOD-159")
-    assert "演员：#妃月るい" in cap
+    assert "演员：\n" in cap              # 无 zh 中文名：演员行留空占位
+    assert "原名：#妃月るい" in cap       # 日文名走原名行（v2）
     assert "标签：#肛交 #中出" in cap
     assert "类别：#中文字幕" in cap
 

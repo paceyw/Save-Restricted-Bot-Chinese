@@ -452,13 +452,15 @@ _PANEL_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 def extract_video_details(page_html, url):
     """Parse the labelled info panel + og meta into caption ingredients.
 
-    Returns {'code','title','actresses','genres','badges','studio',
-    'release_date'} — every field degrades independently (page layout
-    changes must not break downloads). studio is never on the missav
-    panel; it starts empty and is filled by the JavBus enrichment.
+    Returns {'code','title','actresses','actresses_cn','genres','badges',
+    'studio','release_date'} — every field degrades independently (page
+    layout changes must not break downloads). studio is never on the
+    missav panel; it starts empty and is filled by the JavBus enrichment.
+    actresses keeps the panel's source-language names; actresses_cn
+    (契约 v2 中文名) starts empty here — javbus/词库 fills it.
     """
-    details = {"code": "", "title": "", "actresses": [], "genres": [],
-               "badges": [], "studio": "", "release_date": ""}
+    details = {"code": "", "title": "", "actresses": [], "actresses_cn": [],
+               "genres": [], "badges": [], "studio": "", "release_date": ""}
 
     code = _panel_plain(_panel_section(page_html, "code"))
     # 变体页的面板 code 带版本尾巴（如 ROYD-159-UNCENSORED-LEAK）：剥到纯番号
@@ -518,20 +520,29 @@ def _hashtag(text):
 
 
 def build_caption(details, max_len=1024):
-    """Five-block caption per issue #13 style:
+    """Caption v2（契约 Caption v2 节）：
 
-        DASS-629\n\n<intro>\n\n演员：#…\n标签：#…\n类别：#…
+        DASS-629\n\n<intro>\n\n演员：#中文名…\n原名：#日文名…\n标签：#…\n类别：#…
 
-    The hashtag lines form ONE block (single newlines) separated from
-    the intro by a blank line, matching the reference layout. Blocks
-    with no data are omitted; hashtag lines are trimmed from the tail
-    when the whole caption would exceed Telegram's 1024 limit.
+    四行 hashtag 行合成一个块（单换行），与简介之间空一行。骨架恒定
+    渲染：缺数据的行留空占位，便于手动补全。类别行 = badges +
+    categories 合并去重（badges 在前）。hashtag lines are trimmed from
+    the tail when the whole caption would exceed Telegram's 1024 limit.
     """
+    def _uniq(seq):
+        out = []
+        for item in seq:
+            if item and item not in out:
+                out.append(item)
+        return out
+
     code = (details.get("code") or "").strip()
     intro = (details.get("title") or "").strip()
-    actresses = [t for t in (_hashtag(x) for x in details.get("actresses") or []) if t]
-    genres = [t for t in (_hashtag(x) for x in details.get("genres") or []) if t]
-    badges = [t for t in (_hashtag(x) for x in details.get("badges") or []) if t]
+    actresses_cn = _uniq(t for t in (_hashtag(x) for x in details.get("actresses_cn") or []) if t)
+    actresses = _uniq(t for t in (_hashtag(x) for x in details.get("actresses") or []) if t)
+    genres = _uniq(t for t in (_hashtag(x) for x in details.get("genres") or []) if t)
+    badges = _uniq(t for t in (_hashtag(x) for x in details.get("badges") or []) if t)
+    categories = _uniq(t for t in (_hashtag(x) for x in details.get("categories") or []) if t)
 
     if not code and not intro:
         return ""  # nothing to show: caller falls back to a bold title
@@ -542,12 +553,15 @@ def build_caption(details, max_len=1024):
     if intro:
         blocks.append(intro)
 
-    # 骨架留空（用户定稿）：三行结构恒定渲染，缺数据的行留空占位，
+    # 骨架留空（用户定稿）：四行结构恒定渲染，缺数据的行留空占位，
     # 便于手动补全（与 /single /batch /merge 的自动排版骨架一致）
+    # 类别 = badges + categories 合并（badges 在前、去重）
+    cats = badges + [c for c in categories if c not in badges]
     tag_lines = [
-        "演员：" + " ".join(actresses),
+        "演员：" + " ".join(actresses_cn),
+        "原名：" + " ".join(actresses),
         "标签：" + " ".join(genres),
-        "类别：" + " ".join(badges),
+        "类别：" + " ".join(cats),
     ]
     blocks.append("\n".join(tag_lines))
 
@@ -557,8 +571,8 @@ def build_caption(details, max_len=1024):
     # hashtag lines carry a 「label：」prefix; trim their tails (keep the
     # label + one tag) until the caption fits Telegram's limit
     def is_tag_line(line):
-        return line.startswith(("演员：", "标签：", "类别：",
-                                "演员:", "标签:", "类别:"))
+        return line.startswith(("演员：", "原名：", "标签：", "类别：",
+                                "演员:", "原名:", "标签:", "类别:"))
 
     while len(render(blocks)) > max_len:
         tag_block_idx = next(
@@ -576,7 +590,18 @@ def build_caption(details, max_len=1024):
             break
         tag_lines[trimmable] = " ".join(tag_lines[trimmable].split(" ")[:-1])
         blocks[tag_block_idx] = "\n".join(tag_lines)
-    return render(blocks)[:max_len]
+    out = render(blocks)
+    if len(out) > max_len and len(blocks) >= 2:
+        # 兜底：标签行已全部收到「label + 单 tag」仍超长（如单个超长人名）
+        # 时压缩简介块，四行骨架的 label 恒定保留（定稿约定）。
+        tag_i = next((i for i, b in enumerate(blocks) if "\n" in b), None)
+        if tag_i:  # 简介（或番号）块位于 tag 块之前才可压
+            others = len(render([b for i, b in enumerate(blocks)
+                                 if i != tag_i and i != tag_i - 1]))
+            budget = max(max_len - others - 2 * (len(blocks) - 1) - 1, 1)
+            blocks[tag_i - 1] = blocks[tag_i - 1][:budget].rstrip() + "…"
+            out = render(blocks)
+    return out[:max_len]
 
 
 def extract_m3u8_url(html):
@@ -1130,11 +1155,35 @@ def fetch_getav_movie(url, hosts=GETAV_DEFAULT_MIRRORS):
     raise MissAVBlockedError(BLOCKED_MSG)
 
 
+# P0 收紧：劈分截断符从「。<」扩到「。，,；;」——简介里
+# 「主演：A、B，讲述…」以前会把整个叙述段抓进来，劈分出假演员。
+# 注：契约截断符列表里的「、」保留为劈分符而非截断符——截在、会把
+# 「主演：A、B」的 B 弄丢（多演员列表是主流格式）。
+_GETAV_ZH_STARS_RE = re.compile(r"主演[：:]([^<。，,；;]{2,60})")
 _GETAV_ZH_TITLE_RE = re.compile(
     r"<title>(.*?)</title>", re.DOTALL | re.IGNORECASE)
 _GETAV_ZH_DESC_RE = re.compile(
     r'<meta\s+name="description"\s+content="([^"]*)"', re.IGNORECASE)
-_GETAV_ZH_STARS_RE = re.compile(r"主演[：:]([^<。]{2,60})")
+# 白名单校验（第二道防线）：劈分后的每段必须像真实人名才收录。
+# 无数字/拉丁标点由纯 CJK 字符类一并排除；中隔点 · 是译名的一部分。
+_NARRATIVE_WORDS = ("讲述", "描写", "为您", "带来", "片中", "剧情", "作品",
+                    "出演", "是一位", "的", "了", "在", "和", "与", "及", "其")
+_CJK_NAME_RE = re.compile(r"^[\u3400-\u9fff·・]+$")
+
+
+def _looks_like_name(seg):
+    """True when a 主演 fragment plausibly is a person name.
+
+    strip 后 2–15 字、纯 CJK（允许中隔点 ·/・）、不含叙述词
+    （讲述/描写/为您/带来/片中/剧情/作品/出演/是一位/的/了/在/和/与/及/其）。
+    尽力而为的启发式：宁可漏收，绝不产出「讲述…」这类叙述残句。
+    """
+    name = (seg or "").strip().strip("·・").strip()
+    if not 2 <= len(name) <= 15:
+        return False
+    if not _CJK_NAME_RE.match(name):
+        return False
+    return not any(w in name for w in _NARRATIVE_WORDS)
 
 
 def _augment_getav_zh(data, url, hosts, api_host):
@@ -1171,7 +1220,10 @@ def _augment_getav_zh(data, url, hosts, api_host):
             data["descriptionZh"] = desc
         m = _GETAV_ZH_STARS_RE.search(desc)
         if m:
-            stars = [n.strip() for n in re.split(r"[、,，/]", m.group(1)) if n.strip()]
+            # 劈分（含空白，处理「A、B 讲述…」式粘连）后逐段过白名单；
+            # 过滤后非空才写入 starsZh
+            stars = [n for n in (s.strip() for s in re.split(r"[、,，/\s]+", m.group(1)))
+                     if _looks_like_name(n)]
             if stars:
                 data["starsZh"] = stars
     except Exception:
@@ -1292,14 +1344,16 @@ def getav_cover_url(data):
 
 
 def extract_getav_details(data, url, family=None):
-    """Movie JSON -> caption ingredients (same shape as missav details).
+    """Movie JSON -> caption ingredients (details dict v2 契约字段表).
 
     ``family`` is the chosen source family ('cn'/'uc'/'raw'/None) and
-    only badges the actually downloaded stream. ``titleZh``/``starsZh``
-    (the /zh page overlay, when available) take precedence over the
-    locale-fixed Japanese API fields.
+    only badges the actually downloaded stream. ``titleZh`` takes
+    precedence over the locale-fixed Japanese API title. v2 字段分离：
+    ``starsZh``（/zh 页中文演员）→ ``actresses_cn``；``stars``（API 源
+    语言名，日文为主）→ ``actresses``——不再混入/拼接。
     """
-    details = {"code": "", "title": "", "actresses": [], "genres": [], "badges": []}
+    details = {"code": "", "title": "", "actresses": [], "actresses_cn": [],
+               "genres": [], "badges": []}
 
     code = data.get("id") or (parse_getav_url(url) or {}).get("slug", "") or ""
     details["code"] = str(code).upper()
@@ -1316,12 +1370,6 @@ def extract_getav_details(data, url, family=None):
     details["title"] = title.strip()
 
     names = []
-    stars_zh = data.get("starsZh")
-    if isinstance(stars_zh, list):
-        for name in stars_zh:
-            name = str(name).strip()
-            if name and name not in names:
-                names.append(name)
     stars = data.get("stars")
     if isinstance(stars, list):
         for star in stars:
@@ -1330,6 +1378,15 @@ def extract_getav_details(data, url, family=None):
             if name and name not in names:
                 names.append(name)
     details["actresses"] = names
+
+    names_cn = []
+    stars_zh = data.get("starsZh")
+    if isinstance(stars_zh, list):
+        for name in stars_zh:
+            name = str(name).strip()
+            if name and name not in names_cn:
+                names_cn.append(name)
+    details["actresses_cn"] = names_cn
 
     genres = data.get("genres")
     if isinstance(genres, list):

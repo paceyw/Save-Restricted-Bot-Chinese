@@ -1,4 +1,4 @@
-"""Offline tests for the JavBus metadata enrichment (issue #21 D4+D5).
+"""Offline tests for the JavBus metadata enrichment (issue #21 D4 + av-dict v2).
 
 No network: ``javbus._http_get`` is monkeypatched with fixture-serving
 fakes, same convention as tests/test_missav.py. The missav /cn/ fallback
@@ -14,11 +14,14 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SRC))
 
 # utils.missav (lazily imported by the /cn/ fallback) pulls config, which
 # hard-requires these keys at import time — same defaults as test_missav.
 os.environ.setdefault("MASTER_KEY", "missav-test-master")
 os.environ.setdefault("IV_KEY", "missav-test-iv")
+
+from utils import avdict  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("javbus_mod", SRC / "utils" / "javbus.py")
 javbus = importlib.util.module_from_spec(spec)
@@ -32,6 +35,29 @@ class FakeResp:
         self.text = text
 
 
+class _DictCol:
+    """dict-backed 最小 mongo 桩：词库 seam 离线化（不做断言，只消音）。"""
+
+    def __init__(self):
+        self.rows = {}
+
+    def find_one(self, query):
+        return self.rows.get(query.get("_id"))
+
+    def update_one(self, query, update, upsert=False):
+        doc = self.rows.setdefault(query.get("_id"), {"_id": query.get("_id")})
+        for k, v in update.get("$set", {}).items():
+            doc[k] = v
+        for k, v in update.get("$setOnInsert", {}).items():
+            doc.setdefault(k, v)
+        for k, delta in update.get("$inc", {}).items():
+            doc[k] = doc.get(k, 0) + delta
+        for k, v in (update.get("$addToSet") or {}).items():
+            doc.setdefault(k, [])
+            if v not in doc[k]:
+                doc[k].append(v)
+
+
 @pytest.fixture(autouse=True)
 def _clean_cache():
     javbus._cache_clear()
@@ -39,8 +65,17 @@ def _clean_cache():
     javbus._cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _offline_avdict(monkeypatch):
+    """avdict 的 mongo seam 换成进程内桩：enrich 里的词库调用不碰网络。"""
+    col = _DictCol()
+    monkeypatch.setattr(avdict, "_cols", lambda: (col, col))
+    monkeypatch.setattr(avdict, "_code_col", lambda: col)
+
+
 # trimmed/reshaped from a real www.javbus.com movie page (2026-09):
 # labelled <p class="header"> rows + bigImage cover + /star/ actress links
+# (zh-CN 页 star 名为中文译名；无译名的保持假名)
 JAVBUS_PAGE = """
 <html><head><title>DASS-629 私に飼われてみない？ - JavBus</title></head><body>
 <div class="container">
@@ -63,7 +98,7 @@ JAVBUS_PAGE = """
    <a href="https://www.javbus.com/genre/e8">颜射</a>
   </p>
   <p><span class="header">演員:</span>
-   <a href="https://www.javbus.com/star/abc"><img src="a.jpg">百永さりな</a>
+   <a href="https://www.javbus.com/star/abc"><img src="a.jpg">百永纱里奈</a>
    <a href="https://www.javbus.com/star/def">桃乃木かな</a>
   </p>
  </div>
@@ -107,7 +142,7 @@ def test_fetch_javbus_meta_parses_all_fields(monkeypatch):
     assert meta["genres"] == ["苗条", "女同性恋", "潮吹", "多人运动", "单体作品", "巨乳"]
     assert meta["cover"] == "https://www.javbus.com/pics/cover/dass-629.jpg"
     # <img> inside the anchor must not leak into the name
-    assert meta["actresses"] == ["百永さりな", "桃乃木かな"]
+    assert meta["actresses"] == ["百永纱里奈", "桃乃木かな"]
 
 
 def test_fetch_javbus_meta_title_falls_back_to_title_tag(monkeypatch):
@@ -211,17 +246,6 @@ def test_lru_cache_does_not_stick_failures(monkeypatch):
     assert meta and meta["studio"] == "プレステージ"
 
 
-# ─── D5: dual-name formatting ──────────────────────────────────────────────────
-
-def test_pair_names_dual_single_and_shortfall():
-    assert javbus._pair_names(["百永さりな"], ["桃永紗里奈"]) == ["桃永紗里奈 (百永さりな)"]
-    # same name on both sites: keep the single original
-    assert javbus._pair_names(["百永さりな"], ["百永さりな"]) == ["百永さりな"]
-    # fewer CN names: leftover originals stay untouched
-    assert javbus._pair_names(
-        ["百永さりな", "千石もなか"], ["桃永紗里奈"]) == ["桃永紗里奈 (百永さりな)", "千石もなか"]
-
-
 # ─── enrich_details: wiring-level behaviour ────────────────────────────────────
 
 def _details(**over):
@@ -245,8 +269,9 @@ def test_enrich_details_fills_missing_fields_from_javbus(monkeypatch):
     assert out is d
     assert d["studio"] == "プレステージ"
     assert d["release_date"] == "2025-05-09"
-    # positional pairing: javbus name[0] equals the missav name -> single
+    # v2: JP source names untouched; javbus CN star names live in actresses_cn
     assert d["actresses"] == ["百永さりな"]
+    assert d["actresses_cn"] == ["百永纱里奈", "桃乃木かな"]
     # source-page genres are authoritative: never overwritten
     assert d["genres"] == ["苗条"]
 
@@ -269,7 +294,8 @@ def test_enrich_details_falls_back_to_missav_cn_page(monkeypatch):
     monkeypatch.setattr(javbus, "_http_get", fake_get)
     d = _details()
     javbus.enrich_details(d, "https://missav.ai/en/dass-629")
-    assert d["actresses"] == ["桃永紗里奈 (百永さりな)"]
+    assert d["actresses"] == ["百永さりな"]      # JP 名保持原样，不拼接
+    assert d["actresses_cn"] == ["桃永紗里奈"]   # missav /cn/ 探测的 CN 名
     assert d["studio"] == ""  # javbus blocked: no studio fill
 
 
@@ -283,6 +309,7 @@ def test_enrich_details_skips_cn_probe_for_cn_url(monkeypatch):
     d = _details()
     javbus.enrich_details(d, "https://missav.ai/cn/dass-629")
     assert d["actresses"] == ["百永さりな"]
+    assert "actresses_cn" not in d  # javbus 403 且 cn 页未探测：无 CN 名产出
 
 
 def test_enrich_details_silent_when_everything_fails(monkeypatch):
@@ -292,7 +319,8 @@ def test_enrich_details_silent_when_everything_fails(monkeypatch):
     monkeypatch.setattr(javbus, "_http_get", fake_get)
     d = _details()
     javbus.enrich_details(d, "https://youtube.com/watch?v=x")
-    assert d == _details()
+    # genres 归一照常运行（纯种子映射）并派生 categories；其余无增量
+    assert d == {**_details(), "categories": ["身体·部位"]}
 
 
 def test_enrich_details_no_code_no_http(monkeypatch):
@@ -352,7 +380,7 @@ def test_fetch_javbus_meta_same_host_redirect_accepted(monkeypatch):
 def test_enrich_fc2_code_skips_javbus_uses_getav(monkeypatch):
     """FC2：JavBus 必 404，直接走 getav 详情兜底（title/genres/演员填充）。
 
-    getav 中文名与 missav 日文名按位配对成「中文名 (日文名)」。
+    getav 中文名独立写入 actresses_cn，不再与 missav 日文名拼接。
     """
     import types
 
@@ -380,4 +408,6 @@ def test_enrich_fc2_code_skips_javbus_uses_getav(monkeypatch):
     assert javbus_calls == []                  # never hit javbus for FC2
     assert out["title"] == "FC2 中文标题"
     assert out["genres"] == ["素人"]
-    assert out["actresses"] == ["中文演员 (JP Name)"]
+    assert out["actresses"] == ["JP Name"]       # 源 JP 名不拼接
+    assert out["actresses_cn"] == ["中文演员"]    # getav 中文名独立成列
+    assert out["categories"] == ["素人·自拍"]     # genres 归一时的派生类别

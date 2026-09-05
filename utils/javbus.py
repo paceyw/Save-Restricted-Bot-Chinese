@@ -2,7 +2,7 @@
 # Licensed under the GNU General Public License v3.0.
 # See LICENSE file in the repository root for full license text.
 
-"""JavBus 资料补全（issue #21 D4）+ 演员 CN/JP 双名（D5）。
+"""JavBus 资料补全（issue #21 D4）+ 演员 CN/JP 分离与词库集成（v2）。
 
 :func:`fetch_javbus_meta` 抓取 ``https://www.javbus.com/{code}`` 影片页，
 尽力而为地解析标题、片商、发行日期、类型标签、封面大图与演员名。
@@ -12,9 +12,11 @@ Cloudflare 拦截、404、超时、解析失败一律返回 ``None``——单次
 
 :func:`enrich_details` 是下载管线的唯一入口：用 javbus 元数据补全
 caption 原料（studio / release_date / title / genres 只补缺不覆盖），
-并把演员列表升级为「中文名 (日文名)」。javbus 未命中演员名时最多
-再探测一次 missav ``/cn/`` 页（复用 :func:`utils.missav.extract_video_details`
-的既有解析）。任何异常都被吞掉并原样返回 ``details``——补全永不致
+中文演员名写入独立的 ``actresses_cn``（javbus CN star 名优先，missav
+``/cn/`` 页探测兜底）；``actresses`` 保留源 JP 名，不再拼接。序位对应
+的 jp/cn 对回写词库学习（:mod:`utils.avdict`），genres 归一为 CN 规范
+名并派生 ``categories``。成功补全后落 av_code 番号快照；网络源全失败
+时回放快照补缺。任何异常都被吞掉并原样返回 ``details``——补全永不致
 失败下载。
 
 测试约定与 ``utils/missav`` 相同：全部网络经由 :func:`_http_get`，
@@ -295,12 +297,13 @@ def fetch_javbus_meta(code):
 
 
 def enrich_details(details, url=None):
-    """caption 原料的最小侵入升级：javbus 补全 + 演员双名（永不抛出）。
+    """caption 原料的最小侵入升级：javbus 补全 + 词库集成（永不抛出）。
 
     D4: studio / release_date / title / genres 只补缺，不覆盖来源页
-    自己的解析结果。D5: 演员列表元素升级为「中文名 (日文名)」——
-    javbus 演员名优先；未命中且 ``url`` 非 cn 语言时再探测一次 missav
-    ``/cn/`` 页。失败静默返回原 ``details``。
+    自己的解析结果。v2: 中文演员名独立写入 ``actresses_cn``（javbus
+    演员名优先；未命中且 ``url`` 非 cn 语言时再探测一次 missav
+    ``/cn/`` 页），``actresses`` 保持源 JP 名。学习/归一/快照细节见
+    :func:`_enrich_details`。失败静默返回原 ``details``。
     """
     try:
         return _enrich_details(details, url)
@@ -474,8 +477,12 @@ def _enrich_details(details, url):
     if not isinstance(details, dict):
         return details
 
+    from utils import avdict  # 延迟导入：与 utils.missav 同款，加载期零依赖
+
     code = str(details.get("code") or "")
-    cn_names = []
+    cn_names = []   # 网络源提供的中文演员名（保序去重）
+    hit = False     # 任一网络源吐出 meta（区别于"全失败回放"路径）
+    gained = False  # 本次 enrich 对 details 有实际增量
     if code.upper().startswith("FC2"):
         # JavBus does not catalog FC2: getav usually carries the release
         # with full Chinese metadata; JavLibrary CN lists FC2 too.
@@ -489,40 +496,96 @@ def _enrich_details(details, url):
             meta = None
         if not meta:
             continue
+        contributed = False  # 本源真正补到东西才记为命中（仅封面页不算）
         if not details.get("title") and meta.get("title"):
             details["title"] = meta["title"]
+            gained = contributed = True
         if not details.get("genres") and meta.get("genres"):
             details["genres"] = list(meta["genres"][:GENRES_MAX])
+            gained = contributed = True
         if not details.get("studio") and meta.get("studio"):
             details["studio"] = meta["studio"]
+            gained = contributed = True
         if not details.get("release_date") and meta.get("release_date"):
             details["release_date"] = meta["release_date"]
+            gained = contributed = True
         for name in meta.get("actresses") or []:
             if name and name not in cn_names:
                 cn_names.append(name)
+                contributed = True
+        if contributed:
+            hit = True
         if details.get("genres") and details.get("actresses") and cn_names:
             break  # nothing left worth another network round
 
     if not cn_names and url:
         cn_names = _missav_cn_actresses(url)
 
-    actresses = details.get("actresses") or []
-    if cn_names and actresses:
-        details["actresses"] = _pair_names(actresses, cn_names)
+    # v2：中文名独立成列，不再与 JP 名拼接。javbus 提供的名排前，
+    # details 已有的 actresses_cn（getav starsZh 场景）去重并入尾部。
+    existing_cn = details.get("actresses_cn")
+    if not isinstance(existing_cn, list):
+        existing_cn = []
+    merged = []
+    for name in list(cn_names) + list(existing_cn):
+        name = name.strip() if isinstance(name, str) else ""
+        if name and name not in merged:
+            merged.append(name)
+    if merged:
+        details["actresses_cn"] = merged
+
+    # 词库读路径（对照）：源 JP 名在合并后的 cn 列表里没有对应中文名时，
+    # 查词库补——这是词库在生产里的主要消费点。
+    jps = [j for j in (details.get("actresses") or []) if isinstance(j, str)]
+    for jp in jps:
+        jp = jp.strip()
+        if not jp:
+            continue
+        cn = avdict.actress_cn(jp)
+        if cn and cn not in merged and cn != jp:
+            merged.append(cn)
+    if merged:
+        details["actresses_cn"] = merged
+
+    # 词库学习（写路径）：仅当两侧数量一致时才按位配对回写——跨站演员
+    # 排序不保证一致，长度不齐的 zip 会把错误映射永久写进词库；
+    # 两边同名说明该站没有中文译名，不算对照、不入库。
+    if cn_names and len(jps) == len(cn_names):
+        for jp, cn in zip(jps, cn_names):
+            jp = jp.strip()
+            cn = cn.strip()
+            if jp and cn and cn != jp:
+                avdict.record_actress(jp, cn, source="javbus")
+
+    # genres 归一为 CN 规范名 + 派生 categories
+    genres = details.get("genres")
+    if isinstance(genres, list) and genres:
+        tags, cats = avdict.classify(genres)
+        if tags:
+            gained = gained or tags != genres
+            details["genres"] = tags
+        if cats:
+            details["categories"] = cats
+
+    if code and not hit:
+        # 网络源全失败：回放番号快照，只补缺不覆盖；补到的 genres 也归一
+        snapshot = avdict.code_meta_load(code)
+        if snapshot:
+            for key, value in snapshot.items():
+                if not details.get(key):
+                    details[key] = value
+            replay = details.get("genres")
+            if isinstance(replay, list) and replay:
+                tags, cats = avdict.classify(replay)
+                if tags:
+                    details["genres"] = tags
+                if cats:
+                    details["categories"] = cats
+
+    if code and (gained or merged or details.get("categories")):
+        # 成功 enrich（有增量或 cn/分类非空）：落番号快照，供下次全失败回放
+        avdict.code_meta_save(code, details)
     return details
-
-
-def _pair_names(original, cn_names):
-    """['日文名'] + ['中文名'] -> ['中文名 (日文名)']；仅有单名保持原名。
-
-    Positional pairing: same code = same film, both sites bill actresses
-    in the same order. Extra names on either side keep their original.
-    """
-    out = []
-    for i, name in enumerate(original):
-        cn = cn_names[i] if i < len(cn_names) else ""
-        out.append(f"{cn} ({name})" if cn and cn != name else name)
-    return out
 
 
 def _missav_cn_actresses(url):
