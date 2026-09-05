@@ -1380,13 +1380,15 @@ def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
         {}, "surrit.com", [0]))
 
 
-def test_segment_404_raises_stale_immediately(monkeypatch, tmp_path):
-    """段 404 = 时敏令牌过期/分片缺失：同 URL 重试无意义，单次即抛
-    _SegmentStale 交由核心刷新播放列表（生产实案 ADN-538 段 156）。"""
+def test_segment_404_gets_dedicated_backoff_budget(monkeypatch, tmp_path):
+    """段 404（worldstatic 限流/瞬断伪装，ADN-538 段 659 实案）：独立
+    退避档（4 次尝试、退避上限 20s）扛住微窗口，仍 404 才抛
+    _SegmentStale 交由核心刷新播放列表。"""
     calls = {"n": 0}
+    sleeps = []
 
     async def fake_sleep(s):
-        pass
+        sleeps.append(s)
 
     def fake_get(url, headers=None, timeout=None, max_bytes=None):
         calls["n"] += 1
@@ -1398,8 +1400,32 @@ def test_segment_404_raises_stale_immediately(monkeypatch, tmp_path):
         asyncio.run(missav._download_one_segment(
             0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
             {}, "surrit.com", [0]))
-    assert calls["n"] == 1
+    assert calls["n"] == missav.SEGMENT_RETRIES_404
     assert ei.value.index == 0
+    # 退避覆盖：4/8/16s（cap 20），不是普通 8s 档
+    assert sleeps == [2, 4, 8]
+
+
+def test_segment_404_transient_recovers_same_url(monkeypatch, tmp_path):
+    """瞬态 404：第 2 次同 URL 请求 200 → 分片成功，无需刷新播放列表。"""
+    calls = {"n": 0}
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeResp(404), None
+        return FakeResp(content=b"data"), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    path = asyncio.run(missav._download_one_segment(
+        0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
+        {}, "surrit.com", [0]))
+    assert os.path.exists(path)
+    assert calls["n"] == 2
 
 
 def test_segment_502_gets_deep_backoff_budget(monkeypatch, tmp_path):
@@ -1756,7 +1782,8 @@ def test_build_caption_blank_skeleton_from_sparse_details():
 # ─── 404-stale 播放列表刷新（时敏令牌过期，生产实案 ADN-538）──────────────────
 
 def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
-    """段 404 → 刷新播放列表 → 新 URL 重下成功；已完成分片不重下。"""
+    """段 404 耗尽分片内预算 → 刷新播放列表 → 新 URL 重下成功；
+    已完成分片不重下；刷新间隔真实退避（30s 档，测试中 stub 掉）。"""
     key = os.urandom(16)
     media_sequence = 5
     parts = [os.urandom(188 * 40), os.urandom(188 * 40)]
@@ -1767,6 +1794,10 @@ def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
 
     seg0_state = {"n": 0}
     playlist_hits = {"n": 0}
+    refresh_sleeps = []
+
+    async def fake_sleep(s):
+        refresh_sleeps.append(s)
 
     def fake_get(url, headers=None, timeout=None, max_bytes=None):
         if url.endswith("prog.m3u8"):
@@ -1774,8 +1805,8 @@ def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
             return FakeResp(text=MEDIA), None
         if url.endswith("seg-0.ts"):
             seg0_state["n"] += 1
-            if seg0_state["n"] == 1:
-                return FakeResp(status=404), None  # 首次 404 → stale → 刷新
+            if seg0_state["n"] <= missav.SEGMENT_RETRIES_404:
+                return FakeResp(status=404), None  # 分片内预算耗尽 → stale → 刷新
             return FakeResp(content=enc_part(0, parts[0])), None
         if url.endswith("seg-1.ts"):
             seg1_seen.append(1)
@@ -1790,6 +1821,7 @@ def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
 
     seg1_seen = []
     monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
 
     dest = tmp_path / "out.mp4"
@@ -1797,8 +1829,9 @@ def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
         "https://missav.ai/sone-543", str(dest)))
     assert dest.exists()
     assert playlist_hits["n"] == 2        # 初始 + 1 次刷新
-    assert seg0_state["n"] == 2           # 新 URL 重下成功
+    assert seg0_state["n"] == missav.SEGMENT_RETRIES_404 + 1  # 新 URL 重下成功
     assert seg1_seen == [1]               # 已完成分片不重下
+    assert refresh_sleeps == [2, 4, 8, 30]  # 分片内退避 2/4/8 + 刷新间隔 30s
     with open(dest, "rb") as fh:
         assert fh.read() == parts[0] + parts[1]
 
@@ -1830,6 +1863,11 @@ def test_hls_refresh_exhausts_with_clear_error(monkeypatch, tmp_path):
         return FakeResp(status=404), None
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
 
     dest = tmp_path / "out.mp4"

@@ -62,7 +62,8 @@ _CHROME_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 SEGMENT_RETRIES = 3        # attempts per segment before failing the job
-MAX_PLAYLIST_REFRESH = 3   # 段 404 驱动的播放列表刷新上限（时敏令牌过期）
+SEGMENT_RETRIES_404 = 4    # 段 404 档：CDN 瞬断/限流伪装 404（实测分钟级窗口）
+MAX_PLAYLIST_REFRESH = 3   # 404 驱动的播放列表刷新上限，间隔退避 30/60/90s
 SEGMENT_RETRIES_RATE_LIMITED = 6   # extended budget while the CDN 429s us
 # 502/503/504 gateway brownouts are sustained ~1-2 minutes (edge/origin
 # outage observed live on worldstatic 2026-08-16): the deepest budget, so
@@ -1905,6 +1906,7 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
     across the job; exceeding MAX_TOTAL_BYTES aborts the whole download.
     """
     last_err = None
+    last_status = None
     max_attempts = SEGMENT_RETRIES
     attempt = 0
     while attempt < max_attempts:
@@ -1938,12 +1940,14 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
                     fh.write(data)
                 return path
         else:
+            last_status = status
             last_err = f"segment {index}: HTTP {status if status is not None else err}"
             if status == 404:
-                # 同 URL 重试 404 无意义（时敏令牌过期/分片缺失）：
-                # 立即上抛，由核心刷新播放列表换新 URL
-                raise _SegmentStale(index, last_err)
-            if status == 429:
+                # worldstatic 限流/瞬断会伪装成 404（生产实案 ADN-538 段
+                # 659：下载期 3 轮刷新均 404，数分钟后自愈 200）。同 URL
+                # 短退避重试先扛住微窗口；仍失败则上抛核心刷新播放列表
+                max_attempts = max(max_attempts, SEGMENT_RETRIES_404)
+            elif status == 429:
                 # a CDN rate-limit is sustained, not transient: switch to
                 # the long-backoff budget instead of failing the whole job
                 max_attempts = max(max_attempts, SEGMENT_RETRIES_RATE_LIMITED)
@@ -1952,8 +1956,12 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
                 # (exponential backoff capped at 60s spans the outage)
                 max_attempts = max(max_attempts, SEGMENT_RETRIES_SERVER_ERROR)
         if attempt < max_attempts:
-            cap = 60 if status in (429, 502, 503, 504) else 8
+            cap = 60 if status in (429, 502, 503, 504) else (
+                20 if status == 404 else 8)
             await asyncio.sleep(min(2 ** attempt, cap))
+    if last_status == 404:
+        # 404 档耗尽：交由核心刷新播放列表换新 URL 再试
+        raise _SegmentStale(index, last_err)
     raise MissAVError(f"片段 {index} 下载失败: {last_err}")
 
 
@@ -2114,6 +2122,9 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
                     f"片段 {idx} 刷新播放列表后仍 404（源站分片缺失或清单已整体过期），"
                     f"已刷新 {stale_refreshes} 次")
             stale_refreshes += 1
+            # 分钟级 404 窗口（worldstatic brownout）需要真实间隔，
+            # 否则 3 轮刷新几秒内连发毫无意义
+            await asyncio.sleep(min(30 * stale_refreshes, 90))
             await _report(total - len(failures), total, "refresh")
 
             playlist, playlist_url, master_url, subtitle_uri = await _resolve_media_playlist(
