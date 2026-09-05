@@ -577,3 +577,73 @@ def test_search_pick_avsea_dl_routes_to_mav_card(ytdl, monkeypatch):
     assert 42 in ytdl._MISSAV_PROMPTS
     # 卡片按推荐序重排：uc(无码破解) 在 raw 前
     assert [v[0] for v in ytdl._MISSAV_PROMPTS[42]["variants"]] == ["uc", "raw"]
+
+
+# ─── 搜索流外挂字幕开关（用户裁决：操作卡片可切换 -sub 语义）──────────────────
+
+def test_search_action_card_has_subtitle_toggle_off_by_default(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda code, hosts: (_search_results(ytdl, n=1), None))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ROYD-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    markup = prompt["card"].reply_markup
+    labels = [b.text for row in markup.buttons for b in row]
+    assert "🔥 外挂字幕：关" in labels
+    assert not prompt["want_subtitle"]
+
+
+def test_search_subtitle_toggle_flips_state(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda code, hosts: (_search_results(ytdl, n=1), None))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ROYD-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    toggle = _FakeQuery(42, f"srchact:{prompt['token']}:sub",
+                        _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, toggle))
+    assert prompt["want_subtitle"] is True
+    assert "外挂字幕：开" in prompt["card"].text
+    labels = [b.text for row in prompt["card"].reply_markup.buttons
+              for b in row]
+    assert "🔥 外挂字幕：开" in labels
+    # 返回搜索结果再选中：开关状态保留
+    back = _FakeQuery(42, f"srchact:{prompt['token']}:back",
+                      _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, back))
+    pick2 = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                       _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick2))
+    assert prompt["want_subtitle"] is True
+
+
+def test_search_dl_carries_subtitle_flag_to_enqueue(ytdl, monkeypatch):
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search",
+                        lambda code, hosts: (_search_results(ytdl, n=1), None))
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ROYD-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    toggle = _FakeQuery(42, f"srchact:{prompt['token']}:sub",
+                        _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, toggle))
+    state = _queue_state(monkeypatch)
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back|sub)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    assert state_tasks_want_subtitle(state) == [True]
+
+
+def state_tasks_want_subtitle(state):
+    return [t.get("want_subtitle") for t in state["created"]]

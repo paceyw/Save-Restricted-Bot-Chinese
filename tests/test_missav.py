@@ -1380,7 +1380,9 @@ def test_segment_429_gets_extended_backoff(monkeypatch, tmp_path):
         {}, "surrit.com", [0]))
 
 
-def test_segment_404_still_fails_fast(monkeypatch, tmp_path):
+def test_segment_404_raises_stale_immediately(monkeypatch, tmp_path):
+    """段 404 = 时敏令牌过期/分片缺失：同 URL 重试无意义，单次即抛
+    _SegmentStale 交由核心刷新播放列表（生产实案 ADN-538 段 156）。"""
     calls = {"n": 0}
 
     async def fake_sleep(s):
@@ -1392,11 +1394,12 @@ def test_segment_404_still_fails_fast(monkeypatch, tmp_path):
 
     monkeypatch.setattr(missav, "_http_get", fake_get)
     monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
-    with pytest.raises(missav.MissAVError, match="HTTP 404"):
+    with pytest.raises(missav._SegmentStale, match="HTTP 404") as ei:
         asyncio.run(missav._download_one_segment(
             0, "https://surrit.com/seg-0.ts", str(tmp_path), None, None,
             {}, "surrit.com", [0]))
-    assert calls["n"] == missav.SEGMENT_RETRIES  # no escalation on 404
+    assert calls["n"] == 1
+    assert ei.value.index == 0
 
 
 def test_segment_502_gets_deep_backoff_budget(monkeypatch, tmp_path):
@@ -1748,3 +1751,89 @@ def test_build_caption_blank_skeleton_from_sparse_details():
     )
 
 
+
+
+# ─── 404-stale 播放列表刷新（时敏令牌过期，生产实案 ADN-538）──────────────────
+
+def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
+    """段 404 → 刷新播放列表 → 新 URL 重下成功；已完成分片不重下。"""
+    key = os.urandom(16)
+    media_sequence = 5
+    parts = [os.urandom(188 * 40), os.urandom(188 * 40)]
+
+    def enc_part(i, data):
+        iv = (i + media_sequence).to_bytes(16, "big")
+        return _aes_crypt(_pkcs7(data), key, iv, encrypt=True)
+
+    seg0_state = {"n": 0}
+    playlist_hits = {"n": 0}
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("prog.m3u8"):
+            playlist_hits["n"] += 1
+            return FakeResp(text=MEDIA), None
+        if url.endswith("seg-0.ts"):
+            seg0_state["n"] += 1
+            if seg0_state["n"] == 1:
+                return FakeResp(status=404), None  # 首次 404 → stale → 刷新
+            return FakeResp(content=enc_part(0, parts[0])), None
+        if url.endswith("seg-1.ts"):
+            seg1_seen.append(1)
+            return FakeResp(content=enc_part(1, parts[1])), None
+        if url.endswith("enc.key"):
+            return FakeResp(content=key), None
+        if url.endswith("/sone-543"):
+            return FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")), None
+        if url.endswith("master.m3u8"):
+            return FakeResp(text=MASTER), None
+        return FakeResp(status=404), None
+
+    seg1_seen = []
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
+
+    dest = tmp_path / "out.mp4"
+    meta = asyncio.run(missav.download_missav(
+        "https://missav.ai/sone-543", str(dest)))
+    assert dest.exists()
+    assert playlist_hits["n"] == 2        # 初始 + 1 次刷新
+    assert seg0_state["n"] == 2           # 新 URL 重下成功
+    assert seg1_seen == [1]               # 已完成分片不重下
+    with open(dest, "rb") as fh:
+        assert fh.read() == parts[0] + parts[1]
+
+
+def test_hls_refresh_exhausts_with_clear_error(monkeypatch, tmp_path):
+    """分片真缺失：刷新 MAX_PLAYLIST_REFRESH 次后给出明确错误。"""
+    key = os.urandom(16)
+
+    def enc_part(i, data):
+        iv = (i + missav.SEGMENT_RETRIES).to_bytes(16, "big")
+        return _aes_crypt(_pkcs7(data), key, iv, encrypt=True)
+
+    playlist_hits = {"n": 0}
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        if url.endswith("prog.m3u8"):
+            playlist_hits["n"] += 1
+            return FakeResp(text=MEDIA), None
+        if url.endswith("seg-0.ts"):
+            return FakeResp(status=404), None  # 永远 404：真缺失
+        if url.endswith("seg-1.ts"):
+            return FakeResp(content=enc_part(1, b"x" * 188 * 40)), None
+        if url.endswith("enc.key"):
+            return FakeResp(content=key), None
+        if url.endswith("/sone-543"):
+            return FakeResp(text=_page_html("https://surrit.com/vid/master.m3u8")), None
+        if url.endswith("master.m3u8"):
+            return FakeResp(text=MASTER), None
+        return FakeResp(status=404), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav, "remux_to_mp4", _concat_aware_remux)
+
+    dest = tmp_path / "out.mp4"
+    with pytest.raises(missav.MissAVError, match="刷新播放列表后仍 404"):
+        asyncio.run(missav.download_missav(
+            "https://missav.ai/sone-543", str(dest)))
+    assert playlist_hits["n"] == 1 + missav.MAX_PLAYLIST_REFRESH

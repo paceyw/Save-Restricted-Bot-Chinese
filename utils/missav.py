@@ -62,6 +62,7 @@ _CHROME_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 SEGMENT_RETRIES = 3        # attempts per segment before failing the job
+MAX_PLAYLIST_REFRESH = 3   # 段 404 驱动的播放列表刷新上限（时敏令牌过期）
 SEGMENT_RETRIES_RATE_LIMITED = 6   # extended budget while the CDN 429s us
 # 502/503/504 gateway brownouts are sustained ~1-2 minutes (edge/origin
 # outage observed live on worldstatic 2026-08-16): the deepest budget, so
@@ -89,6 +90,20 @@ BLOCKED_MSG = (
 
 class MissAVError(Exception):
     """Generic missav download failure (page layout change, missing video…)."""
+
+
+
+
+class _SegmentStale(MissAVError):
+    """分段 404：同 URL 重试无意义，交由 _download_hls_core 刷新播放列表。
+
+    getav/missav 的 m3u8 常带时敏令牌：媒体清单过期后段 URL 集体失效
+    （生产实案 ADN-538 段 156 集体 404）。刷新清单换新 URL 才是正解。
+    """
+
+    def __init__(self, index, message=""):
+        super().__init__(message or f"片段 {index}: HTTP 404")
+        self.index = index
 
 
 class MissAVBlockedError(MissAVError):
@@ -1917,6 +1932,10 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
                 return path
         else:
             last_err = f"segment {index}: HTTP {status if status is not None else err}"
+            if status == 404:
+                # 同 URL 重试 404 无意义（时敏令牌过期/分片缺失）：
+                # 立即上抛，由核心刷新播放列表换新 URL
+                raise _SegmentStale(index, last_err)
             if status == 429:
                 # a CDN rate-limit is sustained, not transient: switch to
                 # the long-backoff budget instead of failing the whole job
@@ -2020,38 +2039,117 @@ async def _download_hls_core(m3u8_url, dest_path, referer_host, info, details,
 
     temp_dir = _tempfile.mkdtemp(prefix="missav_parts_", dir=dest_dir)
     try:
-        seg_urls = [_absolute(playlist_url, s.uri) for s in segments]
-        total = len(seg_urls)
+        # 分段阶段：404-stale（时敏令牌过期）驱动播放列表刷新，只补缺失
+        # 分片；AES 密钥或 media_sequence 轮换时废弃旧解密分片全部重下。
+        results = None
+        total = 0
+        old_media_sequence = media_sequence
         budget = [0]  # cumulative downloaded bytes (single-threaded loop)
-        results = [None] * total
-        queue = asyncio.Queue()
-        for i, u in enumerate(seg_urls):
-            queue.put_nowait((i, u))
-        done = 0
+        stale_refreshes = 0
 
-        async def worker():
-            nonlocal done
-            while True:
-                try:
-                    i, seg_url = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                path = await _download_one_segment(
-                    i, seg_url, temp_dir, key_bytes, iv_factory, headers,
-                    pinned_domain, budget,
+        while True:
+            seg_urls = [_absolute(playlist_url, s.uri) for s in segments]
+            if results is None:
+                total = len(seg_urls)
+                results = [None] * total
+            else:
+                # 刷新后按序号对位：已下载分片直接复用
+                new_total = len(seg_urls)
+                if new_total < total:
+                    raise MissAVError(
+                        f"刷新播放列表后片段数变少 ({total} -> {new_total})，"
+                        "源站内容已变更，中止")
+                results.extend([None] * (new_total - total))
+                total = new_total
+            missing = [i for i in range(total) if results[i] is None]
+            if not missing:
+                break
+
+            failures = []
+            done = total - len(missing)
+            queue = asyncio.Queue()
+            for i in missing:
+                queue.put_nowait((i, seg_urls[i]))
+
+            async def _worker():
+                nonlocal done
+                while True:
+                    try:
+                        i, seg_url = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        results[i] = await _download_one_segment(
+                            i, seg_url, temp_dir, key_bytes, iv_factory,
+                            headers, pinned_domain, budget,
+                        )
+                    except _SegmentStale as e:
+                        failures.append((i, e))
+                        continue
+                    done += 1
+                    await _report(done, total, "segments")
+
+            workers = [asyncio.create_task(_worker())
+                       for _ in range(max(1, concurrency))]
+            try:
+                await asyncio.gather(*workers)
+            except BaseException:
+                for t in workers:
+                    t.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                raise
+
+            if not failures:
+                break
+            if stale_refreshes >= MAX_PLAYLIST_REFRESH:
+                idx = failures[0][0]
+                raise MissAVError(
+                    f"片段 {idx} 刷新播放列表后仍 404（源站分片缺失或清单已整体过期），"
+                    f"已刷新 {stale_refreshes} 次")
+            stale_refreshes += 1
+            await _report(total - len(failures), total, "refresh")
+
+            playlist, playlist_url, master_url, subtitle_uri = await _resolve_media_playlist(
+                m3u8_url, headers, pinned_domain
+            )
+            segments = playlist.segments
+            if len(segments) > MAX_SEGMENTS:
+                raise MissAVError(f"片段数超上限 ({len(segments)} > {MAX_SEGMENTS})，疑似异常数据")
+            media_sequence = getattr(playlist, "media_sequence", 0) or 0
+            enc = playlist_encryption(playlist)
+            key_rotated = False
+            if enc:
+                key_url = _absolute(playlist_url, enc["uri"])
+                if not _host_allowed(key_url, pinned_domain):
+                    raise MissAVError(f"AES 密钥地址域校验失败: {urlparse(key_url).hostname}")
+                key_resp, kerr = await asyncio.to_thread(
+                    _http_get_retry, key_url, headers, PAGE_TIMEOUT, KEY_MAX_BYTES
                 )
-                results[i] = path
-                done += 1
-                await _report(done, total, "segments")
-
-        workers = [asyncio.create_task(worker()) for _ in range(max(1, concurrency))]
-        try:
-            await asyncio.gather(*workers)
-        except BaseException:
-            for t in workers:
-                t.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-            raise
+                if key_resp is None or key_resp.status_code != 200 or not key_resp.content:
+                    raise MissAVError(f"AES 密钥获取失败: {kerr or getattr(key_resp, 'status_code', '?')}")
+                if len(key_resp.content) != 16:
+                    raise MissAVError(f"AES 密钥长度异常 ({len(key_resp.content)} bytes)")
+                new_key = key_resp.content
+                key_rotated = (key_bytes is not None and new_key != key_bytes) or (
+                    media_sequence != old_media_sequence)
+                key_bytes = new_key
+                if enc["iv"]:
+                    iv_factory = lambda i: segment_iv(enc["iv"], i, media_sequence)
+                else:
+                    iv_factory = lambda i: segment_iv(None, i, media_sequence)
+            else:
+                key_bytes = None
+                iv_factory = None
+            old_media_sequence = media_sequence
+            if key_rotated:
+                # 密钥/序列轮换：旧解密分片与新密钥不可混用，全部作废重下
+                for r in results:
+                    if r and os.path.exists(r):
+                        try:
+                            os.remove(r)
+                        except OSError:
+                            pass
+                results = None  # 下一轮按新列表全量重建
 
         await _report(total, total, "merge")
         # review F1: the job slot frees at burn time, so concurrent tasks
