@@ -545,3 +545,35 @@ def test_missav_search_all_blocked_returns_error(ytdl, monkeypatch):
             status_code=403, text="Just a moment..."), None))
     results, err = ytdl._missav_search("SSIS-405", ("missav.ai",))
     assert results is None and "Cloudflare" in err
+
+
+def test_search_pick_avsea_dl_routes_to_mav_card(ytdl, monkeypatch):
+    """avsea 结果点下载：探测 原版/-uncensored 双版本 → 版本卡片（推荐序）。"""
+    _queue_state(monkeypatch)
+    monkeypatch.setattr(ytdl, "_missav_search", lambda code, hosts: ([], None))
+    monkeypatch.setattr(ytdl, "_getav_search", lambda code, hosts: ([], None))
+    monkeypatch.setattr(
+        ytdl, "_avsea_search",
+        lambda code: ([{"title": "A 无码",
+                        "href": "https://avsea.site/movies/royd-159-uncensored",
+                        "thumb": "", "badges": "无码破解",
+                        "source": "avsea"}], None))
+
+    def fake_discover(url):
+        # 同步桩：search_action_callback 经 asyncio.to_thread 调用
+        return [("raw", url.rsplit("-uncensored", 1)[0], "原版"),
+                ("uc", url, "无码破解")]
+
+    monkeypatch.setattr(ytdl, "discover_avsea_variants", fake_discover)
+    msg = _Card()
+    asyncio.run(ytdl.start_missav_search(msg, "ROYD-159"))
+    prompt = ytdl._SEARCH_PROMPTS[42]
+    pick = _FakeQuery(42, f"srch:{prompt['token']}:0",
+                      _re.compile(r"^srch:([0-9a-f]+):(\d+)$"))
+    asyncio.run(ytdl.search_pick_callback(None, pick))
+    act = _FakeQuery(42, f"srchact:{prompt['token']}:dl",
+                     _re.compile(r"^srchact:([0-9a-f]+):(dl|back)$"))
+    asyncio.run(ytdl.search_action_callback(None, act))
+    assert 42 in ytdl._MISSAV_PROMPTS
+    # 卡片按推荐序重排：uc(无码破解) 在 raw 前
+    assert [v[0] for v in ytdl._MISSAV_PROMPTS[42]["variants"]] == ["uc", "raw"]

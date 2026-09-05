@@ -24,6 +24,50 @@ Telegram 私域内容转发与媒体下载机器人 · 番号搜索 / 多版本�
 
 ---
 
+## 🔎 番号搜索与下载链路
+
+```mermaid
+flowchart TD
+    U["用户 /search 番号 或直发番号文本"] --> N["番号归一化<br/>FC2 / HEYZO / 纯数字 / 字母-数字"]
+    N --> S1["源1 missav<br/>/search/{code}（镜像轮换）"]
+    N --> S2["源2 getav<br/>/zh/search?q={code}"]
+    N --> S3["源3 avsea<br/>/search/{code}（/movies/ 结果）"]
+    S1 --> M["合并：跨源保留 + 轮插展示 ≤10 条<br/>（卡片标题显示各源条数）"]
+    S2 --> M
+    S3 --> M
+    M --> C1["搜索结果卡片<br/>封面 + [M]/[G]/[A] 来源标记 + badge + 翻页"]
+    C1 -->|选中结果| ACT["操作卡片"]
+    ACT -->|🌐 预览网页| WEB["浏览器打开原页面"]
+    ACT -->|⬇️ 下载| V
+    ACT -->|↩️ 返回搜索结果| C1
+    V["版本探测（每个来源各自探测）<br/>missav：4 候选页 + m3u8 流指纹比对防幻影<br/>avsea：-uncensored 姊妹页（硬 404 无幻影）<br/>getav：videoSources 多播放源"]
+    V -->|多版本| C2["版本卡片 ⭐组合>中字>无码>原版<br/>+ ⏬ 全部下载"]
+    V -->|单版本| Q
+    C2 --> Q
+    Q["任务队列：非-sub 优先<br/>烧录阶段释放并发槽（慢车道）"]
+    Q --> DL["HLS 下载：分段并发 + AES-128<br/>+ 分级重试 + 重定向最终 host 复验"]
+    DL --> R["默认：秒级 remux<br/>-sub：字幕轨/getav 官方字幕烧录（nice 降权）"]
+    R --> UP["相册投递：频道 → LOG_GROUP → 私聊"]
+```
+
+### 信息（元数据）补全链
+
+```mermaid
+flowchart LR
+    D["下载时详情补全（只补缺不覆盖，失败静默）"] --> J["JavBus（非FC2，中文）"]
+    D --> G["getav 详情（FC2 优先，zh 中文 overlay）"]
+    D --> L["JavLibrary CN（兜底）"]
+    D --> C["missav /cn/ 页演员（双名兜底）"]
+    J --> PA["演员双名：中文名 (日文名)"]
+    G --> PA
+    L --> PA
+```
+
+**多源语义**：三源结果轮插展示（同番号跨源保留——不同站是不同的流/版本选择）；版本探测各源独立；字幕优先级 missav HLS 字幕轨 > getav 官方 VTT（番号强匹配）；元数据只补缺（演员/标签/片商/日期），avsea 暂为搜索发现源（页面 m3u8 非标准格式，bot 下载适配待后续）。
+
+---
+
+## 🚀 快速部署
 ## 🚀 快速部署
 
 前置：Docker 24+ 与 Docker Compose v2；在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 `BOT_TOKEN`，在 [my.telegram.org](https://my.telegram.org) 拿到 `API_ID` / `API_HASH`。

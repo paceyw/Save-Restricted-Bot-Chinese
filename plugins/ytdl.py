@@ -415,7 +415,7 @@ async def dl_handler(client, message):
     # pasted (single-version pages keep the direct-enqueue path; a blocked
     # probe degrades to the pasted page alone inside discover_missav_variants).
     if is_avsea_url(url):
-        variants = await discover_avsea_variants(url)
+        variants = await asyncio.to_thread(discover_avsea_variants, url)
         if len(variants) > 1:
             await _send_missav_card(message, user_id, url, want_subtitle, variants)
             return
@@ -1162,9 +1162,13 @@ async def search_action_callback(client, query):
         pass
     if not picked:
         return
-    await _edit_search_card(prompt, f"✅ 已选择：{picked['title'][:80]}")
+    await _edit_search_card(
+        prompt,
+        f"✅ 已选择：{picked['title'][:80]}\n"
+        f"来源：{picked.get('source', 'missav')}\n⏳ 正在获取版本信息…",
+    )
     if picked.get("source") == "avsea":
-        variants = await discover_avsea_variants(picked["href"])
+        variants = await asyncio.to_thread(discover_avsea_variants, picked["href"])
         if len(variants) > 1:
             await _send_missav_card(prompt["message"], uid, picked["href"],
                                     False, variants)
