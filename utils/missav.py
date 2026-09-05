@@ -1943,10 +1943,21 @@ async def _download_one_segment(index, seg_url, temp_dir, key, iv_factory,
             last_status = status
             last_err = f"segment {index}: HTTP {status if status is not None else err}"
             if status == 404:
-                # worldstatic 限流/瞬断会伪装成 404（生产实案 ADN-538 段
-                # 659：下载期 3 轮刷新均 404，数分钟后自愈 200）。同 URL
-                # 短退避重试先扛住微窗口；仍失败则上抛核心刷新播放列表
+                # worldstatic 的 404 有两种形态（ADN-538 连续三案实锤）：
+                # ① 瞬态 404（限流/微窗口）——同 URL 短退避即愈；
+                # ② Cloudflare 边缘粘性 404：源站曾瞬时 404 一次，被 CF
+                #    按 cache-control: max-age=1y 缓存（cf-cache-status:
+                #    HIT, age 天级, body 空），该 URL 从此永远 404——
+                #    换令牌/刷新清单均无效，唯一解是加随机 query 穿透
+                #    缓存键直回源站（实测 cf=MISS 200）。
+                # 第 2 次尝试起启用穿透；bust 值每次唯一（防 busted URL
+                # 自身又被缓存）。仍失败则上抛核心刷新播放列表兜底。
                 max_attempts = max(max_attempts, SEGMENT_RETRIES_404)
+                if attempt >= 2:
+                    seg_url = (
+                        f"{seg_url}{'&' if '?' in seg_url else '?'}"
+                        f"_cfbust={time.monotonic_ns()}"
+                    )
             elif status == 429:
                 # a CDN rate-limit is sustained, not transient: switch to
                 # the long-backoff budget instead of failing the whole job

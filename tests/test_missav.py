@@ -1803,10 +1803,10 @@ def test_hls_refresh_recovers_stale_segment(monkeypatch, tmp_path):
         if url.endswith("prog.m3u8"):
             playlist_hits["n"] += 1
             return FakeResp(text=MEDIA), None
-        if url.endswith("seg-0.ts"):
+        if "/seg-0.ts" in url:  # 兼容 bust 参数形态（...seg-0.ts?_cfbust=…）
             seg0_state["n"] += 1
             if seg0_state["n"] <= missav.SEGMENT_RETRIES_404:
-                return FakeResp(status=404), None  # 分片内预算耗尽 → stale → 刷新
+                return FakeResp(status=404), None  # 分片内预算（含 bust）耗尽 → stale → 刷新
             return FakeResp(content=enc_part(0, parts[0])), None
         if url.endswith("seg-1.ts"):
             seg1_seen.append(1)
@@ -1875,3 +1875,56 @@ def test_hls_refresh_exhausts_with_clear_error(monkeypatch, tmp_path):
         asyncio.run(missav.download_missav(
             "https://missav.ai/sone-543", str(dest)))
     assert playlist_hits["n"] == 1 + missav.MAX_PLAYLIST_REFRESH
+
+
+def test_segment_sticky_cf_404_bypassed_by_cache_bust(monkeypatch, tmp_path):
+    """CF 边缘粘性 404（cf-cache-status: HIT 空体）：第 3 次尝试起加
+    唯一 _cfbust 参数穿透缓存键直回源站（生产实案 ADN-538 段 30：
+    age 2.5 天的缓存 404，bust 后 cf=MISS 200）。"""
+    calls = []
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls.append(url)
+        if "_cfbust=" in url:
+            return FakeResp(content=b"fresh-from-origin"), None
+        return FakeResp(404), None  # 原始 URL 永远缓存 404
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    path = asyncio.run(missav._download_one_segment(
+        7, "https://static.worldstatic.com/seg-7.woff2?e=2095210937",
+        str(tmp_path), None, None, {}, "worldstatic.com", [0]))
+    with open(path, "rb") as fh:
+        assert fh.read() == b"fresh-from-origin"
+    # 前 2 次原样重试（扛瞬态），第 3 次起 bust（每次值唯一）
+    assert len(calls) == 3
+    assert "_cfbust=" not in calls[0] and "_cfbust=" not in calls[1]
+    assert "_cfbust=" in calls[2] and calls[2].startswith(
+        "https://static.worldstatic.com/seg-7.woff2?e=2095210937&")
+
+
+def test_segment_bust_values_unique_when_origin_also_404(monkeypatch, tmp_path):
+    """bust 后源站仍 404：每次 bust 值必须唯一（否则 busted URL 也会被
+    CF 缓存成粘性 404），耗尽后抛 _SegmentStale 走清单刷新兜底。"""
+    calls = []
+
+    async def fake_sleep(s):
+        pass
+
+    def fake_get(url, headers=None, timeout=None, max_bytes=None):
+        calls.append(url)
+        return FakeResp(404), None
+
+    monkeypatch.setattr(missav, "_http_get", fake_get)
+    monkeypatch.setattr(missav.asyncio, "sleep", fake_sleep)
+    with pytest.raises(missav._SegmentStale):
+        asyncio.run(missav._download_one_segment(
+            0, "https://static.worldstatic.com/seg-0.woff2",
+            str(tmp_path), None, None, {}, "worldstatic.com", [0]))
+    busted = [u for u in calls if "_cfbust=" in busted] if False else \
+        [u for u in calls if "_cfbust=" in u]
+    assert len(busted) == missav.SEGMENT_RETRIES_404 - 2  # 第 3 次起全部 bust
+    assert len(set(busted)) == len(busted)                 # 值唯一

@@ -288,7 +288,7 @@ flowchart LR
 
 - **通用 HLS 核心**：missav / getav / avsea 三站共用同一下载核心——页面解析取 m3u8 → 主清单变体选择 → 分段并发下载（AES-128 解密）→ ffconcat 直读分片封装（无 merged.ts 中间拷贝）。资源守卫：20k 段 / 20GB / 8 小时 / 磁盘水位双检查 / 重定向最终 host 复验
 - **镜像轮换**：发送 host 优先 → 其余镜像（missav 5 站含 avsea）；403/CF 拦截自动切换；502/503/504 深重试预算（8 次指数退避）
-- **404 brownout 自愈**：分段 404（worldstatic 限流/瞬断伪装 404，ADN-538 段 659 实案）走独立退避档（4 次尝试、上限 20s）扛微窗口 → 仍 404 上抛 → 核心刷新媒体清单（间隔退避 30/60/90s，覆盖分钟级窗口）只补缺失分片（AES 密钥/序列轮换时废弃旧解密分片全量重下），真缺失给出明确错误
+- **404 分级自愈**：① 瞬态 404 同 URL 短退避（2/4/8s）；② **Cloudflare 边缘粘性 404**（源站瞬时 404 被 CF 按 max-age=1y 缓存，该 URL 永久 404，ADN-538 三连案实锤 cf-cache-status: HIT/age 天级/空体）→ 加唯一 `_cfbust` 随机参数穿透缓存键直回源站（实测 cf=MISS 200）；③ 仍 404 才刷新媒体清单（间隔退避 30/60/90s）只补缺失分片（AES 密钥/序列轮换时废弃旧解密分片全量重下）
 - **队列慢车道**：烧录类任务下载完成即释放 `MISSAV_MAX_JOBS` 槽，烧录由 `BURN_CONCURRENCY` 独立约束；worker 出队非-sub 优先——快任务永不排队等慢任务
 - **烧录**：`superfast/CRF19/源分辨率`，ffmpeg `nice 19 + ionice idle` 降权；字幕来源优先级 missav HLS 字幕轨 > getav 官方 VTT（番号边界强匹配）；中字版自带烧录字幕的不二次烧录
 - **幻影版本防护**：missav 对未知 slug 后缀会返回基础视频的可播放页（幻影别名）；版本探测以 **m3u8 流指纹（per-video UUID）必须不同于基础页**为准，指纹相同一律剔除
@@ -396,7 +396,7 @@ flowchart LR
 │   ├── avdict_seed.py   # 词库种子：117 条标签别名表（运行时以库为准）
 │   ├── javbus.py        # JavBus/JavLibrary 元数据补全（尽力而为，LRU）
 │   ├── func.py encrypt.py health.py caption.py custom_filters.py logging_setup.py ratelimit.py
-├── tests/               # 640 项 pytest 离线回归
+├── tests/               # 642 项 pytest 离线回归
 └── templates/welcome.html
 ```
 
