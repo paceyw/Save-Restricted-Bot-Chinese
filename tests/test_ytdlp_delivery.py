@@ -230,7 +230,7 @@ def test_finalize_uploads_to_resolved_target_not_request_chat(ytdl_env, tmp_path
     custom = _Recorder("custom-bot")
 
     async def fake_resolve(message):
-        return -100999, custom
+        return -100999, custom, 12
 
     async def fake_metadata(path):
         return {"duration": 61, "width": 1280, "height": 720}
@@ -260,6 +260,7 @@ def test_finalize_uploads_to_resolved_target_not_request_chat(ytdl_env, tmp_path
 
     # video went to the resolved channel via the custom bot
     assert custom.videos and custom.videos[0][0] == -100999
+    assert custom.videos[0][1]["reply_to_message_id"] == 12
     cap = custom.videos[0][1]["caption"]
     assert cap.startswith("**Title**") and "标签：#a" in cap
     # progress stayed in the requesting chat via the main bot
@@ -274,7 +275,7 @@ def test_finalize_without_channel_target_behaves_as_before(ytdl_env, tmp_path):
     main_bot = _Recorder("main-bot")
 
     async def fake_resolve(message):
-        return message.chat.id, main_bot
+        return message.chat.id, main_bot, None
 
     async def fake_metadata(path):
         return {"duration": 1, "width": 2, "height": 3}
@@ -295,6 +296,41 @@ def test_finalize_without_channel_target_behaves_as_before(ytdl_env, tmp_path):
 
     asyncio.run(scenario())
     assert main_bot.videos and main_bot.videos[0][0] == 42
+
+
+def test_hls_album_preserves_topic_target(ytdl_env, tmp_path):
+    ytdl = ytdl_env.ytdl
+    video = tmp_path / "hls.mp4"
+    video.write_bytes(b"v")
+    captured = {}
+
+    class Sender:
+        async def send_media_group(self, chat, group, **kwargs):
+            captured["chat"] = chat
+            captured["kwargs"] = kwargs
+
+    class Notice:
+        async def delete(self):
+            return None
+
+    class MainBot:
+        async def send_message(self, chat, text):
+            return Notice()
+
+    async def fake_metadata(path):
+        return {"duration": 9, "width": 16, "height": 9}
+
+    ytdl.app = MainBot()
+    ytdl.get_video_metadata = fake_metadata
+    ytdl._build_album_group = lambda *args: ["album"]
+
+    asyncio.run(ytdl._upload_missav_album(
+        Sender(), -100999, 42, str(video), None, "CAP", 9, 16, 9,
+        reply_to_message_id=77,
+    ))
+
+    assert captured["chat"] == -100999
+    assert captured["kwargs"]["reply_to_message_id"] == 77
 
 
 def test_split_upload_routes_parts_and_progress_separately(ytdl_env, tmp_path):

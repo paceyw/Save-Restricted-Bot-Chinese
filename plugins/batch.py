@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 import asyncio
 import time
@@ -13,7 +12,6 @@ from plugins.tasks import (
     _MAX_QUEUE, create_task, enqueue_task, get_queue_size, get_user_tasks,
     request_cancel_tasks,
 )
-from plugins.start import subscribe as sub
 from utils.custom_filters import login_in_progress
 
 pending_flows = {}
@@ -56,7 +54,6 @@ async def process_cmd(c, m):
         await m.reply_text("此机器人不提供免费服务，请向管理员订阅")
         return
     
-    if await sub(c, m) == 1: return
     pro = await m.reply_text('正在进行检查，请稍候...')
 
     qsize = get_queue_size(uid)

@@ -65,6 +65,11 @@ def _load_settings_module(monkeypatch):
     func.get_user_data_key = None
     func.save_user_data = None
     func.bump_cred_epoch = lambda _uid: None
+    func.parse_delivery_chat = lambda value: (
+        int(value.strip().split('/', 1)[0]),
+        int(value.strip().split('/', 1)[1])
+        if '/' in value and value.strip().split('/', 1)[1] else None,
+    )
     monkeypatch.setitem(sys.modules, "utils.func", func)
 
     plugins = types.ModuleType("plugins")
@@ -111,6 +116,27 @@ def test_rename_file_uses_snapshot_settings(monkeypatch, tmp_path):
 
     assert result.endswith("/bar TAG.mp4")
     assert renamed == [(str(source), result)]
+
+
+def test_setchat_accepts_topic_and_normalizes_input(monkeypatch):
+    module = _load_settings_module(monkeypatch)
+    saved = {}
+
+    async def save_user_data(user_id, key, value):
+        saved[(user_id, key)] = value
+
+    class Message:
+        text = " -1001234567890 / 77 "
+
+        async def reply_text(self, text):
+            self.reply = text
+
+    monkeypatch.setattr(module, "save_user_data", save_user_data)
+    message = Message()
+    asyncio.run(module.handle_setchat(message, 42))
+
+    assert saved[(42, "chat_id")] == "-1001234567890/77"
+    assert "设置成功" in message.reply
 
 def test_settings_callback_filter_scoped_to_own_buttons(monkeypatch):
     """The settings callback handler must NOT swallow foreign callbacks.

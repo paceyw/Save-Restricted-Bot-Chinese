@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 import time
 import os
@@ -101,6 +100,25 @@ def get_display_name(user):
 
 def sanitize_filename(filename):
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+
+def parse_delivery_chat(value):
+    """Parse ``-100chat`` or ``-100chat/topic`` into normalized integers.
+
+    Raises ValueError for malformed values so a typo can never silently
+    reroute downloaded media to the requester's private chat.
+    """
+    compact = str(value or '').strip().replace(' ', '')
+    if not compact or compact.count('/') > 1:
+        raise ValueError('invalid delivery chat')
+    chat_part, sep, topic_part = compact.partition('/')
+    chat_id = int(chat_part)
+    topic_id = int(topic_part) if sep and topic_part else None
+    if chat_id >= 0:
+        raise ValueError('delivery chat must be negative')
+    if topic_id is not None and topic_id < 0:
+        raise ValueError('topic id must be non-negative')
+    return chat_id, topic_id
 
 
 def get_dummy_filename(info):
@@ -412,14 +430,6 @@ def task_downloads_dir(task_id, create=True):
     if create:
         os.makedirs(path, exist_ok=True)
     return path
-def cleanup_task_downloads(task_id):
-    """Remove a finished task's scratch dir. Idempotent and never raises —
-    the last-resort net above every per-file cleanup path, so cancellation
-    or a crash mid-upload cannot leak the dir."""
-    path = task_downloads_dir(task_id, create=False)
-    shutil.rmtree(path, ignore_errors=True)
-
-
 def cleanup_task_downloads(task_id):
     """Remove a finished task's scratch dir. Idempotent and never raises —
     the last-resort net above every per-file cleanup path, so cancellation

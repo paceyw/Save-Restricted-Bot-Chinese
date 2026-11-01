@@ -1,10 +1,8 @@
 {
   "name": "Save Restricted Content Bot v3",
-  "description": "Save Restricted Content Bot by Team SPY",
-  "logo": "https://lh3.googleusercontent.com/-HPcn7AqepNg/AAAAAAAAAAI/AAAAAAAAAAA/ALKGfknb1BkQiq-8_KUVOYcNAJ4swKivDQ/photo.jpg",
+  "description": "Telegram private-content transfer and media download bot",
   "keywords": ["python3", "telegram", "MusicBot", "telegram-bot", "pyrogram"],
-  "repository": "https://github.com/devgaganin/save_restricted-content-telegram-bot-repo",
-  "success_url": "https://devgagan.in",
+  "repository": "https://github.com/paceyw/Save-Restricted-Bot-Chinese",
   "env": {
     "API_ID": {
       "description": "Get this value from https://my.telegram.org",
@@ -41,11 +39,6 @@
       "value": "",
       "required": false
     },
-    "FORCE_SUB": {
-      "description": "Channel ID (with -100 prefix) for forced subscription",
-      "value": "-10012345567",
-      "required": true
-    },
     "LOG_GROUP": {
       "description": "Log channel/group ID (with -100 prefix) where the bot will send logs",
       "value": "-1001234456",
@@ -53,13 +46,13 @@
     },
     "MASTER_KEY": {
       "description": "Master key used for session encryption",
-      "value": "gK8HzLfT9QpViJcYeB5wRa3DmN7P2xUq",
-      "required": false
+      "value": "",
+      "required": true
     },
     "IV_KEY": {
       "description": "Initialization vector key for decryption",
-      "value": "s7Yx5CpVmE3F",
-      "required": false
+      "value": "",
+      "required": true
     },
     "YT_COOKIES": {
       "description": "Cookies for YouTube downloads (in Netscape format)",
@@ -83,12 +76,7 @@
     },
     "ADMIN_CONTACT": {
       "description": "type admin contact link",
-      "value": "https://t.me/kingofpatal",
-      "required": true
-    },
-    "JOIN_LINK": {
-      "description": "type join channel link which comes on /start",
-      "value": "https://t.me/team_spy_pro",
+      "value": "",
       "required": true
     }
   },

@@ -1,13 +1,11 @@
-# Copyright (c) 2025 Gagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 from shared_client import app
 from datetime import timedelta
 from config import OWNER_ID, PAY_NOTICE
 from utils.func import add_premium_user
 from pyrogram import filters
-from plugins.start import subscribe
 
 
 @app.on_message(filters.command("add") & filters.private)
@@ -58,7 +56,4 @@ async def add_premium_handler(client, message):
 
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    subscription_status = await subscribe(client, message)
-    if subscription_status == 1:
-        return
     await message.reply_text(PAY_NOTICE)

@@ -1,5 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.
-# Licensed under the GNU General Public License v3.0.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 """avsea.site 管线：搜索解析、线路提取（Nuxt UrlHls）、下载（复用 missav HLS 核心）。
 

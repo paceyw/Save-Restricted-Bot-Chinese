@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.
-# Licensed under the GNU General Public License v3.0.
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 """av 词库（av_dict）：演员中日名互查、标签别名归一、类别派生、番号快照。
 

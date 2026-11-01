@@ -888,9 +888,10 @@ def _drive_hls_site(ytdl, monkeypatch, stages):
         return None
 
     async def fake_delivery(_message):
-        return -100, ytdl.app
+        return -100, ytdl.app, None
 
-    async def fake_album(sender, dest, notice, path, cover, caption, d, w, h):
+    async def fake_album(sender, dest, notice, path, cover, caption, d, w, h,
+                         **kwargs):
         sent["album"].append((dest, caption))
 
     class FakeApp:

@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.
-# Licensed under the GNU General Public License v3.0.
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 import os
 from dotenv import load_dotenv
@@ -30,7 +29,6 @@ DB_NAME      = os.getenv("DB_NAME", "telegram_downloader")
 OWNER_ID     = list(map(int, os.getenv("OWNER_ID", "").split()))  # space-separated list
 STRING       = os.getenv("STRING", None)  # optional session string
 LOG_GROUP    = int(os.getenv("LOG_GROUP", "0"))
-FORCE_SUB    = int(os.getenv("FORCE_SUB", "0"))
 
 # ─── SECURITY KEYS ──────────────────────────────────────────────────────────────
 def _required_key(name):
@@ -95,7 +93,6 @@ BURN_CRF = int(os.getenv("BURN_CRF", "19"))
 DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "10"))
 
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
-JOIN_LINK     = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
 
 # ─── PAY NOTICE (统一付费提示文案) ─────────────────────────────────────────────
@@ -130,7 +127,3 @@ P0 = {
         "l": os.getenv("PLAN_M_L", "Monthly"),
     },
 }
-
-# ════════════════════════════════════════════════════════════════════════════════
-# ░ DEVGAGAN
-# ════════════════════════════════════════════════════════════════════════════════

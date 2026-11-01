@@ -5,8 +5,10 @@ RUN apt-get update && apt-get install -y git curl ffmpeg python3-pip wget bash f
 # (bot-user), so the font must be world-readable and fontconfig needs a
 # writable cache dir — bake a system-wide cache at build time so runtime
 # needs no writes at all.
-ADD https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Bold.otf /tmp/NotoSansCJKsc-Bold.otf
+ARG NOTO_CJK_SHA256=B5F0D1A190A7F9B43C310A8850630AF12553DF32C4C050543F9059732D9B4C0A
+ADD https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Bold.otf /tmp/NotoSansCJKsc-Bold.otf
 RUN mkdir -p /usr/share/fonts/opentype/noto \
+    && echo "${NOTO_CJK_SHA256}  /tmp/NotoSansCJKsc-Bold.otf" | sha256sum -c - \
     && install -m 0644 /tmp/NotoSansCJKsc-Bold.otf /usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf \
     && rm /tmp/NotoSansCJKsc-Bold.otf \
     && mkdir -p /var/cache/fontconfig \

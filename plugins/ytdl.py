@@ -1,16 +1,5 @@
-# ---------------------------------------------------
-# File Name: ytdl.py (pure code)
-# Description: A Pyrogram bot for downloading yt and other sites videos from Telegram channels or groups 
-#              and uploading them back to Telegram.
-# Author: Gagan
-# GitHub: https://github.com/devgaganin/
-# Telegram: https://t.me/team_spy_pro
-# YouTube: https://youtube.com/@dev_gagan
-# Created: 2025-01-11
-# Last Modified: 2025-01-11
-# Version: 2.0.5
-# License: MIT License
-# ---------------------------------------------------
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 def _require_yt_dlp():
     """Import yt_dlp on first use (plan §5.4).
@@ -191,7 +180,7 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
             temp_cookie_path = temp_cookie_file.name
 
     # Task-scoped scratch dir (plan §5.2, review finding): the fixed
-    # @team_spy_pro_<uid>.mp3 path leaked on cancellation/crash because the
+    # A branded temporary filename leaked on cancellation/crash because the
     # worker's task-dir net could not see it. Falls back to the shared
     # downloads dir for direct (non-queued) calls.
     if task_id:
@@ -200,7 +189,7 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
         download_dir = os.path.join(_WORKDIR, 'downloads')
         os.makedirs(download_dir, exist_ok=True)
     random_filename = os.path.join(
-        download_dir, f"@team_spy_pro_{message.from_user.id}_{get_random_string()}"
+        download_dir, f"audio_{message.from_user.id}_{get_random_string()}"
     )
     download_path = f"{random_filename}.mp3"
     thumbnail_path = None
@@ -230,7 +219,7 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
                 nonlocal thumbnail_path
                 # mutagen only serves MP3 tagging (plan §5.4): load it here
                 # so /dl video tasks and idle startup never pay for it.
-                from mutagen.id3 import ID3, TIT2, TPE1, COMM, APIC
+                from mutagen.id3 import ID3, TIT2, APIC
                 from mutagen.mp3 import MP3
                 audio_file = MP3(download_path, ID3=ID3)
                 try:
@@ -238,8 +227,8 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
                 except Exception:
                     pass
                 audio_file.tags["TIT2"] = TIT2(encoding=3, text=title)
-                audio_file.tags["TPE1"] = TPE1(encoding=3, text="Team SPY")
-                audio_file.tags["COMM"] = COMM(encoding=3, lang="eng", desc="Comment", text="Processed by Team SPY")
+                audio_file.tags.pop("TPE1", None)
+                audio_file.tags.pop("COMM", None)
                 thumbnail_url = info_dict.get('thumbnail')
                 if thumbnail_url:
                     thumbnail_path = os.path.join(
@@ -261,9 +250,9 @@ async def process_audio(message, url, cookies_env_var=None, task_id=None):
             await app.send_audio(
                 chat_id,
                 audio=download_path,
-                caption=f"**{title}**\n\n**__由 Team SPY 提供支持__**",
+                caption=f"**{title}**",
                 title=title,
-                performer="Team SPY",
+                performer=None,
                 progress=progress_bar,
                 progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
             )
@@ -1514,7 +1503,7 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
     # user's designated channel. Route through the same resolver the
     # missav/getav path uses: settings chat -> LOG_GROUP -> requesting chat,
     # channel targets served by the /setbot custom bot when available.
-    target_chat, sender = await _resolve_delivery(message)
+    target_chat, sender, reply_to_message_id = await _resolve_delivery(message)
     download_dir = os.path.dirname(download_path)
     extra = extra_meta or {}
     thumbnail_file = None
@@ -1566,6 +1555,7 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
             await split_and_upload_file(
                 sender, target_chat, download_path, caption,
                 progress_client=app, progress_chat=chat_id,
+                reply_to_message_id=reply_to_message_id,
             )
             await prog.delete()
             await _safe_delete(progress_message)
@@ -1579,18 +1569,45 @@ async def _finalize_and_upload(message, download_path, title, thumbnail_url,
                 logger.info(
                     "site download delivering to target %s via %s",
                     target_chat, getattr(sender, 'name', sender))
-            await sender.send_video(
-                target_chat,
-                video=download_path,
-                caption=caption,
-                duration=duration,
-                width=width,
-                height=height,
-                supports_streaming=True,
-                thumb=THUMB if THUMB else None,
-                progress=progress_bar,
-                progress_args=(UPLOAD_HEADER, prog, time.time(), download_path)
-            )
+            send_kwargs = {}
+            if reply_to_message_id is not None:
+                send_kwargs['reply_to_message_id'] = reply_to_message_id
+            try:
+                await sender.send_video(
+                    target_chat,
+                    video=download_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    supports_streaming=True,
+                    thumb=THUMB if THUMB else None,
+                    progress=progress_bar,
+                    progress_args=(UPLOAD_HEADER, prog, time.time(), download_path),
+                    **send_kwargs,
+                )
+            except Exception:
+                # A configured channel is an explicit destination. Do not turn
+                # a permission failure into a private-chat delivery.
+                if sender is app or target_chat == chat_id:
+                    raise
+                logger.warning(
+                    "custom-bot channel delivery failed; retrying via main bot",
+                    exc_info=True,
+                )
+                await app.send_video(
+                    target_chat,
+                    video=download_path,
+                    caption=caption,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    supports_streaming=True,
+                    thumb=THUMB if THUMB else None,
+                    progress=progress_bar,
+                    progress_args=(UPLOAD_HEADER, prog, time.time(), download_path),
+                    **send_kwargs,
+                )
             if prog:
                 await prog.delete()
             _task_result(task_id, '✅ 上传完成')
@@ -1754,29 +1771,29 @@ async def _run_hls_download(message, url, hosts, progress_message, downloader, s
 
         await _safe_delete(progress_message)
         _report_task(task_id, f'{site} 下载完成，上传相册中...')
-        target_chat, sender = await _resolve_delivery(message)
+        target_chat, sender, reply_to_message_id = await _resolve_delivery(message)
         try:
             await _upload_missav_album(
                 sender, target_chat, message.chat.id, download_path,
                 cover_file, caption, duration, width, height,
+                reply_to_message_id=reply_to_message_id,
             )
         except Exception as e:
             if sender is app or target_chat == message.chat.id:
-                raise  # no alternate route to try
-            # channel send failed (custom bot not a member / no rights):
-            # fall back to the main bot, then to the requesting chat
+                raise
+            # The destination is explicit. Retry with the main bot, but never
+            # hide a permission error by silently sending content back to DM.
             logger.warning("%s channel delivery failed (%s); retrying via main bot", site, e)
             try:
                 await _upload_missav_album(
                     app, target_chat, message.chat.id, download_path,
                     cover_file, caption, duration, width, height,
+                    reply_to_message_id=reply_to_message_id,
                 )
             except Exception as e2:
-                logger.warning("%s main-bot delivery failed too (%s); sending to user chat", site, e2)
-                await _upload_missav_album(
-                    app, message.chat.id, message.chat.id, download_path,
-                    cover_file, caption, duration, width, height,
-                )
+                raise RuntimeError(
+                    f"目标频道上传失败：{e2}。请确认机器人已加入目标频道/话题并发帖权限。"
+                ) from e2
         _task_result(task_id, f'✅ {site} 上传完成')
     except MissAVError as e:
         logger.warning("%s download failed: %s", site, e)
@@ -1931,7 +1948,8 @@ def _build_album_group(cover_file, video_parts, caption, width, height):
 
 
 async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
-                               cover_file, caption, duration, width, height):
+                               cover_file, caption, duration, width, height,
+                               reply_to_message_id=None):
     """Deliver the missav result as ONE album (cover + video/parts).
 
     All progress notices go to ``notice_chat`` (the requesting chat);
@@ -1963,18 +1981,24 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
         group = _build_album_group(cover_file, part_metas, caption, width, height)
         prog = await app.send_message(
             notice_chat, f"**__开始上传相册（{len(group)} 项）...__**")
+        target_kwargs = {}
+        if reply_to_message_id is not None:
+            target_kwargs["reply_to_message_id"] = reply_to_message_id
         try:
             await sender.send_media_group(
                 dest_chat, group,
                 progress=progress_bar,
                 progress_args=(UPLOAD_HEADER, prog, time.time(), video_path),
+                **target_kwargs,
             )
         except Exception as e:
             # media-group upload failed midway (flood/network): fall back to
             # item-by-item sends so the video still reaches the channel
             logger.warning("missav media group failed (%s); falling back to item sends", e)
             if cover_file:
-                await sender.send_photo(dest_chat, cover_file, caption=caption)
+                await sender.send_photo(
+                    dest_chat, cover_file, caption=caption, **target_kwargs,
+                )
             for i, (path, part_duration) in enumerate(part_metas):
                 first = i == 0
                 await sender.send_video(
@@ -1986,6 +2010,7 @@ async def _upload_missav_album(sender, dest_chat, notice_chat, video_path,
                     supports_streaming=True,
                     progress=progress_bar,
                     progress_args=(UPLOAD_HEADER, prog, time.time(), video_path),
+                    **target_kwargs,
                 )
         await _safe_delete(prog)
     finally:
@@ -1997,9 +2022,12 @@ async def _resolve_delivery(message):
     """Pick the delivery target/sender for site downloads (was missav-only):
 
     per-user settings chat -> LOG_GROUP -> the requesting chat. Channel
-    per-user settings chat -> LOG_GROUP -> the requesting chat. Channel
     targets are served by the user's /setbot bot when available (same
-    membership rules as the fetch flow), else the main bot."""
+    membership rules as the fetch flow), else the main bot.
+
+    Returns (chat_id, sender, reply_to_message_id); the reply ID preserves
+    the optional topic suffix accepted by /settings.
+    """
     try:
         from plugins.deliver import resolve_delivery
         from plugins.fetch import get_ubot
@@ -2013,11 +2041,13 @@ async def _resolve_delivery(message):
                 ubot = await get_ubot(message.from_user.id)
             except Exception as e:
                 logger.info("get_ubot unavailable for missav delivery: %s", e)
-            return tcid, (ubot or app)
-        return tcid, app
+            return tcid, (ubot or app), rtmid
+        return tcid, app, rtmid
     except Exception as e:
-        logger.warning("missav delivery resolution failed, defaulting to chat: %s", e)
-        return message.chat.id, app
+        logger.exception("delivery target resolution failed")
+        raise RuntimeError(
+            f"投递目标无效：{e}。请用 /settings 重新设置频道 ID。"
+        ) from e
 
 
 async def _safe_delete(message):
@@ -2069,7 +2099,7 @@ async def process_video(message, url, cookies, check_duration_and_size=False, ta
         await _finalize_and_upload(
             message,
             download_path,
-            info_dict.get('title', '由 Team SPY 提供支持'),
+            info_dict.get('title', '未命名视频'),
             info_dict.get('thumbnail', None),
             progress_message,
             extra_meta=info_dict,
@@ -2093,7 +2123,8 @@ async def process_video(message, url, cookies, check_duration_and_size=False, ta
 
 
 async def split_and_upload_file(upload_client, upload_chat, file_path, caption,
-                                progress_client=None, progress_chat=None):
+                                progress_client=None, progress_chat=None,
+                                reply_to_message_id=None):
     """Split >2GB files into playable parts and send each to upload_chat.
 
     ``upload_client`` may be the user's /setbot bot when the target is a
@@ -2134,7 +2165,9 @@ async def split_and_upload_file(upload_client, upload_chat, file_path, caption,
                 try:
                     edit = await pclient.send_message(pchat, f"⬆️ 正在上传第 {part_number + 1} 部分...")
                     part_caption = f"{caption} \n\n**第 {part_number + 1} 部分：**"
-                    await upload_client.send_document(upload_chat, document=part_file, caption=part_caption,
+                    await upload_client.send_document(
+                        upload_chat, document=part_file, caption=part_caption,
+                        reply_to_message_id=reply_to_message_id,
                         progress=progress_bar,
                         progress_args=(UPLOAD_HEADER, edit, time.time(), part_file)
                     )

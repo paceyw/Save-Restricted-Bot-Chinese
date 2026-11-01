@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 from datetime import timedelta, datetime
 from shared_client import app
@@ -13,7 +12,7 @@ from config import OWNER_ID, PAY_NOTICE
 import logging
 logging.basicConfig(format=
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger('teamspy')
+logger = logging.getLogger(__name__)
 
 
 @app.on_message(filters.command("status") & filters.private)

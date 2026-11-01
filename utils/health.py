@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgajanin.
-# Licensed under the GNU General Public License v3.0
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 """Welcome/health HTTP server running inside the bot's own asyncio loop.
 
@@ -52,7 +51,7 @@ def build_app() -> web.Application:
 class HealthServer:
     """ aiohttp site bound to the bot process; start/stop from main.py lifecycle. """
 
-    def __init__(self, host: str = "0.0.0.0", port: int | None = None):
+    def __init__(self, host: str = "127.0.0.1", port: int | None = None):
         self._host = host
         self._port = port if port is not None else int(os.environ.get("PORT", "5000"))
         self._runner: web.AppRunner | None = None

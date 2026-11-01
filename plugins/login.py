@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -24,7 +23,7 @@ except ImportError:
     user_steps = None
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-model = "v3saver Team SPY"
+model = "v3saver"
 
 STEP_PHONE = 1
 STEP_CODE = 2

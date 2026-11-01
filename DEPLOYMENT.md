@@ -30,10 +30,9 @@
 
 向 [@userinfobot](https://t.me/userinfobot) 发送任意消息，它会返回你的数字用户 ID。多个管理员用空格分隔。
 
-### 1.4 日志群组与强制订阅频道（可选）
+### 1.4 日志群组（可选）
 
-- `LOG_GROUP`：默认投递频道的 Chat ID（通常是 `-100...` 负数）。提取的文件会发到该频道；须把 `/setbot` 的自定义机器人加入该频道并授予发帖权限。
-- `FORCE_SUB`：强制订阅频道的 Chat ID；不需要则填 `0`。
+- `LOG_GROUP`：默认投递频道的 Chat ID（通常是 `-100...` 负数）。提取的文件会发到该频道；须把主 Bot 和（如使用）`/setbot` 自定义机器人加入该频道并授予发帖权限。目标为论坛话题时，可在 `/settings` 中填写 `-100频道ID/话题ID`。
 
 获取 Chat ID：把目标群组/频道转发一条消息给 @userinfobot 即可。
 
@@ -70,7 +69,6 @@ IV_KEY=用openssl生成的16字节十六进制
 
 # 可选
 LOG_GROUP=-100你的投递频道ID
-FORCE_SUB=0
 ```
 
 生成加密密钥：
@@ -93,7 +91,7 @@ docker compose ps
 docker compose logs -f --tail=200 bot
 ```
 
-启动成功后，日志中应出现 `Pyro App Started...` 和 `SpyLib started (API-only, no update loop)...`。在 Telegram 私聊你的机器人发送 `/start`、`/status`、`/myplan` 验证响应。
+启动成功后，日志中应出现 `Pyro App Started...`。在 Telegram 私聊你的机器人发送 `/start`、`/status`、`/myplan` 验证响应。
 
 ### 2.4 停止与更新
 
@@ -176,7 +174,6 @@ python3 main.py
 | `DB_NAME` | — | `telegram_downloader` | 数据库名 |
 | `STRING` | — | 空 | 高级账号 Pyrogram 会话字符串，启用 4GB 上传 |
 | `LOG_GROUP` | — | `0` | 投递/日志频道 Chat ID（`-100...`），提取文件发到该频道，须将机器人加入并授予发帖权限；`0` 不启用 |
-| `FORCE_SUB` | — | `0` | 强制订阅频道 Chat ID；`0` 不启用 |
 | `YT_COOKIES` | — | 空 | YouTube 下载 cookie（Netscape 格式文本） |
 | `INSTA_COOKIES` | — | 空 | Instagram 下载 cookie |
 | `FREEMIUM_LIMIT` | — | `0` | 免费用户单批链接数上限；`0` = 关闭免费使用（提示联系管理员订阅） |
@@ -196,7 +193,6 @@ python3 main.py
 | `FFMPEG_BURN_THREADS` | — | `0` | 烧录编码线程数；`0` = 自动（按 CPU 数，限制在 2–8） |
 | `BURN_TIMEOUT_S` | — | `10800` | 单次烧录墙钟超时（秒）；`0` = 不限时，超时自动回退无字幕封装 |
 | `DISK_FREE_MIN_GB` | — | `10` | 运行卷剩余空间水位（GB），低于该值拒绝新任务 |
-| `JOIN_LINK` | — | `https://t.me/team_spy_pro` | 加入频道/群组链接 |
 | `ADMIN_CONTACT` | — | `https://t.me/username_of_admin` | 管理员联系方式（`/terms` 按钮指向） |
 | `PAY_NOTICE` | — | 内置默认文案 | 统一付费提示文案（`/start` `/pay` `/plan` 等入口） |
 | `PLAN_D_*` / `PLAN_W_*` / `PLAN_M_*` | — | 见 `config.py` | 日/周/月套餐：`_S` 价格、`_DU` 时长数、`_U` 单位、`_L` 显示标签 |

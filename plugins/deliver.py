@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 import asyncio
 import os
 import time
@@ -52,7 +51,7 @@ async def prog(c, t, C, h, m, st, fp=None):
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
         speed = c / (time.time() - st) / (1024 * 1024) if time.time() > st else 0
         eta = time.strftime('%M:%S', time.gmtime((t - c) / (speed * 1024 * 1024))) if speed > 0 else '00:00'
-        await C.edit_message_text(h, m, f"__**Pyro 处理器...**__\n\n{bar}\n\n⚡**__已完成__**：{c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__完成度__**：{p:.2f}%\n🚀 **__速度__**：{speed:.2f} MB/s\n⏳ **__预计剩余时间__**：{eta}\n\n**__由 Team SPY 提供支持__**")
+        await C.edit_message_text(h, m, f"__**Pyro 处理器...**__\n\n{bar}\n\n⚡**__已完成__**：{c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__完成度__**：{p:.2f}%\n🚀 **__速度__**：{speed:.2f} MB/s\n⏳ **__预计剩余时间__**：{eta}")
         if p >= 100: progress_state.pop(m, None)
 
 
@@ -141,10 +140,15 @@ async def resolve_delivery(d, settings):
     rtmid = None
     deliver_via_bot = False
     if cfg_chat:
-        if '/' in cfg_chat:
-            parts = cfg_chat.split('/', 1)
-            tcid = int(parts[0])
-            rtmid = int(parts[1]) if len(parts) > 1 else None
+        try:
+            from utils.func import parse_delivery_chat
+        except ImportError:
+            parse_delivery_chat = None
+        if parse_delivery_chat is not None:
+            tcid, rtmid = parse_delivery_chat(cfg_chat)
+        elif '/' in cfg_chat:
+            chat_part, topic_part = cfg_chat.split('/', 1)
+            tcid, rtmid = int(chat_part), int(topic_part) if topic_part else None
         else:
             tcid = int(cfg_chat)
         deliver_via_bot = True

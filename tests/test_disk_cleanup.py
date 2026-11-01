@@ -192,7 +192,6 @@ def batch_module(monkeypatch, tmp_path):
     config.API_HASH = "hash"
     config.LOG_GROUP = 0
     config.STRING = None
-    config.FORCE_SUB = 0
     config.FREEMIUM_LIMIT = 1
     config.PREMIUM_LIMIT = 10
     config.BATCH_INTERVAL = 0.01

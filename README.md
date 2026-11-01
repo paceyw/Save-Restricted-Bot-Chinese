@@ -6,7 +6,7 @@ Telegram 私域内容转发与媒体下载机器人 · 番号搜索 / 多版本�
 
 </div>
 
-> 本仓库 Fork 自 [devgaganin/Save-Restricted-Content-Bot-v3](https://github.com/devgaganin/Save-Restricted-Content-Bot-v3)，修复原版 v3 的架构性缺陷（9 个命令注册在已关闭 loop 的 Telethon 上永久失效），并完成中文本地化与下载管线建设。
+> 本项目基于 GPLv3 上游修复架构性缺陷，并完成中文本地化与下载管线建设。
 > 所有**合规使用**仅限转发/下载自己有权访问的内容；不得用于绕过他人设置的访问限制、抓取受版权保护内容等用途。
 
 **目录**：[一、部署指南](#一部署指南) ｜ [二、功能介绍](#二功能介绍命令与使用方法) ｜ [三、原理解析](#三原理解析) ｜ [项目结构](#-项目结构) ｜ [开发约定](#-开发约定) ｜ [免责声明](#-免责声明)
@@ -53,7 +53,7 @@ layout:
 required_env: [API_ID, API_HASH, BOT_TOKEN, OWNER_ID, LOG_GROUP, MONGO_ROOT_USERNAME,
                MONGO_ROOT_PASSWORD, MONGO_APP_USERNAME, MONGO_APP_PASSWORD,
                DB_NAME, MASTER_KEY, IV_KEY]
-optional_env: [STRING, FORCE_SUB, FREEMIUM_LIMIT, PREMIUM_LIMIT, YT_COOKIES,
+optional_env: [STRING, FREEMIUM_LIMIT, PREMIUM_LIMIT, YT_COOKIES,
                INSTA_COOKIES, MISSAV_MIRRORS, GETAV_MIRRORS, BURN_CONCURRENCY,
                BURN_PRESET, BURN_CRF, FFMPEG_BURN_THREADS, BURN_TIMEOUT_S,
                DISK_FREE_MIN_GB, LOG_LEVEL]
@@ -66,7 +66,7 @@ verify:
   health: "GET :5000/healthz -> {\"ok\": true}"
   diagnostics: "GET :5000/debug/tasks"
   logs: "docker compose logs --tail=200 bot"
-limits: {bot_memory: 512M, mongo_memory: 512M, mongo_wiredtiger_cache: 0.25GB}
+limits: {bot_memory: 1G, mongo_memory: 512M, mongo_wiredtiger_cache: 0.25GB}
 rollback: "git checkout <prev_tag> && docker compose up -d --build"
 forbidden:
   - "docker compose down -v        # 会删除 mongo 数据卷"
@@ -76,7 +76,7 @@ forbidden:
 
 ## 环境变量
 
-完整表（36 项：必填/可选/默认值/用途）见 [DEPLOYMENT.md](DEPLOYMENT.md)。速查：
+完整表（必填/可选/默认值/用途）见 [DEPLOYMENT.md](DEPLOYMENT.md)。速查：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
@@ -85,7 +85,6 @@ forbidden:
 | `MONGO_DB` / `DB_NAME` | — | MongoDB 连接与库名（必填） |
 | `MASTER_KEY` / `IV_KEY` | — | 会话加密密钥，**生产必须随机覆盖**（必填） |
 | `LOG_GROUP` | `0` | 默认投递频道；`0` 不启用 |
-| `FORCE_SUB` | `0` | 强制订阅频道 ID |
 | `STRING` | 空 | 高级账号会话串（>2GB 上传需要） |
 | `MISSAV_MIRRORS` | 内置 5 站 | missav 镜像，逗号分隔（含 avsea.site） |
 | `GETAV_MIRRORS` | `getav.net` | getav 镜像 |
@@ -231,7 +230,7 @@ https://t.me/xxx/2
 
 ## 投递规则
 
-所有站点成品统一投递：**用户设置频道（`/setbot` 机器人发送）→ `LOG_GROUP` → 私聊回退**；下载/上传进度只发私聊与 `/tasks`。
+所有站点成品统一投递：**`/settings` 中设置的频道/话题（优先使用 `/setbot` 自定义机器人发送）→ `LOG_GROUP` → 私聊**。话题格式为 `-100频道ID/话题ID`。只要配置了频道，权限失败时会明确报错，不会静默改投私聊；进度只发私聊与 `/tasks`。
 
 ## 会员与管理
 
@@ -396,7 +395,7 @@ flowchart LR
 │   ├── avdict_seed.py   # 词库种子：117 条标签别名表（运行时以库为准）
 │   ├── javbus.py        # JavBus/JavLibrary 元数据补全（尽力而为，LRU）
 │   ├── func.py encrypt.py health.py caption.py custom_filters.py logging_setup.py ratelimit.py
-├── tests/               # 642 项 pytest 离线回归
+├── tests/               # 648 项 pytest 离线回归
 └── templates/welcome.html
 ```
 
@@ -412,8 +411,3 @@ flowchart LR
 - 不对用户行为负责，不推广受版权保护的内容。
 - 使用非官方客户端登录的账号可能受到 Telegram 的额外审查，请只使用合法授权的账号。
 - 遵守 [Telegram API Terms of Service](https://core.telegram.org/api/terms)。
-
-# 🙏 致谢
-
-- 原作者：[devgagan / Team SPY](https://github.com/devgaganin)
-- 本 Fork 由 [paceyw](https://github.com/paceyw) 维护：Bug 修复、中文本地化与下载管线建设

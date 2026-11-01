@@ -1,6 +1,5 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2025 Save Restricted Bot Chinese contributors.
 
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton as IK, InlineKeyboardMarkup as IKM
@@ -61,8 +60,7 @@ def settings_menu():
          IK('🚪 退出登录', callback_data='logout')],
         [IK('🖼️ 设置缩略图', callback_data='setthumb'),
          IK('❌ 移除缩略图', callback_data='remthumb')],
-        [IK('📚 词库管理', callback_data='lexicon')],
-        [IK('🆘 报告错误', url='https://t.me/team_spy_pro')]
+        [IK('📚 词库管理', callback_data='lexicon')]
     ])
 
 
@@ -86,8 +84,8 @@ async def callback_query_handler(client, query):
     callback_actions = {
         'setchat': {
             'type': 'setchat',
-            'message': """请向我发送该聊天的 ID（带 -100 前缀）： 
-__👉 **注意：** 如果您使用自定义机器人，您的机器人必须是该聊天的管理员，否则本机器人必须是管理员。__
+            'message': """请向我发送该聊天的 ID（带 -100 前缀）：
+__👉 **注意：** 主 Bot 和（如使用）自定义机器人最好都加入该聊天，并授予“发布消息/发送媒体”权限。__
 👉 __如果您想上传到群组中的话题以及特定话题，请按 **-100CHANNELID/TOPIC_ID** 这种格式传入聊天 ID，例如：**-1004783898/12**__"""
         },
         'setrename': {
@@ -237,16 +235,16 @@ async def handle_conversation_input(client, message):
 
 async def handle_setchat(message, user_id):
     try:
-        chat_id = message.text.strip()
+        from utils.func import parse_delivery_chat
         try:
-            chat_id_int = int(chat_id)
-        except ValueError:
-            await message.reply_text('❌ 无效的聊天 ID，请输入数字 ID（频道/群组通常为 -100 开头的负数）。')
+            chat_id_int, topic_id = parse_delivery_chat(message.text)
+        except (TypeError, ValueError):
+            await message.reply_text(
+                '❌ 无效的聊天 ID。请输入 `-100频道ID`，或话题格式 `-100频道ID/话题ID`。'
+            )
             return
-        if chat_id_int >= 0:
-            await message.reply_text('❌ 聊天 ID 必须为负数（频道/群组 ID），例如 -1001234567890。')
-            return
-        await save_user_data(user_id, 'chat_id', chat_id)
+        normalized = f'{chat_id_int}/{topic_id}' if topic_id is not None else str(chat_id_int)
+        await save_user_data(user_id, 'chat_id', normalized)
         await message.reply_text('✅ 聊天 ID 设置成功！')
     except Exception as e:
         await message.reply_text(f'❌ 设置聊天 ID 时出错：{e}')
