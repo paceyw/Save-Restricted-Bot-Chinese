@@ -143,12 +143,13 @@ async def terms(client, message):
         "✨ 我们不对用户的行为负责，也不推广受版权保护的内容。如有用户从事此类活动，责任由其自行承担。\n"
         "✨ 购买后，我们不保证方案的在线时间、停机时间或有效性。__用户的授权和封禁由我们自行决定；我们保留随时封禁或授权用户的权利。__\n"
     )
-    buttons = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💬 联系开通", url=ADMIN_CONTACT)],
-        ]
-    )
-    await message.reply_text(terms_text, reply_markup=buttons)
+    if ADMIN_CONTACT:
+        buttons = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("💬 联系开通", url=ADMIN_CONTACT)]]
+        )
+        await message.reply_text(terms_text, reply_markup=buttons)
+    else:
+        await message.reply_text(terms_text)
 
 
 @app.on_message(filters.command("plan") & filters.private)

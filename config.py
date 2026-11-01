@@ -93,7 +93,7 @@ BURN_CRF = int(os.getenv("BURN_CRF", "19"))
 DISK_FREE_MIN_GB = float(os.getenv("DISK_FREE_MIN_GB", "10"))
 
 # ─── UI / LINKS ─────────────────────────────────────────────────────────────────
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "").strip()
 
 # ─── PAY NOTICE (统一付费提示文案) ─────────────────────────────────────────────
 # 所有支付/会员入口均展示此文案，引导用户联系人工开通。

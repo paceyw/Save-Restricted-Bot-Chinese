@@ -193,7 +193,7 @@ python3 main.py
 | `FFMPEG_BURN_THREADS` | — | `0` | 烧录编码线程数；`0` = 自动（按 CPU 数，限制在 2–8） |
 | `BURN_TIMEOUT_S` | — | `10800` | 单次烧录墙钟超时（秒）；`0` = 不限时，超时自动回退无字幕封装 |
 | `DISK_FREE_MIN_GB` | — | `10` | 运行卷剩余空间水位（GB），低于该值拒绝新任务 |
-| `ADMIN_CONTACT` | — | `https://t.me/username_of_admin` | 管理员联系方式（`/terms` 按钮指向） |
+| `ADMIN_CONTACT` | — | 空 | 管理员联系方式；为空时 `/terms` 不显示联系按钮 |
 | `PAY_NOTICE` | — | 内置默认文案 | 统一付费提示文案（`/start` `/pay` `/plan` 等入口） |
 | `PLAN_D_*` / `PLAN_W_*` / `PLAN_M_*` | — | 见 `config.py` | 日/周/月套餐：`_S` 价格、`_DU` 时长数、`_U` 单位、`_L` 显示标签 |
 | `BURN_PRESET`（即将加入） | — | `superfast` | 烧录 x264 preset；MISSAV 方案 §8 定稿（superfast + CRF19 + 源分辨率）即将合入，合入前配置不生效 |
